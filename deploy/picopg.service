@@ -1,0 +1,14 @@
+[Unit]
+Description=Pico main service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/picopg
+ExecStart=/usr/bin/python3 %h/picopg/apps/server/server.py
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
