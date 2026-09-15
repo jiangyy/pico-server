@@ -10,12 +10,16 @@ method returns ``405 Method Not Allowed``. Unknown paths return ``404``.
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
+
+from database import open_database
 
 HOST = "127.0.0.1"
 PORT = 8001
 
 ALLOWED_METHODS = ("GET", "HEAD")
+DATABASE_PATH = Path("data/app.db")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -77,6 +81,9 @@ def make_server(host=HOST, port=PORT):
 
 
 def main():
+    database = open_database(DATABASE_PATH)
+    database.close()
+
     server = make_server()
     host, port = server.server_address[:2]
     print(f"Pico service: http://{host}:{port}", flush=True)
