@@ -18,6 +18,7 @@ from classes import (
     Class,
     InvalidClassNameError,
     Membership,
+    MembershipNotFoundError,
     MissingClassError,
     RoleMismatchError,
     assign_student,
@@ -500,7 +501,9 @@ class ClassTest(unittest.TestCase):
         class_id = self.insert_class(teacher.id)
         self.insert_membership(student.id, class_id)
 
-        removed = remove_membership(self.connection, admin, student.id)
+        removed = remove_membership(
+            self.connection, admin, class_id, student.id
+        )
 
         self.assertTrue(removed)
         self.assertEqual(self.membership_count(), 0)
@@ -508,15 +511,21 @@ class ClassTest(unittest.TestCase):
 
     def test_remove_membership_retry_is_safe_noop(self):
         admin = self.insert_admin()
-        student = self.insert_student()
-
-        self.assertFalse(remove_membership(self.connection, admin, student.id))
-
         teacher = self.insert_teacher()
+        student = self.insert_student()
         class_id = self.insert_class(teacher.id)
+
+        self.assertFalse(
+            remove_membership(self.connection, admin, class_id, student.id)
+        )
+
         self.insert_membership(student.id, class_id)
-        self.assertTrue(remove_membership(self.connection, admin, student.id))
-        self.assertFalse(remove_membership(self.connection, admin, student.id))
+        self.assertTrue(
+            remove_membership(self.connection, admin, class_id, student.id)
+        )
+        self.assertFalse(
+            remove_membership(self.connection, admin, class_id, student.id)
+        )
         self.assertEqual(self.membership_count(), 0)
 
     def test_remove_membership_requires_admin(self):
@@ -535,24 +544,40 @@ class ClassTest(unittest.TestCase):
         for actor in (teacher, student, impostor, None, "admin"):
             with self.subTest(actor=actor):
                 with self.assertRaises(ForbiddenActionError):
-                    remove_membership(self.connection, actor, student.id)
+                    remove_membership(
+                        self.connection, actor, class_id, student.id
+                    )
 
         self.assertEqual(self.membership_count(), 1)
 
     def test_remove_membership_requires_existing_student(self):
         admin = self.insert_admin()
+        teacher = self.insert_teacher()
+        class_id = self.insert_class(teacher.id)
 
         with self.assertRaises(MissingUserError):
-            remove_membership(self.connection, admin, uuid.uuid4().hex)
+            remove_membership(
+                self.connection, admin, class_id, uuid.uuid4().hex
+            )
+
+    def test_remove_membership_requires_existing_class(self):
+        admin = self.insert_admin()
+        student = self.insert_student()
+
+        with self.assertRaises(MissingClassError):
+            remove_membership(
+                self.connection, admin, uuid.uuid4().hex, student.id
+            )
 
     def test_remove_membership_rejects_non_student(self):
         admin = self.insert_admin()
         teacher = self.insert_teacher()
+        class_id = self.insert_class(teacher.id)
 
         with self.assertRaises(RoleMismatchError):
-            remove_membership(self.connection, admin, teacher.id)
+            remove_membership(self.connection, admin, class_id, teacher.id)
         with self.assertRaises(RoleMismatchError):
-            remove_membership(self.connection, admin, admin.id)
+            remove_membership(self.connection, admin, class_id, admin.id)
 
     def test_remove_membership_rejects_archived_class(self):
         admin = self.insert_admin()
@@ -563,8 +588,32 @@ class ClassTest(unittest.TestCase):
         self.archive_class(class_id)
 
         with self.assertRaises(ArchivedClassError):
-            remove_membership(self.connection, admin, student.id)
+            remove_membership(self.connection, admin, class_id, student.id)
 
+        self.assertEqual(self.membership_count(), 1)
+
+    def test_remove_membership_wrong_class_is_not_found_and_preserved(self):
+        admin = self.insert_admin()
+        teacher = self.insert_teacher()
+        student = self.insert_student()
+        current_class = self.insert_class(teacher.id, class_id="class-1")
+        other_class = self.insert_class(teacher.id, class_id="class-2")
+        self.insert_membership(
+            student.id,
+            current_class,
+            joined_at="2024-03-01T00:00:00Z",
+        )
+
+        with self.assertRaises(MembershipNotFoundError):
+            remove_membership(
+                self.connection, admin, other_class, student.id
+            )
+
+        rows = self.membership_rows(student.id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["student_id"], student.id)
+        self.assertEqual(rows[0]["class_id"], current_class)
+        self.assertEqual(rows[0]["joined_at"], "2024-03-01T00:00:00Z")
         self.assertEqual(self.membership_count(), 1)
 
     # ----- get_class --------------------------------------------------------

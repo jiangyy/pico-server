@@ -23,6 +23,10 @@ class ArchivedClassError(Exception):
     """Raised when a membership change targets an archived Class."""
 
 
+class MembershipNotFoundError(Exception):
+    """Raised when a Student's current membership is in a different Class."""
+
+
 @dataclass(frozen=True)
 class Class:
     id: str
@@ -220,32 +224,40 @@ def assign_student(connection, actor, student_id, class_id, now=None):
     )
 
 
-def remove_membership(connection, actor, student_id):
-    """Remove a Student's current membership. Admin only.
+def remove_membership(connection, actor, class_id, student_id):
+    """Remove a Student's membership in a specific Class. Admin only.
 
-    Returns ``True`` when a membership row was removed and ``False`` when the
-    Student simply has no current membership.
+    Returns ``True`` when the matching membership row was removed and ``False``
+    when the Student has no current membership. A Student who is a member of a
+    different Class raises :class:`MembershipNotFoundError` and that membership
+    is left unchanged.
     """
     _require_admin(actor)
     _require_student(connection, student_id)
+    class_row = _require_class(connection, class_id)
 
     with connection:
         row = connection.execute(
             """
-            SELECT class_memberships.class_id, classes.archived_at
+            SELECT class_id
             FROM class_memberships
-            JOIN classes ON classes.id = class_memberships.class_id
-            WHERE class_memberships.student_id = ?
+            WHERE student_id = ?
             """,
             (student_id,),
         ).fetchone()
         if row is None:
             return False
-        if row["archived_at"] is not None:
-            raise ArchivedClassError(row["class_id"])
+        if row["class_id"] != class_id:
+            raise MembershipNotFoundError(student_id)
+        if class_row["archived_at"] is not None:
+            raise ArchivedClassError(class_id)
 
         connection.execute(
-            "DELETE FROM class_memberships WHERE student_id = ?", (student_id,)
+            """
+            DELETE FROM class_memberships
+            WHERE student_id = ? AND class_id = ?
+            """,
+            (student_id, class_id),
         )
     return True
 

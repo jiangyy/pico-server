@@ -16,6 +16,19 @@ from accounts import (
     create_user,
     register_student,
 )
+from classes import (
+    ArchivedClassError,
+    InvalidClassNameError,
+    MembershipNotFoundError,
+    MissingClassError,
+    RoleMismatchError,
+    assign_student,
+    change_class_owner,
+    create_class,
+    get_class,
+    list_classes,
+    remove_membership,
+)
 from database import open_database
 from repository import DEFAULT_REPOSITORY_PATH, open_repository
 from sessions import (
@@ -43,6 +56,10 @@ ROUTE_METHODS = {
 }
 ADMIN_USERS_PATH = "/api/v1/admin/users"
 ADMIN_USER_ROLE_SUFFIX = "/role"
+ADMIN_CLASSES_PATH = "/api/v1/admin/classes"
+CLASS_OWNER_SUFFIX = "/owner"
+CLASS_MEMBERS_SEGMENT = "/members/"
+CLASSES_PATH = "/api/v1/classes"
 
 
 def _match_admin_user_role(path):
@@ -61,6 +78,45 @@ def _match_admin_user_role(path):
     return user_id
 
 
+def _match_class_owner(path):
+    """Return the opaque class ID in a class owner path, else None."""
+    prefix = ADMIN_CLASSES_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(CLASS_OWNER_SUFFIX):
+        return None
+
+    class_id = path[len(prefix): -len(CLASS_OWNER_SUFFIX)]
+    if not class_id or "/" in class_id:
+        return None
+    return class_id
+
+
+def _match_class_member(path):
+    """Return the opaque (class ID, student ID) pair in a member path."""
+    prefix = ADMIN_CLASSES_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    remainder = path[len(prefix):]
+    class_id, separator, student_id = remainder.partition(CLASS_MEMBERS_SEGMENT)
+    if not separator or not class_id or not student_id:
+        return None
+    if "/" in class_id or "/" in student_id:
+        return None
+    return class_id, student_id
+
+
+def _match_class(path):
+    """Return the opaque class ID in a class read path, else None."""
+    prefix = CLASSES_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    class_id = path[len(prefix):]
+    if not class_id or "/" in class_id:
+        return None
+    return class_id
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -70,6 +126,16 @@ def _allowed_methods(path):
         return ("POST",)
     if _match_admin_user_role(path) is not None:
         return ("PATCH",)
+    if path == ADMIN_CLASSES_PATH:
+        return ("POST",)
+    if _match_class_owner(path) is not None:
+        return ("PATCH",)
+    if _match_class_member(path) is not None:
+        return ("PUT", "DELETE")
+    if path == CLASSES_PATH:
+        return ALLOWED_METHODS
+    if _match_class(path) is not None:
+        return ALLOWED_METHODS
     return None
 
 
@@ -97,6 +163,10 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, "ok\n", head_only=head_only)
         elif path == "/api/v1/me":
             self._get_me(head_only=head_only)
+        elif path == CLASSES_PATH:
+            self._get_classes(head_only=head_only)
+        elif _match_class(path) is not None:
+            self._get_class(_match_class(path), head_only=head_only)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -113,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_logout()
         elif path == ADMIN_USERS_PATH:
             self._post_admin_user()
+        elif path == ADMIN_CLASSES_PATH:
+            self._post_admin_class()
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -121,8 +193,31 @@ class Handler(BaseHTTPRequestHandler):
     def _route_patch(self):
         path = urlsplit(self.path).path
         user_id = _match_admin_user_role(path)
+        class_id = _match_class_owner(path)
         if user_id is not None:
             self._patch_admin_user_role(user_id)
+        elif class_id is not None:
+            self._patch_class_owner(class_id)
+        elif _allowed_methods(path) is not None:
+            self._method_not_allowed()
+        else:
+            self._not_found()
+
+    def _route_put(self):
+        path = urlsplit(self.path).path
+        member = _match_class_member(path)
+        if member is not None:
+            self._put_class_member(*member)
+        elif _allowed_methods(path) is not None:
+            self._method_not_allowed()
+        else:
+            self._not_found()
+
+    def _route_delete(self):
+        path = urlsplit(self.path).path
+        member = _match_class_member(path)
+        if member is not None:
+            self._delete_class_member(*member)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -191,6 +286,45 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
+    def _get_classes(self, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                classes = list_classes(connection, actor)
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"classes": [self._class_payload(item) for item in classes]},
+            head_only=head_only,
+        )
+
+    def _get_class(self, class_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                class_record = get_class(connection, actor, class_id)
+        except MissingClassError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"class": self._class_payload(class_record)},
+            head_only=head_only,
+        )
+
     def _post_admin_user(self):
         actor = self._authenticate()
         if actor is None:
@@ -230,6 +364,44 @@ class Handler(BaseHTTPRequestHandler):
 
         self._respond_json(201, {"user": self._user_payload(user)})
 
+    def _post_admin_class(self):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                class_record = create_class(
+                    connection,
+                    actor,
+                    payload["name"],
+                    payload["teacherId"],
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except (TypeError, ValueError):
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidClassNameError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except RoleMismatchError:
+            self._api_error(400, "invalid_request")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(201, {"class": self._class_payload(class_record)})
+
     def _patch_admin_user_role(self, user_id):
         actor = self._authenticate()
         if actor is None:
@@ -267,6 +439,107 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._respond_json(200, {"user": self._user_payload(user)})
+
+    def _patch_class_owner(self, class_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                class_record = change_class_owner(
+                    connection,
+                    actor,
+                    class_id,
+                    payload["teacherId"],
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except (TypeError, ValueError):
+            self._api_error(400, "invalid_request")
+            return
+        except MissingClassError:
+            self._api_error(404, "not_found")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except RoleMismatchError:
+            self._api_error(400, "invalid_request")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(200, {"class": self._class_payload(class_record)})
+
+    def _put_class_member(self, class_id, student_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                membership = assign_student(
+                    connection,
+                    actor,
+                    student_id,
+                    class_id,
+                )
+        except MissingClassError:
+            self._api_error(404, "not_found")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except RoleMismatchError:
+            self._api_error(400, "invalid_request")
+            return
+        except ArchivedClassError:
+            self._api_error(409, "class_archived")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(
+            200,
+            {"membership": self._membership_payload(membership)},
+        )
+
+    def _delete_class_member(self, class_id, student_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                remove_membership(connection, actor, class_id, student_id)
+        except MissingClassError:
+            self._api_error(404, "not_found")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except MembershipNotFoundError:
+            self._api_error(404, "not_found")
+            return
+        except RoleMismatchError:
+            self._api_error(400, "invalid_request")
+            return
+        except ArchivedClassError:
+            self._api_error(409, "class_archived")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond(204, "")
 
     def _authenticate(self, head_only=False):
         token = self._bearer_token()
@@ -335,6 +608,24 @@ class Handler(BaseHTTPRequestHandler):
             "createdAt": user.created_at,
         }
 
+    @staticmethod
+    def _class_payload(class_record):
+        return {
+            "id": class_record.id,
+            "name": class_record.name,
+            "teacherId": class_record.teacher_id,
+            "createdAt": class_record.created_at,
+            "archivedAt": class_record.archived_at,
+        }
+
+    @staticmethod
+    def _membership_payload(membership):
+        return {
+            "studentId": membership.student_id,
+            "classId": membership.class_id,
+            "joinedAt": membership.joined_at,
+        }
+
     def _database(self):
         return closing(open_database(self.server.database_path))
 
@@ -400,8 +691,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     # Route-aware method boundary for unsupported verbs.
-    do_PUT = _method_not_allowed
-    do_DELETE = _method_not_allowed
+    def do_PUT(self):
+        self._route_put()
+
+    def do_DELETE(self):
+        self._route_delete()
+
     do_OPTIONS = _method_not_allowed
 
 
