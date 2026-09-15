@@ -21,10 +21,12 @@ class ServerTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary_directory = tempfile.TemporaryDirectory()
         database_path = Path(cls.temporary_directory.name) / "app.db"
+        cls.repository_path = Path(cls.temporary_directory.name) / "picopg.git"
         cls.server = make_server(
             host="127.0.0.1",
             port=0,
             database_path=database_path,
+            repository_path=cls.repository_path,
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -76,6 +78,12 @@ class ServerTest(unittest.TestCase):
                 status, headers, _ = self.request(method, "/")
                 self.assertEqual(status, 405)
                 self.assertEqual(headers["allow"], ", ".join(ALLOWED_METHODS))
+
+    def test_injected_repository_is_initialized_bare(self):
+        self.assertEqual(self.server.repository_path, self.repository_path)
+        self.assertTrue(self.repository_path.is_dir())
+        self.assertTrue((self.repository_path / "HEAD").is_file())
+        self.assertFalse((self.repository_path / ".git").exists())
 
 
 if __name__ == "__main__":

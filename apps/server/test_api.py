@@ -15,10 +15,12 @@ class AccountApiTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary_directory = tempfile.TemporaryDirectory()
         database_path = Path(cls.temporary_directory.name) / "app.db"
+        repository_path = Path(cls.temporary_directory.name) / "picopg.git"
         cls.server = make_server(
             host="127.0.0.1",
             port=0,
             database_path=database_path,
+            repository_path=repository_path,
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)

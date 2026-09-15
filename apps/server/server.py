@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from accounts import UsernameTakenError, register_student
 from database import open_database
+from repository import DEFAULT_REPOSITORY_PATH, open_repository
 from sessions import (
     InvalidCredentialsError,
     InvalidSessionError,
@@ -269,14 +270,24 @@ class Handler(BaseHTTPRequestHandler):
     do_OPTIONS = _method_not_allowed
 
 
-def make_server(host=HOST, port=PORT, database_path=DATABASE_PATH):
+def make_server(
+    host=HOST,
+    port=PORT,
+    database_path=DATABASE_PATH,
+    repository_path=DEFAULT_REPOSITORY_PATH,
+):
     """Return an initialized HTTP server bound to ``host:port``."""
     database_path = Path(database_path)
     database = open_database(database_path)
     database.close()
 
+    repository_path = Path(repository_path)
+    repository = open_repository(repository_path)
+
     server = ThreadingHTTPServer((host, port), Handler)
     server.database_path = database_path
+    server.repository_path = repository_path
+    server.repository = repository
     return server
 
 
