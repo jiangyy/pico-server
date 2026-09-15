@@ -19,6 +19,15 @@ class DatabaseTest(unittest.TestCase):
         self.addCleanup(connection.close)
         return connection
 
+    def insert_user(self, connection, user_id="user-1", username="alice"):
+        connection.execute(
+            """
+            INSERT INTO users (id, username, role, password_hash, created_at)
+            VALUES (?, ?, 'student', 'hash', '2026-09-15T00:00:00Z')
+            """,
+            (user_id, username),
+        )
+
     def test_open_creates_database_with_foreign_keys_enabled(self):
         connection = self.open()
 
@@ -54,10 +63,13 @@ class DatabaseTest(unittest.TestCase):
 
         upgraded = self.open()
 
-        user_table = upgraded.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
-        ).fetchone()
-        self.assertIsNotNone(user_table)
+        tables = upgraded.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name IN ('users', 'sessions')
+            """
+        ).fetchall()
+        self.assertEqual({row["name"] for row in tables}, {"users", "sessions"})
 
     def test_newer_schema_is_rejected(self):
         connection = self.open()
@@ -104,6 +116,47 @@ class DatabaseTest(unittest.TestCase):
                 """,
                 rows[1],
             )
+
+    def test_session_requires_user(self):
+        connection = self.open()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
+                VALUES ('token-hash', 'missing', '2026-09-15T00:00:00Z',
+                        '2026-09-16T00:00:00Z')
+                """
+            )
+
+    def test_session_stores_unique_token_hash(self):
+        connection = self.open()
+        self.insert_user(connection)
+        values = (
+            "token-hash",
+            "user-1",
+            "2026-09-15T00:00:00Z",
+            "2026-09-16T00:00:00Z",
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            values,
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                values,
+            )
+
+        columns = connection.execute("PRAGMA table_info(sessions)").fetchall()
+        self.assertNotIn("token", {row["name"] for row in columns})
 
 
 if __name__ == "__main__":

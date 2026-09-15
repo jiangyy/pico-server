@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def open_database(path):
@@ -62,6 +62,23 @@ def _initialize_schema(connection):
                 """
             )
             _record_migration(connection, 2)
+
+        if version < 3:
+            connection.execute(
+                """
+                CREATE TABLE sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX sessions_user_id_idx ON sessions(user_id)"
+            )
+            _record_migration(connection, 3)
 
 
 def _record_migration(connection, version):
