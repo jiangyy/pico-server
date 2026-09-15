@@ -907,5 +907,443 @@ class ClassApiTest(unittest.TestCase):
             self.assertEqual((status, body["code"]), (404, "not_found"), (method, path))
 
 
+class PlaygroundApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        cls.database_path = Path(cls.temporary_directory.name) / "app.db"
+        cls.repository_path = Path(cls.temporary_directory.name) / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    def request(self, method, path, payload=None, token=None):
+        headers = {}
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def grant_publisher(self, token, user_id):
+        status, _, body = self.request(
+            "PUT",
+            f"/api/v1/admin/publishers/{user_id}",
+            token=token,
+        )
+        self.assertEqual(status, 204)
+        self.assertIsNone(body)
+
+    def revoke_publisher(self, token, user_id):
+        status, _, body = self.request(
+            "DELETE",
+            f"/api/v1/admin/publishers/{user_id}",
+            token=token,
+        )
+        self.assertEqual(status, 204)
+        self.assertIsNone(body)
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def test_publisher_grant_lifecycle_and_creation_authorization(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+
+        # An ungranted user cannot create playground metadata.
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": self.unique("pg")},
+            token=teacher_token,
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # A non-Admin cannot grant or revoke publisher permission.
+        for method in ("PUT", "DELETE"):
+            status, _, body = self.request(
+                method,
+                f"/api/v1/admin/publishers/{student.id}",
+                token=teacher_token,
+            )
+            self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # Admin grant is idempotent and persists exactly one row.
+        self.grant_publisher(admin_token, teacher.id)
+        self.grant_publisher(admin_token, teacher.id)
+        connection = open_database(self.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT user_id, granted_by FROM publisher_grants"
+                " WHERE user_id = ?",
+                (teacher.id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["granted_by"], admin.id)
+
+        # The granted user can create metadata, which defaults to release_only.
+        playground = self.create_playground(teacher_token, self.unique("pg"))
+        self.assertEqual(playground["creatorId"], teacher.id)
+        self.assertEqual(playground["policy"], "release_only")
+
+        # Revoke is idempotent and immediately takes effect.
+        self.revoke_publisher(admin_token, teacher.id)
+        self.revoke_publisher(admin_token, teacher.id)
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": self.unique("pg")},
+            token=teacher_token,
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # Admin needs no grant.
+        admin_playground = self.create_playground(admin_token, self.unique("pg"))
+        self.assertEqual(admin_playground["creatorId"], admin.id)
+
+        # Unknown targets are not found for both grant and revoke.
+        for method in ("PUT", "DELETE"):
+            status, _, body = self.request(
+                method,
+                "/api/v1/admin/publishers/missing-user",
+                token=admin_token,
+            )
+            self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_playground_policy_archive_and_unarchive_authorization(self):
+        admin = self.seed_user("admin")
+        owner = self.seed_user("teacher")
+        other = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        owner_token = self.login_token(owner.username)
+        other_token = self.login_token(other.username)
+        student_token = self.login_token(student.username)
+
+        self.grant_publisher(admin_token, owner.id)
+        self.grant_publisher(admin_token, other.id)
+        playground_id = self.create_playground(
+            owner_token, self.unique("pg")
+        )["id"]
+
+        # Unrelated actors cannot change policy or archive state.
+        for token in (other_token, student_token):
+            for payload in ({"policy": "public"}, {"archived": True}):
+                status, _, body = self.request(
+                    "PATCH",
+                    f"/api/v1/playgrounds/{playground_id}",
+                    payload,
+                    token=token,
+                )
+                self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # The creator and Admin can change policy.
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": "public"},
+            token=owner_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["playground"]["policy"], "public")
+
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": "release_only"},
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["playground"]["policy"], "release_only")
+
+        # The creator archives; retrying keeps the first archivedAt.
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"archived": True},
+            token=owner_token,
+        )
+        self.assertEqual(status, 200)
+        archived_at = body["playground"]["archivedAt"]
+        self.assertIsNotNone(archived_at)
+
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"archived": True},
+            token=owner_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["playground"]["archivedAt"], archived_at)
+
+        # Only Admin may unarchive.
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"archived": False},
+            token=owner_token,
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"archived": False},
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["playground"]["archivedAt"])
+
+        # Missing playgrounds are not found.
+        for payload in ({"policy": "public"}, {"archived": True}):
+            status, _, body = self.request(
+                "PATCH",
+                "/api/v1/playgrounds/missing-playground",
+                payload,
+                token=admin_token,
+            )
+            self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_playground_creation_defaults_and_stores_no_content(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {
+                "id": playground_id,
+                "policy": "public",
+                "content": {"main.py": "print('hi')"},
+                "bundle": "base64",
+                "refs": ["refs/heads/main"],
+                "git": {"commit": "deadbeef"},
+            },
+            token=admin_token,
+        )
+        self.assertEqual(status, 201)
+        playground = body["playground"]
+        self.assertEqual(
+            set(playground),
+            {"id", "creatorId", "policy", "createdAt", "archivedAt"},
+        )
+        self.assertEqual(playground["policy"], "release_only")
+        self.assertIsNone(playground["archivedAt"])
+
+        connection = open_database(self.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT creator_id, policy, archived_at FROM playgrounds"
+                " WHERE id = ?",
+                (playground_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["creator_id"], admin.id)
+        self.assertEqual(rows[0]["policy"], "release_only")
+        self.assertIsNone(rows[0]["archived_at"])
+
+        # Metadata creation writes no Git refs or loose objects.
+        self.assertEqual(
+            list((self.repository_path / "refs" / "heads").iterdir()), []
+        )
+        self.assertEqual(
+            list((self.repository_path / "refs" / "tags").iterdir()), []
+        )
+        for path in self.repository_path.rglob("*"):
+            self.assertNotIn(playground_id, path.name)
+
+    def test_playground_mutation_validation(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        self.grant_publisher(admin_token, teacher.id)
+
+        for payload in ({}, {"id": ""}, {"id": 7}, {"id": None}):
+            status, _, body = self.request(
+                "POST", "/api/v1/playgrounds", payload, token=admin_token
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), payload
+            )
+
+        playground_id = self.create_playground(
+            teacher_token, self.unique("pg")
+        )["id"]
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=admin_token,
+        )
+        self.assertEqual((status, body["code"]), (409, "conflict"))
+
+        invalid_mutations = (
+            {},
+            {"policy": "public", "archived": True},
+            {"policy": "secret"},
+            {"policy": 7},
+            {"policy": None},
+            {"archived": "true"},
+            {"archived": 1},
+            {"archived": None},
+            {"unknown": True},
+            {"policy": "public", "extra": 1},
+        )
+        for payload in invalid_mutations:
+            status, _, body = self.request(
+                "PATCH",
+                f"/api/v1/playgrounds/{playground_id}",
+                payload,
+                token=admin_token,
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), payload
+            )
+
+        # Rejected mutations left the stored metadata untouched.
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": "public"},
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["playground"]["policy"], "public")
+
+    def test_playground_routes_reject_invalid_sessions(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        playground = self.create_playground(admin_token, self.unique("pg"))
+
+        calls = (
+            ("PUT", f"/api/v1/admin/publishers/{admin.id}", None),
+            ("DELETE", f"/api/v1/admin/publishers/{admin.id}", None),
+            ("POST", "/api/v1/playgrounds", {"id": "pg-unauthorized"}),
+            (
+                "PATCH",
+                f"/api/v1/playgrounds/{playground['id']}",
+                {"policy": "public"},
+            ),
+        )
+        for method, path, payload in calls:
+            for token in (None, "bogus"):
+                status, _, body = self.request(
+                    method, path, payload, token=token
+                )
+                self.assertEqual(
+                    (status, body["code"]),
+                    (401, "invalid_session"),
+                    (method, path, token),
+                )
+
+    def test_playground_route_methods_and_paths(self):
+        method_not_allowed = (
+            ("GET", "/api/v1/playgrounds", "POST"),
+            ("PUT", "/api/v1/playgrounds", "POST"),
+            ("PATCH", "/api/v1/playgrounds", "POST"),
+            ("DELETE", "/api/v1/playgrounds", "POST"),
+            ("GET", "/api/v1/playgrounds/some-id", "PATCH"),
+            ("POST", "/api/v1/playgrounds/some-id", "PATCH"),
+            ("PUT", "/api/v1/playgrounds/some-id", "PATCH"),
+            ("DELETE", "/api/v1/playgrounds/some-id", "PATCH"),
+            ("POST", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
+            ("GET", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
+            ("PATCH", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
+        )
+        for method, path, allow in method_not_allowed:
+            status, headers, body = self.request(method, path)
+            self.assertEqual(status, 405, (method, path))
+            self.assertEqual(headers.get("allow"), allow, (method, path))
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        not_found = (
+            ("GET", "/api/v1/playgrounds/"),
+            ("GET", "/api/v1/playgrounds/a/b"),
+            ("GET", "/api/v1/admin/publishers"),
+            ("GET", "/api/v1/admin/publishers/"),
+            ("PUT", "/api/v1/admin/publishers/a/b"),
+        )
+        for method, path in not_found:
+            status, _, body = self.request(method, path)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), (method, path)
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

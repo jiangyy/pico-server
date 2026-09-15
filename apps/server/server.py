@@ -30,6 +30,16 @@ from classes import (
     remove_membership,
 )
 from database import open_database
+from playgrounds import (
+    InvalidPolicyError,
+    InvalidRequestError,
+    MissingPlaygroundError,
+    PlaygroundConflictError,
+    create_playground,
+    grant_publisher,
+    revoke_publisher,
+    update_playground,
+)
 from repository import DEFAULT_REPOSITORY_PATH, open_repository
 from sessions import (
     InvalidCredentialsError,
@@ -60,6 +70,8 @@ ADMIN_CLASSES_PATH = "/api/v1/admin/classes"
 CLASS_OWNER_SUFFIX = "/owner"
 CLASS_MEMBERS_SEGMENT = "/members/"
 CLASSES_PATH = "/api/v1/classes"
+ADMIN_PUBLISHERS_PATH = "/api/v1/admin/publishers"
+PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 
 
 def _match_admin_user_role(path):
@@ -117,6 +129,30 @@ def _match_class(path):
     return class_id
 
 
+def _match_admin_publisher(path):
+    """Return the opaque user ID in an admin publisher path, else None."""
+    prefix = ADMIN_PUBLISHERS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    user_id = path[len(prefix):]
+    if not user_id or "/" in user_id:
+        return None
+    return user_id
+
+
+def _match_playground(path):
+    """Return the opaque playground ID in a playground path, else None."""
+    prefix = PLAYGROUNDS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    playground_id = path[len(prefix):]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -136,6 +172,12 @@ def _allowed_methods(path):
         return ALLOWED_METHODS
     if _match_class(path) is not None:
         return ALLOWED_METHODS
+    if _match_admin_publisher(path) is not None:
+        return ("PUT", "DELETE")
+    if path == PLAYGROUNDS_PATH:
+        return ("POST",)
+    if _match_playground(path) is not None:
+        return ("PATCH",)
     return None
 
 
@@ -185,6 +227,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_admin_user()
         elif path == ADMIN_CLASSES_PATH:
             self._post_admin_class()
+        elif path == PLAYGROUNDS_PATH:
+            self._post_playground()
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -194,10 +238,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         user_id = _match_admin_user_role(path)
         class_id = _match_class_owner(path)
+        playground_id = _match_playground(path)
         if user_id is not None:
             self._patch_admin_user_role(user_id)
         elif class_id is not None:
             self._patch_class_owner(class_id)
+        elif playground_id is not None:
+            self._patch_playground(playground_id)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -206,8 +253,11 @@ class Handler(BaseHTTPRequestHandler):
     def _route_put(self):
         path = urlsplit(self.path).path
         member = _match_class_member(path)
+        publisher_id = _match_admin_publisher(path)
         if member is not None:
             self._put_class_member(*member)
+        elif publisher_id is not None:
+            self._put_admin_publisher(publisher_id)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -216,8 +266,11 @@ class Handler(BaseHTTPRequestHandler):
     def _route_delete(self):
         path = urlsplit(self.path).path
         member = _match_class_member(path)
+        publisher_id = _match_admin_publisher(path)
         if member is not None:
             self._delete_class_member(*member)
+        elif publisher_id is not None:
+            self._delete_admin_publisher(publisher_id)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -541,6 +594,115 @@ class Handler(BaseHTTPRequestHandler):
 
         self._respond(204, "")
 
+    def _put_admin_publisher(self, user_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                grant_publisher(connection, actor, user_id)
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond(204, "")
+
+    def _delete_admin_publisher(self, user_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                revoke_publisher(connection, actor, user_id)
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond(204, "")
+
+    def _post_playground(self):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                playground = create_playground(
+                    connection,
+                    actor,
+                    payload["id"],
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except PlaygroundConflictError:
+            self._api_error(409, "conflict")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(
+            201,
+            {"playground": self._playground_payload(playground)},
+        )
+
+    def _patch_playground(self, playground_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                playground = update_playground(
+                    connection,
+                    actor,
+                    playground_id,
+                    payload,
+                )
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidPolicyError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingPlaygroundError:
+            self._api_error(404, "not_found")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(
+            200,
+            {"playground": self._playground_payload(playground)},
+        )
+
     def _authenticate(self, head_only=False):
         token = self._bearer_token()
         if token is None:
@@ -624,6 +786,16 @@ class Handler(BaseHTTPRequestHandler):
             "studentId": membership.student_id,
             "classId": membership.class_id,
             "joinedAt": membership.joined_at,
+        }
+
+    @staticmethod
+    def _playground_payload(playground):
+        return {
+            "id": playground.id,
+            "creatorId": playground.creator_id,
+            "policy": playground.policy,
+            "createdAt": playground.created_at,
+            "archivedAt": playground.archived_at,
         }
 
     def _database(self):
