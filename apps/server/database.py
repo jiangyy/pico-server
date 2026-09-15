@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def open_database(path):
@@ -147,6 +147,28 @@ def _initialize_schema(connection):
                 "ON publisher_grants(granted_by)"
             )
             _record_migration(connection, 5)
+
+        if version < 6:
+            connection.execute(
+                """
+                CREATE TABLE idempotency_results (
+                    actor_id TEXT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL
+                        CHECK (endpoint <> '' AND length(endpoint) <= 255),
+                    request_key TEXT NOT NULL
+                        CHECK (request_key <> '' AND length(request_key) <= 255),
+                    request_sha256 TEXT NOT NULL
+                        CHECK (length(request_sha256) = 64),
+                    response_status INTEGER NOT NULL
+                        CHECK (response_status BETWEEN 100 AND 599),
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (actor_id, endpoint, request_key)
+                )
+                """
+            )
+            _record_migration(connection, 6)
 
 
 def _record_migration(connection, version):

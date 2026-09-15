@@ -81,6 +81,34 @@ class DatabaseTest(unittest.TestCase):
             (user_id, granted_by),
         )
 
+    def insert_idempotency_result(
+        self,
+        connection,
+        actor_id="user-1",
+        endpoint="/playgrounds",
+        request_key="key-1",
+        request_sha256="a" * 64,
+        status=201,
+        response_json='{"id":"playground-1"}',
+    ):
+        connection.execute(
+            """
+            INSERT INTO idempotency_results (
+                actor_id, endpoint, request_key, request_sha256,
+                response_status, response_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, '2026-09-15T00:00:00Z')
+            """,
+            (
+                actor_id,
+                endpoint,
+                request_key,
+                request_sha256,
+                status,
+                response_json,
+            ),
+        )
+
     def create_version_three_database(self):
         self.database_path.parent.mkdir(parents=True)
         connection = sqlite3.connect(self.database_path)
@@ -262,7 +290,7 @@ class DatabaseTest(unittest.TestCase):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5, 6])
         self.assertEqual(
             connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 4"
@@ -312,7 +340,7 @@ class DatabaseTest(unittest.TestCase):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5, 6])
         self.assertEqual(
             connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 5"
@@ -404,6 +432,112 @@ class DatabaseTest(unittest.TestCase):
             connection.execute("DELETE FROM users WHERE id = 'user-1'")
         with self.assertRaises(sqlite3.IntegrityError):
             connection.execute("DELETE FROM users WHERE id = 'admin-1'")
+
+    def test_version_five_database_is_upgraded(self):
+        connection = self.open()
+        self.insert_user(connection)
+        connection.execute("DROP TABLE idempotency_results")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+        connection.commit()
+
+        upgraded = self.open()
+
+        versions = upgraded.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        self.assertEqual(
+            [row["version"] for row in versions], [1, 2, 3, 4, 5, 6]
+        )
+        users = upgraded.execute("SELECT id FROM users").fetchall()
+        self.assertEqual([row["id"] for row in users], ["user-1"])
+        tables = upgraded.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'idempotency_results'
+            """
+        ).fetchall()
+        self.assertEqual([row["name"] for row in tables], ["idempotency_results"])
+
+    def test_idempotency_schema_is_created(self):
+        connection = self.open()
+
+        columns = connection.execute(
+            "PRAGMA table_info(idempotency_results)"
+        ).fetchall()
+        self.assertEqual(
+            {row["name"] for row in columns},
+            {
+                "actor_id",
+                "endpoint",
+                "request_key",
+                "request_sha256",
+                "response_status",
+                "response_json",
+                "created_at",
+            },
+        )
+        primary_key = [row["name"] for row in columns if row["pk"] > 0]
+        self.assertEqual(primary_key, ["actor_id", "endpoint", "request_key"])
+
+    def test_idempotency_scope_must_be_unique(self):
+        connection = self.open()
+        self.insert_user(connection)
+        self.insert_idempotency_result(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, status=202)
+
+    def test_idempotency_requires_existing_actor(self):
+        connection = self.open()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, actor_id="missing")
+
+    def test_idempotency_rejects_empty_or_oversized_scope(self):
+        connection = self.open()
+        self.insert_user(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, endpoint="")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, request_key="")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, endpoint="e" * 256)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, request_key="k" * 256)
+
+    def test_idempotency_rejects_invalid_status_and_digest(self):
+        connection = self.open()
+        self.insert_user(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, status=99)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, status=600)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_idempotency_result(connection, request_sha256="short")
+
+    def test_idempotency_stores_no_secret_columns(self):
+        connection = self.open()
+        forbidden = {
+            "token",
+            "token_hash",
+            "password",
+            "password_hash",
+            "source",
+            "body",
+            "request_body",
+            "bundle",
+        }
+
+        columns = connection.execute(
+            "PRAGMA table_info(idempotency_results)"
+        ).fetchall()
+        self.assertEqual(
+            {row["name"] for row in columns} & forbidden,
+            set(),
+            "unexpected secret columns in idempotency_results",
+        )
 
     def test_playground_tables_store_no_git_content(self):
         connection = self.open()
