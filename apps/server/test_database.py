@@ -152,6 +152,36 @@ class DatabaseTest(unittest.TestCase):
             connection, playground_id="playground-1", creator_id="teacher-1"
         )
 
+    def insert_submission(
+        self,
+        connection,
+        submission_id="submission-1",
+        release_id="release-1",
+        student_id="student-1",
+        work_commit_id="work-commit-1",
+        created_at="2026-09-21T00:00:00Z",
+    ):
+        connection.execute(
+            """
+            INSERT INTO submissions (
+                id, release_id, student_id, work_commit_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                submission_id,
+                release_id,
+                student_id,
+                work_commit_id,
+                created_at,
+            ),
+        )
+
+    def insert_submission_parents(self, connection):
+        self.insert_release_parents(connection)
+        self.insert_user(connection, user_id="student-1", username="student")
+        self.insert_release(connection)
+
     def create_version_three_database(self):
         self.database_path.parent.mkdir(parents=True)
         connection = sqlite3.connect(self.database_path)
@@ -367,6 +397,44 @@ class DatabaseTest(unittest.TestCase):
                 'teacher-1', '/playgrounds', 'key-1',
                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 201, '{"id":"playground-1"}', '2026-09-15T00:00:00Z'
+            );
+            """
+        )
+        connection.close()
+
+    def create_version_seven_database(self):
+        self.create_version_six_database()
+        connection = sqlite3.connect(self.database_path)
+        connection.executescript(
+            """
+            CREATE TABLE releases (
+                id TEXT PRIMARY KEY NOT NULL,
+                class_id TEXT NOT NULL
+                    REFERENCES classes(id) ON DELETE RESTRICT,
+                playground_id TEXT NOT NULL
+                    REFERENCES playgrounds(id) ON DELETE RESTRICT,
+                playground_commit_id TEXT NOT NULL
+                    CHECK (playground_commit_id <> ''),
+                created_by TEXT NOT NULL
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                open_at TEXT NOT NULL,
+                due_at TEXT,
+                requires_submission INTEGER NOT NULL
+                    CHECK (requires_submission IN (0, 1)),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX releases_class_id_idx ON releases(class_id);
+            CREATE INDEX releases_playground_commit_id_idx
+                ON releases(playground_id, playground_commit_id);
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (7, '2026-09-15T00:00:06Z');
+            INSERT INTO releases (
+                id, class_id, playground_id, playground_commit_id,
+                created_by, open_at, due_at, requires_submission, created_at
+            ) VALUES (
+                'release-1', 'class-1', 'playground-1', 'commit-1',
+                'teacher-1', '2026-09-20T00:00:00Z', NULL, 1,
+                '2026-09-15T00:00:00Z'
             );
             """
         )
@@ -601,8 +669,10 @@ class DatabaseTest(unittest.TestCase):
     def test_version_five_database_is_upgraded(self):
         connection = self.open()
         self.insert_user(connection)
+        connection.execute("DROP TABLE submissions")
         connection.execute("DROP TABLE releases")
         connection.execute("DROP TABLE idempotency_results")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 8")
         connection.execute("DELETE FROM schema_migrations WHERE version = 7")
         connection.execute("DELETE FROM schema_migrations WHERE version = 6")
         connection.commit()
@@ -622,13 +692,14 @@ class DatabaseTest(unittest.TestCase):
             """
             SELECT name FROM sqlite_master
             WHERE type = 'table' AND name IN (
-                'idempotency_results', 'releases'
+                'idempotency_results', 'releases', 'submissions'
             )
             ORDER BY name
             """
         ).fetchall()
         self.assertEqual(
-            [row["name"] for row in tables], ["idempotency_results", "releases"]
+            [row["name"] for row in tables],
+            ["idempotency_results", "releases", "submissions"],
         )
 
     def test_idempotency_schema_is_created(self):
@@ -798,7 +869,7 @@ class DatabaseTest(unittest.TestCase):
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
         self.assertEqual(
-            [row["version"] for row in versions], [1, 2, 3, 4, 5, 6, 7]
+            [row["version"] for row in versions], [1, 2, 3, 4, 5, 6, 7, 8]
         )
         self.assertEqual(
             connection.execute(
@@ -1193,6 +1264,533 @@ class DatabaseTest(unittest.TestCase):
             "releases must not duplicate branch, source, manifest, "
             "or membership snapshot data",
         )
+
+    def test_submission_schema_is_created(self):
+        connection = self.open()
+
+        columns = connection.execute("PRAGMA table_info(submissions)").fetchall()
+        self.assertEqual(
+            {row["name"] for row in columns},
+            {
+                "id",
+                "release_id",
+                "student_id",
+                "work_commit_id",
+                "created_at",
+            },
+        )
+        primary_key = [row["name"] for row in columns if row["pk"] > 0]
+        self.assertEqual(primary_key, ["id"])
+
+    def test_submission_required_columns_are_not_null(self):
+        connection = self.open()
+        required = {
+            "id",
+            "release_id",
+            "student_id",
+            "work_commit_id",
+            "created_at",
+        }
+        columns = connection.execute("PRAGMA table_info(submissions)").fetchall()
+        not_null = {row["name"] for row in columns if row["notnull"] == 1}
+        self.assertEqual(not_null, required)
+        self.assertEqual(
+            {row["name"] for row in columns if row["notnull"] == 0}, set()
+        )
+
+        self.insert_submission_parents(connection)
+        values = {
+            "submission_id": "submission-1",
+            "release_id": "release-1",
+            "student_id": "student-1",
+            "work_commit_id": "work-commit-1",
+            "created_at": "2026-09-21T00:00:00Z",
+        }
+        for column, key in (
+            ("id", "submission_id"),
+            ("release_id", "release_id"),
+            ("student_id", "student_id"),
+            ("work_commit_id", "work_commit_id"),
+            ("created_at", "created_at"),
+        ):
+            with self.subTest(column=column):
+                missing = dict(values)
+                missing[key] = None
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.insert_submission(connection, **missing)
+
+    def test_submission_index_shape(self):
+        connection = self.open()
+
+        indexes = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA index_list(submissions)").fetchall()
+        }
+        self.assertIn("submissions_release_id_idx", indexes)
+        self.assertIn("submissions_student_id_idx", indexes)
+        self.assertEqual(indexes["submissions_release_id_idx"]["unique"], 0)
+        self.assertEqual(indexes["submissions_student_id_idx"]["unique"], 0)
+
+        release_columns = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_info(submissions_release_id_idx)"
+            ).fetchall()
+        ]
+        self.assertEqual(release_columns, ["release_id"])
+        student_columns = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_info(submissions_student_id_idx)"
+            ).fetchall()
+        ]
+        self.assertEqual(student_columns, ["student_id"])
+
+    def test_submission_foreign_key_shape(self):
+        connection = self.open()
+
+        foreign_keys = {
+            (row["from"], row["table"], row["to"], row["on_delete"])
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(submissions)"
+            ).fetchall()
+        }
+        self.assertEqual(
+            foreign_keys,
+            {
+                ("release_id", "releases", "id", "RESTRICT"),
+                ("student_id", "users", "id", "RESTRICT"),
+            },
+        )
+
+    def test_submission_requires_existing_release_and_student(self):
+        connection = self.open()
+        self.insert_submission_parents(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_submission(connection, release_id="missing")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_submission(connection, student_id="missing")
+
+    def test_deleting_submission_references_is_restricted(self):
+        connection = self.open()
+        self.insert_submission_parents(connection)
+        self.insert_submission(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM releases WHERE id = 'release-1'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM users WHERE id = 'student-1'")
+
+    def test_repeated_submissions_are_allowed(self):
+        connection = self.open()
+        self.insert_submission_parents(connection)
+
+        self.insert_submission(
+            connection,
+            submission_id="submission-1",
+            work_commit_id="work-commit-1",
+        )
+        self.insert_submission(
+            connection,
+            submission_id="submission-2",
+            work_commit_id="work-commit-1",
+        )
+        self.insert_submission(
+            connection,
+            submission_id="submission-3",
+            work_commit_id="work-commit-2",
+        )
+
+        rows = connection.execute(
+            """
+            SELECT id, release_id, student_id, work_commit_id
+            FROM submissions ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["release_id"],
+                    row["student_id"],
+                    row["work_commit_id"],
+                )
+                for row in rows
+            ],
+            [
+                ("submission-1", "release-1", "student-1", "work-commit-1"),
+                ("submission-2", "release-1", "student-1", "work-commit-1"),
+                ("submission-3", "release-1", "student-1", "work-commit-2"),
+            ],
+        )
+
+    def test_submission_work_commit_id_is_opaque_and_not_a_foreign_key(self):
+        connection = self.open()
+        self.insert_submission_parents(connection)
+
+        self.insert_submission(
+            connection,
+            submission_id="submission-1",
+            work_commit_id="0" * 40,
+        )
+        self.insert_submission(
+            connection,
+            submission_id="submission-2",
+            work_commit_id="deadbeef",
+        )
+
+        foreign_columns = {
+            row["from"]
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(submissions)"
+            ).fetchall()
+        }
+        self.assertNotIn("work_commit_id", foreign_columns)
+        commits = connection.execute(
+            "SELECT DISTINCT work_commit_id FROM submissions "
+            "ORDER BY work_commit_id"
+        ).fetchall()
+        self.assertEqual(
+            [row["work_commit_id"] for row in commits],
+            ["0" * 40, "deadbeef"],
+        )
+
+    def test_submission_rejects_empty_work_commit_id(self):
+        connection = self.open()
+        self.insert_submission_parents(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_submission(connection, work_commit_id="")
+
+    def test_submission_stores_no_source_tree_or_status_columns(self):
+        connection = self.open()
+        forbidden = {
+            "source",
+            "source_code",
+            "tree",
+            "blob",
+            "content",
+            "payload",
+            "bundle",
+            "status",
+            "state",
+            "grading_status",
+            "submission_status",
+        }
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(submissions)").fetchall()
+        }
+        self.assertEqual(
+            columns & forbidden,
+            set(),
+            "submissions must not store source, tree, or mutable status data",
+        )
+
+    def test_version_seven_database_is_upgraded(self):
+        self.create_version_seven_database()
+
+        connection = self.open()
+
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        self.assertEqual(
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 8"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0],
+            0,
+        )
+        users = connection.execute(
+            "SELECT id, username, role FROM users ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["id"], row["username"], row["role"])
+                for row in users
+            ],
+            [
+                ("admin-1", "admin", "admin"),
+                ("student-1", "student", "student"),
+                ("teacher-1", "teacher", "teacher"),
+            ],
+        )
+        sessions = connection.execute(
+            """
+            SELECT token_hash, user_id, created_at, expires_at, revoked_at
+            FROM sessions
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["token_hash"],
+                    row["user_id"],
+                    row["created_at"],
+                    row["expires_at"],
+                    row["revoked_at"],
+                )
+                for row in sessions
+            ],
+            [
+                (
+                    "token-hash",
+                    "teacher-1",
+                    "2026-09-15T00:00:00Z",
+                    "2026-09-16T00:00:00Z",
+                    None,
+                )
+            ],
+        )
+        classes = connection.execute(
+            "SELECT id, name, teacher_id, created_at, archived_at FROM classes"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["name"],
+                    row["teacher_id"],
+                    row["created_at"],
+                    row["archived_at"],
+                )
+                for row in classes
+            ],
+            [
+                (
+                    "class-1",
+                    "Algebra",
+                    "teacher-1",
+                    "2026-09-15T00:00:00Z",
+                    None,
+                )
+            ],
+        )
+        memberships = connection.execute(
+            "SELECT student_id, class_id, joined_at FROM class_memberships"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["student_id"], row["class_id"], row["joined_at"])
+                for row in memberships
+            ],
+            [("student-1", "class-1", "2026-09-15T00:00:00Z")],
+        )
+        playgrounds = connection.execute(
+            """
+            SELECT id, creator_id, policy, created_at, archived_at
+            FROM playgrounds
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["creator_id"],
+                    row["policy"],
+                    row["created_at"],
+                    row["archived_at"],
+                )
+                for row in playgrounds
+            ],
+            [
+                (
+                    "playground-1",
+                    "teacher-1",
+                    "release_only",
+                    "2026-09-15T00:00:00Z",
+                    None,
+                )
+            ],
+        )
+        grants = connection.execute(
+            "SELECT user_id, granted_by, created_at FROM publisher_grants"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["user_id"], row["granted_by"], row["created_at"])
+                for row in grants
+            ],
+            [("teacher-1", "admin-1", "2026-09-15T00:00:00Z")],
+        )
+        idempotency = connection.execute(
+            """
+            SELECT actor_id, endpoint, request_key, request_sha256,
+                   response_status, response_json, created_at
+            FROM idempotency_results
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["actor_id"],
+                    row["endpoint"],
+                    row["request_key"],
+                    row["request_sha256"],
+                    row["response_status"],
+                    row["response_json"],
+                    row["created_at"],
+                )
+                for row in idempotency
+            ],
+            [
+                (
+                    "teacher-1",
+                    "/playgrounds",
+                    "key-1",
+                    "a" * 64,
+                    201,
+                    '{"id":"playground-1"}',
+                    "2026-09-15T00:00:00Z",
+                )
+            ],
+        )
+        releases = connection.execute(
+            """
+            SELECT id, class_id, playground_id, playground_commit_id,
+                   created_by, open_at, due_at, requires_submission, created_at
+            FROM releases
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["class_id"],
+                    row["playground_id"],
+                    row["playground_commit_id"],
+                    row["created_by"],
+                    row["open_at"],
+                    row["due_at"],
+                    row["requires_submission"],
+                    row["created_at"],
+                )
+                for row in releases
+            ],
+            [
+                (
+                    "release-1",
+                    "class-1",
+                    "playground-1",
+                    "commit-1",
+                    "teacher-1",
+                    "2026-09-20T00:00:00Z",
+                    None,
+                    1,
+                    "2026-09-15T00:00:00Z",
+                )
+            ],
+        )
+
+    def test_submission_survives_account_and_class_administration(self):
+        connection = self.open()
+        self.insert_submission_parents(connection)
+        self.insert_membership(connection, "student-1", "class-1")
+        self.insert_submission(connection)
+
+        before = dict(
+            connection.execute(
+                """
+                SELECT id, release_id, student_id, work_commit_id, created_at
+                FROM submissions WHERE id = 'submission-1'
+                """
+            ).fetchone()
+        )
+
+        connection.execute(
+            "UPDATE users SET username = 'student-renamed' WHERE id = 'student-1'"
+        )
+        self.insert_user(connection, user_id="teacher-2", username="teacher-two")
+        connection.execute(
+            "UPDATE classes SET teacher_id = 'teacher-2' WHERE id = 'class-1'"
+        )
+        self.insert_class(
+            connection, class_id="class-2", teacher_id="teacher-2", name="Geometry"
+        )
+        connection.execute(
+            "UPDATE class_memberships SET class_id = 'class-2' "
+            "WHERE student_id = 'student-1'"
+        )
+        connection.execute(
+            "DELETE FROM class_memberships WHERE student_id = 'student-1'"
+        )
+
+        self.assertEqual(
+            connection.execute(
+                "SELECT username FROM users WHERE id = 'student-1'"
+            ).fetchone()["username"],
+            "student-renamed",
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT teacher_id FROM classes WHERE id = 'class-1'"
+            ).fetchone()["teacher_id"],
+            "teacher-2",
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM class_memberships"
+            ).fetchone()[0],
+            0,
+        )
+
+        after = dict(
+            connection.execute(
+                """
+                SELECT id, release_id, student_id, work_commit_id, created_at
+                FROM submissions WHERE id = 'submission-1'
+                """
+            ).fetchone()
+        )
+        self.assertEqual(
+            after,
+            {
+                "id": "submission-1",
+                "release_id": "release-1",
+                "student_id": "student-1",
+                "work_commit_id": "work-commit-1",
+                "created_at": "2026-09-21T00:00:00Z",
+            },
+        )
+        self.assertEqual(after, before)
+
+    def test_failed_submission_migration_rolls_back(self):
+        self.create_version_seven_database()
+        blocker = sqlite3.connect(self.database_path)
+        blocker.execute("CREATE TABLE submissions_release_id_idx (marker INTEGER)")
+        blocker.commit()
+        blocker.close()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            open_database(self.database_path)
+
+        connection = sqlite3.connect(self.database_path)
+        self.addCleanup(connection.close)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertNotIn("submissions", tables)
+        self.assertIn("submissions_release_id_idx", tables)
+        versions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
 
     def test_newer_schema_is_rejected(self):
         connection = self.open()
