@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def open_database(path):
@@ -27,6 +27,7 @@ def open_database(path):
 
 def _initialize_schema(connection):
     with connection:
+        connection.execute("BEGIN")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -169,6 +170,36 @@ def _initialize_schema(connection):
                 """
             )
             _record_migration(connection, 6)
+
+        if version < 7:
+            connection.execute(
+                """
+                CREATE TABLE releases (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    class_id TEXT NOT NULL
+                        REFERENCES classes(id) ON DELETE RESTRICT,
+                    playground_id TEXT NOT NULL
+                        REFERENCES playgrounds(id) ON DELETE RESTRICT,
+                    playground_commit_id TEXT NOT NULL
+                        CHECK (playground_commit_id <> ''),
+                    created_by TEXT NOT NULL
+                        REFERENCES users(id) ON DELETE RESTRICT,
+                    open_at TEXT NOT NULL,
+                    due_at TEXT,
+                    requires_submission INTEGER NOT NULL
+                        CHECK (requires_submission IN (0, 1)),
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX releases_class_id_idx ON releases(class_id)"
+            )
+            connection.execute(
+                "CREATE INDEX releases_playground_commit_id_idx "
+                "ON releases(playground_id, playground_commit_id)"
+            )
+            _record_migration(connection, 7)
 
 
 def _record_migration(connection, version):

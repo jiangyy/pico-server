@@ -109,6 +109,49 @@ class DatabaseTest(unittest.TestCase):
             ),
         )
 
+    def insert_release(
+        self,
+        connection,
+        release_id="release-1",
+        class_id="class-1",
+        playground_id="playground-1",
+        playground_commit_id="commit-1",
+        created_by="teacher-1",
+        open_at="2026-09-20T00:00:00Z",
+        due_at=None,
+        requires_submission=0,
+        created_at="2026-09-15T00:00:00Z",
+    ):
+        connection.execute(
+            """
+            INSERT INTO releases (
+                id, class_id, playground_id, playground_commit_id,
+                created_by, open_at, due_at, requires_submission, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                release_id,
+                class_id,
+                playground_id,
+                playground_commit_id,
+                created_by,
+                open_at,
+                due_at,
+                requires_submission,
+                created_at,
+            ),
+        )
+
+    def insert_release_parents(self, connection):
+        self.insert_user(connection, user_id="teacher-1", username="teacher")
+        self.insert_class(
+            connection, class_id="class-1", teacher_id="teacher-1"
+        )
+        self.insert_playground(
+            connection, playground_id="playground-1", creator_id="teacher-1"
+        )
+
     def create_version_three_database(self):
         self.database_path.parent.mkdir(parents=True)
         connection = sqlite3.connect(self.database_path)
@@ -213,6 +256,122 @@ class DatabaseTest(unittest.TestCase):
         )
         connection.close()
 
+    def create_version_six_database(self):
+        self.database_path.parent.mkdir(parents=True)
+        connection = sqlite3.connect(self.database_path)
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY CHECK (version > 0),
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations (version, applied_at) VALUES
+                (1, '2026-09-15T00:00:00Z'),
+                (2, '2026-09-15T00:00:01Z'),
+                (3, '2026-09-15T00:00:02Z'),
+                (4, '2026-09-15T00:00:03Z'),
+                (5, '2026-09-15T00:00:04Z'),
+                (6, '2026-09-15T00:00:05Z');
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL
+                    CHECK (role IN ('student', 'teacher', 'admin')),
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
+            CREATE INDEX sessions_user_id_idx ON sessions(user_id);
+            CREATE TABLE classes (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL CHECK (name <> ''),
+                teacher_id TEXT NOT NULL
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                archived_at TEXT
+            );
+            CREATE TABLE class_memberships (
+                student_id TEXT PRIMARY KEY
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                class_id TEXT NOT NULL
+                    REFERENCES classes(id) ON DELETE RESTRICT,
+                joined_at TEXT NOT NULL
+            );
+            CREATE INDEX classes_teacher_id_idx ON classes(teacher_id);
+            CREATE INDEX class_memberships_class_id_idx
+                ON class_memberships(class_id);
+            CREATE TABLE playgrounds (
+                id TEXT PRIMARY KEY,
+                creator_id TEXT NOT NULL
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                policy TEXT NOT NULL DEFAULT 'release_only'
+                    CHECK (policy IN ('release_only', 'public')),
+                created_at TEXT NOT NULL,
+                archived_at TEXT
+            );
+            CREATE TABLE publisher_grants (
+                user_id TEXT PRIMARY KEY
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                granted_by TEXT NOT NULL
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX playgrounds_creator_id_idx ON playgrounds(creator_id);
+            CREATE INDEX publisher_grants_granted_by_idx
+                ON publisher_grants(granted_by);
+            CREATE TABLE idempotency_results (
+                actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                endpoint TEXT NOT NULL
+                    CHECK (endpoint <> '' AND length(endpoint) <= 255),
+                request_key TEXT NOT NULL
+                    CHECK (request_key <> '' AND length(request_key) <= 255),
+                request_sha256 TEXT NOT NULL
+                    CHECK (length(request_sha256) = 64),
+                response_status INTEGER NOT NULL
+                    CHECK (response_status BETWEEN 100 AND 599),
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (actor_id, endpoint, request_key)
+            );
+            INSERT INTO users (id, username, role, password_hash, created_at)
+            VALUES
+                ('teacher-1', 'teacher', 'teacher', 'hash-1',
+                 '2026-09-15T00:00:00Z'),
+                ('student-1', 'student', 'student', 'hash-2',
+                 '2026-09-15T00:00:00Z'),
+                ('admin-1', 'admin', 'admin', 'hash-3',
+                 '2026-09-15T00:00:00Z');
+            INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
+            VALUES ('token-hash', 'teacher-1', '2026-09-15T00:00:00Z',
+                    '2026-09-16T00:00:00Z');
+            INSERT INTO classes (id, name, teacher_id, created_at)
+            VALUES ('class-1', 'Algebra', 'teacher-1',
+                    '2026-09-15T00:00:00Z');
+            INSERT INTO class_memberships (student_id, class_id, joined_at)
+            VALUES ('student-1', 'class-1', '2026-09-15T00:00:00Z');
+            INSERT INTO playgrounds (id, creator_id, policy, created_at)
+            VALUES ('playground-1', 'teacher-1', 'release_only',
+                    '2026-09-15T00:00:00Z');
+            INSERT INTO publisher_grants (user_id, granted_by, created_at)
+            VALUES ('teacher-1', 'admin-1', '2026-09-15T00:00:00Z');
+            INSERT INTO idempotency_results (
+                actor_id, endpoint, request_key, request_sha256,
+                response_status, response_json, created_at
+            ) VALUES (
+                'teacher-1', '/playgrounds', 'key-1',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                201, '{"id":"playground-1"}', '2026-09-15T00:00:00Z'
+            );
+            """
+        )
+        connection.close()
+
     def test_open_creates_database_with_foreign_keys_enabled(self):
         connection = self.open()
 
@@ -290,7 +449,10 @@ class DatabaseTest(unittest.TestCase):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
+        )
         self.assertEqual(
             connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 4"
@@ -340,7 +502,10 @@ class DatabaseTest(unittest.TestCase):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
+        )
         self.assertEqual(
             connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 5"
@@ -436,7 +601,9 @@ class DatabaseTest(unittest.TestCase):
     def test_version_five_database_is_upgraded(self):
         connection = self.open()
         self.insert_user(connection)
+        connection.execute("DROP TABLE releases")
         connection.execute("DROP TABLE idempotency_results")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
         connection.execute("DELETE FROM schema_migrations WHERE version = 6")
         connection.commit()
 
@@ -446,17 +613,23 @@ class DatabaseTest(unittest.TestCase):
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
         self.assertEqual(
-            [row["version"] for row in versions], [1, 2, 3, 4, 5, 6]
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
         )
         users = upgraded.execute("SELECT id FROM users").fetchall()
         self.assertEqual([row["id"] for row in users], ["user-1"])
         tables = upgraded.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name = 'idempotency_results'
+            WHERE type = 'table' AND name IN (
+                'idempotency_results', 'releases'
+            )
+            ORDER BY name
             """
         ).fetchall()
-        self.assertEqual([row["name"] for row in tables], ["idempotency_results"])
+        self.assertEqual(
+            [row["name"] for row in tables], ["idempotency_results", "releases"]
+        )
 
     def test_idempotency_schema_is_created(self):
         connection = self.open()
@@ -615,6 +788,411 @@ class DatabaseTest(unittest.TestCase):
             connection.execute("DELETE FROM classes WHERE id = 'class-1'")
         with self.assertRaises(sqlite3.IntegrityError):
             connection.execute("DELETE FROM users WHERE id = 'student-1'")
+
+    def test_version_six_database_is_upgraded(self):
+        self.create_version_six_database()
+
+        connection = self.open()
+
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        self.assertEqual(
+            [row["version"] for row in versions], [1, 2, 3, 4, 5, 6, 7]
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 7"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM releases").fetchone()[0], 0
+        )
+        users = connection.execute("SELECT id FROM users ORDER BY id").fetchall()
+        self.assertEqual(
+            [row["id"] for row in users], ["admin-1", "student-1", "teacher-1"]
+        )
+        sessions = connection.execute(
+            "SELECT token_hash FROM sessions"
+        ).fetchall()
+        self.assertEqual([row["token_hash"] for row in sessions], ["token-hash"])
+        classes = connection.execute("SELECT id, name FROM classes").fetchall()
+        self.assertEqual(
+            [(row["id"], row["name"]) for row in classes],
+            [("class-1", "Algebra")],
+        )
+        memberships = connection.execute(
+            "SELECT student_id, class_id FROM class_memberships"
+        ).fetchall()
+        self.assertEqual(
+            [(row["student_id"], row["class_id"]) for row in memberships],
+            [("student-1", "class-1")],
+        )
+        playgrounds = connection.execute(
+            "SELECT id, creator_id, policy FROM playgrounds"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["creator_id"], row["policy"]) for row in playgrounds],
+            [("playground-1", "teacher-1", "release_only")],
+        )
+        grants = connection.execute(
+            "SELECT user_id, granted_by FROM publisher_grants"
+        ).fetchall()
+        self.assertEqual(
+            [(row["user_id"], row["granted_by"]) for row in grants],
+            [("teacher-1", "admin-1")],
+        )
+        idempotency = connection.execute(
+            """
+            SELECT actor_id, endpoint, request_key, response_status
+            FROM idempotency_results
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["actor_id"],
+                    row["endpoint"],
+                    row["request_key"],
+                    row["response_status"],
+                )
+                for row in idempotency
+            ],
+            [("teacher-1", "/playgrounds", "key-1", 201)],
+        )
+
+    def test_failed_release_migration_rolls_back(self):
+        self.create_version_six_database()
+        blocker = sqlite3.connect(self.database_path)
+        blocker.execute("CREATE TABLE releases_class_id_idx (marker INTEGER)")
+        blocker.commit()
+        blocker.close()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            open_database(self.database_path)
+
+        connection = sqlite3.connect(self.database_path)
+        self.addCleanup(connection.close)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertNotIn("releases", tables)
+        self.assertIn("releases_class_id_idx", tables)
+        versions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
+
+    def test_release_schema_is_created(self):
+        connection = self.open()
+
+        columns = connection.execute("PRAGMA table_info(releases)").fetchall()
+        self.assertEqual(
+            {row["name"] for row in columns},
+            {
+                "id",
+                "class_id",
+                "playground_id",
+                "playground_commit_id",
+                "created_by",
+                "open_at",
+                "due_at",
+                "requires_submission",
+                "created_at",
+            },
+        )
+        primary_key = [row["name"] for row in columns if row["pk"] > 0]
+        self.assertEqual(primary_key, ["id"])
+
+    def test_release_required_columns_are_not_null(self):
+        connection = self.open()
+        required = {
+            "id",
+            "class_id",
+            "playground_id",
+            "playground_commit_id",
+            "created_by",
+            "open_at",
+            "requires_submission",
+            "created_at",
+        }
+        columns = connection.execute("PRAGMA table_info(releases)").fetchall()
+        not_null = {row["name"] for row in columns if row["notnull"] == 1}
+        self.assertEqual(not_null, required)
+        optional = {row["name"] for row in columns if row["notnull"] == 0}
+        self.assertEqual(optional, {"due_at"})
+
+        self.insert_release_parents(connection)
+        values = {
+            "release_id": "release-1",
+            "class_id": "class-1",
+            "playground_id": "playground-1",
+            "playground_commit_id": "commit-1",
+            "created_by": "teacher-1",
+            "open_at": "2026-09-20T00:00:00Z",
+            "requires_submission": 0,
+            "created_at": "2026-09-15T00:00:00Z",
+        }
+        for column, key in (
+            ("id", "release_id"),
+            ("class_id", "class_id"),
+            ("playground_id", "playground_id"),
+            ("playground_commit_id", "playground_commit_id"),
+            ("created_by", "created_by"),
+            ("open_at", "open_at"),
+            ("requires_submission", "requires_submission"),
+            ("created_at", "created_at"),
+        ):
+            with self.subTest(column=column):
+                missing = dict(values)
+                missing[key] = None
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.insert_release(connection, **missing)
+
+    def test_release_boolean_is_strictly_zero_or_one(self):
+        connection = self.open()
+        self.insert_release_parents(connection)
+
+        self.insert_release(
+            connection, release_id="release-0", requires_submission=0
+        )
+        self.insert_release(
+            connection, release_id="release-1", requires_submission=1
+        )
+        stored = connection.execute(
+            "SELECT id, requires_submission FROM releases ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["requires_submission"]) for row in stored],
+            [("release-0", 0), ("release-1", 1)],
+        )
+
+        for invalid in (2, -1, 0.5, "yes", "true"):
+            with self.subTest(value=invalid):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.insert_release(
+                        connection,
+                        release_id="release-invalid",
+                        requires_submission=invalid,
+                    )
+
+    def test_release_due_at_is_nullable(self):
+        connection = self.open()
+        self.insert_release_parents(connection)
+
+        self.insert_release(connection, release_id="release-open", due_at=None)
+        self.insert_release(
+            connection,
+            release_id="release-due",
+            due_at="2026-10-01T00:00:00Z",
+        )
+
+        rows = connection.execute(
+            "SELECT id, due_at FROM releases ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["due_at"]) for row in rows],
+            [
+                ("release-due", "2026-10-01T00:00:00Z"),
+                ("release-open", None),
+            ],
+        )
+
+    def test_release_index_shape(self):
+        connection = self.open()
+
+        indexes = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA index_list(releases)").fetchall()
+        }
+        self.assertIn("releases_class_id_idx", indexes)
+        self.assertIn("releases_playground_commit_id_idx", indexes)
+        self.assertEqual(indexes["releases_class_id_idx"]["unique"], 0)
+        self.assertEqual(
+            indexes["releases_playground_commit_id_idx"]["unique"], 0
+        )
+
+        class_columns = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_info(releases_class_id_idx)"
+            ).fetchall()
+        ]
+        self.assertEqual(class_columns, ["class_id"])
+        commit_columns = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_info(releases_playground_commit_id_idx)"
+            ).fetchall()
+        ]
+        self.assertEqual(
+            commit_columns, ["playground_id", "playground_commit_id"]
+        )
+
+    def test_release_foreign_key_shape(self):
+        connection = self.open()
+
+        foreign_keys = {
+            (row["from"], row["table"], row["to"], row["on_delete"])
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(releases)"
+            ).fetchall()
+        }
+        self.assertEqual(
+            foreign_keys,
+            {
+                ("class_id", "classes", "id", "RESTRICT"),
+                ("playground_id", "playgrounds", "id", "RESTRICT"),
+                ("created_by", "users", "id", "RESTRICT"),
+            },
+        )
+
+    def test_release_requires_existing_class(self):
+        connection = self.open()
+        self.insert_user(connection, user_id="teacher-1", username="teacher")
+        self.insert_playground(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_release(connection, class_id="missing")
+
+    def test_release_requires_existing_playground(self):
+        connection = self.open()
+        self.insert_user(connection, user_id="teacher-1", username="teacher")
+        self.insert_class(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_release(connection, playground_id="missing")
+
+    def test_release_requires_existing_creator(self):
+        connection = self.open()
+        self.insert_user(connection, user_id="teacher-1", username="teacher")
+        self.insert_class(connection)
+        self.insert_playground(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_release(connection, created_by="missing")
+
+    def test_deleting_release_references_is_restricted(self):
+        connection = self.open()
+        self.insert_release_parents(connection)
+        self.insert_user(connection, user_id="author-1", username="author")
+        self.insert_release(connection, created_by="author-1")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM classes WHERE id = 'class-1'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM playgrounds WHERE id = 'playground-1'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM users WHERE id = 'author-1'")
+
+    def test_release_commit_id_is_opaque_and_not_a_foreign_key(self):
+        connection = self.open()
+        self.insert_release_parents(connection)
+
+        self.insert_release(
+            connection, release_id="release-1", playground_commit_id="0" * 40
+        )
+        self.insert_release(
+            connection, release_id="release-2", playground_commit_id="deadbeef"
+        )
+
+        foreign_columns = {
+            row["from"]
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(releases)"
+            ).fetchall()
+        }
+        self.assertNotIn("playground_commit_id", foreign_columns)
+        commits = connection.execute(
+            "SELECT DISTINCT playground_commit_id FROM releases "
+            "ORDER BY playground_commit_id"
+        ).fetchall()
+        self.assertEqual(
+            [row["playground_commit_id"] for row in commits],
+            ["0" * 40, "deadbeef"],
+        )
+
+    def test_release_rejects_empty_commit_id(self):
+        connection = self.open()
+        self.insert_release_parents(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_release(connection, playground_commit_id="")
+
+    def test_multiple_releases_may_share_exact_playground_commit(self):
+        connection = self.open()
+        self.insert_release_parents(connection)
+
+        self.insert_release(
+            connection,
+            release_id="release-1",
+            playground_commit_id="commit-shared",
+        )
+        self.insert_release(
+            connection,
+            release_id="release-2",
+            playground_commit_id="commit-shared",
+        )
+
+        rows = connection.execute(
+            """
+            SELECT id, playground_id, playground_commit_id
+            FROM releases ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["id"], row["playground_id"], row["playground_commit_id"])
+                for row in rows
+            ],
+            [
+                ("release-1", "playground-1", "commit-shared"),
+                ("release-2", "playground-1", "commit-shared"),
+            ],
+        )
+
+    def test_release_stores_no_source_manifest_or_snapshot_columns(self):
+        connection = self.open()
+        forbidden = {
+            "branch",
+            "branch_head",
+            "head",
+            "head_commit",
+            "head_commit_id",
+            "source",
+            "source_code",
+            "source_commit",
+            "manifest",
+            "manifest_id",
+            "manifest_json",
+            "manifest_sha256",
+            "snapshot",
+            "membership_snapshot",
+            "members_snapshot",
+            "content",
+            "blob",
+            "tree",
+            "payload",
+            "bundle",
+        }
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(releases)").fetchall()
+        }
+        self.assertEqual(
+            columns & forbidden,
+            set(),
+            "releases must not duplicate branch, source, manifest, "
+            "or membership snapshot data",
+        )
 
     def test_newer_schema_is_rejected(self):
         connection = self.open()
