@@ -2,6 +2,18 @@
 
 Web 与桌面端共享路由、组件、状态与 API 类型。平台能力集中在 host adapter：Web 使用浏览器存储和 Pyodide，桌面使用文件缓存与隔离 bridge。
 
+## 产品入口与产物
+
+`learn-python` 拥有 Client UI 源码及 Web/桌面构建；`picopg` 拥有 Server API 和 Web 静态产物的部署。Server 只接收构建产物，不维护第二份 Client 源码。
+
+- Student 视图是 Web 与 Windows Client 的真实 consumer；两端使用同一份路由、组件、状态与 API 类型，只替换 host adapter。
+- Teacher 和 Admin 视图在 v0.1 只进入 Web 产物，不进入 Windows EXE。它们只共享已被多个视图证明的 UI primitive 和 API data type，不共享角色业务状态。
+- Web 产物只有一个启动文档；登录后依据 Server 返回的角色进入 Student、Teacher 或 Admin 路由。Client 不从 URL 或本地标记推导授权。
+- Windows EXE 的启动文档只加载 Student 视图和 desktop host adapter。官网/下载页是独立 Portal 产物，不进入 Client。
+- Playground `course/index.html` 是发布器从课程源码生成的不可变内容 artifact，不是 Student/Teacher/Admin 产品壳入口。
+
+单文件 Student/Teacher/Admin HTML 只作为迁移期设计参考，不是发布 contract；视图接入真实 API consumer 并验收后归档。
+
 ## Local-first
 
 Client 启动时先读取本地 manifest、内容、Draft 和 runtime，再增量刷新网络数据。失败的刷新或安装不影响已安装版本。
