@@ -19,9 +19,9 @@ PicoPG 是 local-first 的 Python 学习系统：`learn-python` 发布课程，C
 
 ## 实施计划
 
-1. 建立数据库、认证、Playground 目录和内容发布。
+1. 建立数据库、认证、Class、Playground 目录和内容发布。
 2. 完成公开/授权内容下载、manifest 与 runtime 分发。
 3. 完成 Client 离线安装、Draft、Pyodide 与隔离边界。
 4. 完成 Work 初始化、CAS 同步和追加式恢复。
-5. 完成 Release、Submission、Comment 与角色授权。
+5. 完成按 Class 发放的 Release、Submission、Comment 与角色授权。
 6. 补齐备份、缓存重建、审计和端到端故障测试。

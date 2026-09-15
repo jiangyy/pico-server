@@ -12,7 +12,7 @@
 
 ## 安装与运行
 
-1. Client 先展示本地内容，再合并公开目录与用户可见的 Release。
+1. Client 先展示本地内容，再合并公开目录与当前 Class 可见的 Release。
 2. Client 按 commit manifest 下载缺失 blob/runtime，校验 size 与 SHA-256 后原子安装。
 3. Client 在隔离 renderer 中打开课程；Pyodide 与执行输出留在本地。
 4. 每次编辑立即保存到当前用户的本地 Draft。
@@ -31,8 +31,10 @@ HEAD 不匹配时返回冲突和最新 HEAD。Client 保留 Draft，由用户 re
 
 ## 发布作业与审阅
 
-1. Teacher 创建固定 Playground commit 的 Release；学生仅在 `openAt` 后且师生关系仍有效时可见。
-2. Client 提交前先同步脏 Draft，再以同一 Playground 版本的 Work commit 创建 Submission。
+1. Teacher 为自己拥有的 Class 创建固定 Playground commit 的 Release；学生仅在 `openAt` 后且仍是当前成员时可见。
+2. Client 提交前先同步脏 Draft，再以同一 Playground 版本的 Work commit 创建 Submission；Server 同时校验当前 ClassMembership。
 3. Teacher 读取该快照并添加 Comment；授权的 AI/system 也使用 Comment，且显式记录 source。
 
 Release、Submission 和 Comment 均为不可变记录。`requiresSubmission` 为真时，`dueAt` 后拒绝新 Submission。Client 重连后重新读取当前 canonical 数据，不依赖实时通知。
+
+转班后，学生按新 Class 获取 Release；已经创建的 Submission 与 Comment 保持不变。
