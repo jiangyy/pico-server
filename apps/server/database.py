@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def open_database(path):
@@ -112,6 +112,41 @@ def _initialize_schema(connection):
                 "ON class_memberships(class_id)"
             )
             _record_migration(connection, 4)
+
+        if version < 5:
+            connection.execute(
+                """
+                CREATE TABLE playgrounds (
+                    id TEXT PRIMARY KEY,
+                    creator_id TEXT NOT NULL
+                        REFERENCES users(id) ON DELETE RESTRICT,
+                    policy TEXT NOT NULL DEFAULT 'release_only'
+                        CHECK (policy IN ('release_only', 'public')),
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE publisher_grants (
+                    user_id TEXT PRIMARY KEY
+                        REFERENCES users(id) ON DELETE RESTRICT,
+                    granted_by TEXT NOT NULL
+                        REFERENCES users(id) ON DELETE RESTRICT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX playgrounds_creator_id_idx "
+                "ON playgrounds(creator_id)"
+            )
+            connection.execute(
+                "CREATE INDEX publisher_grants_granted_by_idx "
+                "ON publisher_grants(granted_by)"
+            )
+            _record_migration(connection, 5)
 
 
 def _record_migration(connection, version):
