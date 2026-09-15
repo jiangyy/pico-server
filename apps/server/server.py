@@ -6,7 +6,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from accounts import UsernameTakenError, register_student
+from accounts import (
+    ForbiddenActionError,
+    InvalidRoleError,
+    MissingUserError,
+    RoleConflictError,
+    UsernameTakenError,
+    change_user_role,
+    create_user,
+    register_student,
+)
 from database import open_database
 from repository import DEFAULT_REPOSITORY_PATH, open_repository
 from sessions import (
@@ -32,6 +41,36 @@ ROUTE_METHODS = {
     "/api/v1/login": ("POST",),
     "/api/v1/logout": ("POST",),
 }
+ADMIN_USERS_PATH = "/api/v1/admin/users"
+ADMIN_USER_ROLE_SUFFIX = "/role"
+
+
+def _match_admin_user_role(path):
+    """Return the opaque user ID in an admin role path, else None."""
+    prefix = ADMIN_USERS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    remainder = path[len(prefix):]
+    if not remainder.endswith(ADMIN_USER_ROLE_SUFFIX):
+        return None
+
+    user_id = remainder[: -len(ADMIN_USER_ROLE_SUFFIX)]
+    if not user_id or "/" in user_id:
+        return None
+    return user_id
+
+
+def _allowed_methods(path):
+    """Return the methods a known path accepts, or ``None`` when unknown."""
+    methods = ROUTE_METHODS.get(path)
+    if methods is not None:
+        return methods
+    if path == ADMIN_USERS_PATH:
+        return ("POST",)
+    if _match_admin_user_role(path) is not None:
+        return ("PATCH",)
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,6 +85,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._route_post()
 
+    def do_PATCH(self):
+        self._route_patch()
+
     def _route_get(self, head_only=False):
         path = urlsplit(self.path).path
 
@@ -55,7 +97,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, "ok\n", head_only=head_only)
         elif path == "/api/v1/me":
             self._get_me(head_only=head_only)
-        elif path in ROUTE_METHODS:
+        elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
@@ -69,7 +111,19 @@ class Handler(BaseHTTPRequestHandler):
             self._post_login()
         elif path == "/api/v1/logout":
             self._post_logout()
-        elif path in ROUTE_METHODS:
+        elif path == ADMIN_USERS_PATH:
+            self._post_admin_user()
+        elif _allowed_methods(path) is not None:
+            self._method_not_allowed()
+        else:
+            self._not_found()
+
+    def _route_patch(self):
+        path = urlsplit(self.path).path
+        user_id = _match_admin_user_role(path)
+        if user_id is not None:
+            self._patch_admin_user_role(user_id)
+        elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
@@ -127,16 +181,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _get_me(self, head_only=False):
-        token = self._bearer_token()
-        if token is None:
-            self._api_error(401, "invalid_session", head_only=head_only)
-            return
-
-        try:
-            with self._database() as connection:
-                user = authenticate_session(connection, token)
-        except InvalidSessionError:
-            self._api_error(401, "invalid_session", head_only=head_only)
+        user = self._authenticate(head_only=head_only)
+        if user is None:
             return
 
         self._respond_json(
@@ -144,6 +190,96 @@ class Handler(BaseHTTPRequestHandler):
             {"user": self._user_payload(user)},
             head_only=head_only,
         )
+
+    def _post_admin_user(self):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                user = create_user(
+                    connection,
+                    actor,
+                    payload["username"],
+                    payload["password"],
+                    payload["role"],
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except (TypeError, ValueError):
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidRoleError:
+            self._api_error(400, "invalid_request")
+            return
+        except UsernameTakenError:
+            self._api_error(409, "username_taken")
+            return
+        except RoleConflictError:
+            self._api_error(409, "role_conflict")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(201, {"user": self._user_payload(user)})
+
+    def _patch_admin_user_role(self, user_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                user = change_user_role(
+                    connection,
+                    actor,
+                    user_id,
+                    payload["role"],
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except (TypeError, ValueError):
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidRoleError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingUserError:
+            self._api_error(404, "not_found")
+            return
+        except RoleConflictError:
+            self._api_error(409, "role_conflict")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(200, {"user": self._user_payload(user)})
+
+    def _authenticate(self, head_only=False):
+        token = self._bearer_token()
+        if token is None:
+            self._api_error(401, "invalid_session", head_only=head_only)
+            return None
+
+        try:
+            with self._database() as connection:
+                return authenticate_session(connection, token)
+        except InvalidSessionError:
+            self._api_error(401, "invalid_session", head_only=head_only)
+            return None
 
     def _post_logout(self):
         token = self._bearer_token()
@@ -210,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _method_not_allowed(self):
         path = urlsplit(self.path).path
-        methods = ROUTE_METHODS.get(path)
+        methods = _allowed_methods(path)
         if methods is None:
             self._not_found()
             return
@@ -266,7 +402,6 @@ class Handler(BaseHTTPRequestHandler):
     # Route-aware method boundary for unsupported verbs.
     do_PUT = _method_not_allowed
     do_DELETE = _method_not_allowed
-    do_PATCH = _method_not_allowed
     do_OPTIONS = _method_not_allowed
 
 
