@@ -1,17 +1,12 @@
-"""Tests for the Pico main service (``apps/server/server.py``).
-
-Run with::
-
-    python3 apps/server/test_server.py
-
-Standard library only (``unittest`` + ``http.client``).
-"""
+"""Tests for the PicoPG HTTP service."""
 
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from http.client import HTTPConnection
+from pathlib import Path
 
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +19,13 @@ class ServerTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server = make_server(host="127.0.0.1", port=0)
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        database_path = Path(cls.temporary_directory.name) / "app.db"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=database_path,
+        )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -34,6 +35,7 @@ class ServerTest(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
 
     def request(self, method="GET", path="/", body=None):
         conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -44,8 +46,6 @@ class ServerTest(unittest.TestCase):
         headers = {k.lower(): v for k, v in resp.getheaders()}
         conn.close()
         return status, headers, data
-
-    # -- routes ---------------------------------------------------------
 
     def test_homepage(self):
         status, _, body = self.request("GET", "/")
@@ -61,8 +61,6 @@ class ServerTest(unittest.TestCase):
         status, _, body = self.request("GET", "/does-not-exist")
         self.assertEqual(status, 404)
         self.assertEqual(body, b"not found\n")
-
-    # -- method boundary ------------------------------------------------
 
     def test_head_mirrors_get_headers_without_body(self):
         status, headers, body = self.request("HEAD", "/")
