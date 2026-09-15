@@ -1,109 +1,35 @@
-# Server contract
+# Server 契约
 
-## Responsibilities
+Server 负责认证授权、导入课程、执行 Work Git 操作、存储教学流程，并分发内容与 runtime。它不执行学生代码，不把缓存当作权威。
 
-Server:
-
-- authenticates users and enforces roles and relationships;
-- imports publisher bundles into private Git storage;
-- serves authorized immutable content and runtime artifacts;
-- performs Work Git operations;
-- stores Releases, Submissions, Comments, and ChangeEvents transactionally;
-- exposes the HTTP contract in [api-conventions.md](api-conventions.md).
-
-It does not run student Python or treat generated manifests as authority.
-
-## Storage
+## 存储
 
 ```text
 data/
-  picopg.git/          private bare Git repository
-  app.db               application database
-  artifacts/           immutable runtime and EXE files
-  generated/
-    bootstrap.json     atomically replaced public catalog cache
+  picopg.git/       私有裸 Git 仓库
+  app.db            应用数据库
+  artifacts/        不可变 runtime/EXE
+  generated/        可重建的 manifest/bootstrap/index
 ```
 
-Production may replace SQLite or local artifact files without changing the
-domain model. Do not split `picopg.git` until measured repository size or lock
-contention requires it.
+v0.1 使用一个仓库和一个数据库；只有出现经测量的容量或锁问题时才拆分。
 
-## Bundle import
+## 写入边界
 
-`picopg.json` contains only versioned content metadata:
+发布 bundle 仅允许普通文件 `course/**`、`starter/**` 和 `picopg.json`。Server 拒绝绝对路径、`..`、链接、重复归一化路径、特殊文件、未知 schema/runtime 及超限内容。
 
-```json
-{
-  "schemaVersion": 1,
-  "title": "Loops",
-  "runtimeVersion": "pyodide-0.29.0",
-  "entryPath": "course/index.html"
-}
-```
+Work sync 仅接受有界的 `work/**` 快照。Server 自行组装完整 tree，并校验所有权、内容访问权、Playground 版本、文件限制和 `baseCommitId`。仓库不暴露原生 Git 传输。
 
-The route's `playgroundId` is the stable identity. Access and archival state
-belong to `PlaygroundCatalog`, not the bundle.
+## 读取授权
 
-Before writing Git objects, Server rejects:
+内容 commit 只有在下列情况之一可读：公开且未归档；学生拥有指向它的开放 Release 或 Work；教师获准审阅引用它的 Submission；调用者是授权的发布者或 Admin。知道 commit ID 不构成授权。
 
-- absolute paths, `..`, links, duplicate normalized paths, and special files;
-- files outside `course/**`, `starter/**`, and `picopg.json`;
-- unsupported schema/runtime versions;
-- compressed, unpacked, file-count, and per-file limit violations.
+教师只能读取自己 Release 下的 Submission。Admin 管理账号与策略，但默认没有学生源码读取权。
 
-Import writes objects first and moves the Playground ref last with
-compare-and-swap. A new catalog row is created as `release_only`. Commit
-manifest and public bootstrap generation happen after the ref move and are
-retryable; a crash can leave a stale cache, never a false source of truth.
+## 一致性与运维
 
-## Work writes
-
-Server accepts only the editable `work/**` snapshot. It builds the full Git
-tree itself, preserving publisher and server-owned paths. It verifies ownership,
-authorization, file limits, and `baseCommitId`, then compare-and-swaps the Work
-ref.
-
-All repository subprocess arguments and paths are server-generated or strictly
-validated. The bare repository is never exposed over native Git transport.
-
-## Authorization-sensitive reads
-
-A content commit is readable only when at least one is true:
-
-- it is visible through a public, non-archived catalog entry;
-- the student has an open Release pinned to it;
-- it is referenced by the requesting student's own Work;
-- it is referenced by a Submission the teacher is authorized to review;
-- the caller is an authorized publisher or policy administrator.
-
-Possessing a commit ID is not authorization.
-
-## Database transactions
-
-Release, Submission, and Comment creation insert their `ChangeEvent` in the
-same transaction. A Release event's `availableAt` is no earlier than `openAt`.
-Idempotency records are also committed with the result.
-
-Git and the database cannot share a transaction. Operations therefore make
-Git changes independently retryable and write database references only after
-the target Git object exists. A repair command may rebuild catalog heads and
-manifest caches from Git refs; it must not invent Releases or Submissions.
-
-## Deployment artifacts
-
-Server publishes immutable runtime and EXE artifacts by version. It also serves
-small mutable indexes that point to those immutable files. Historical runtimes
-needed by installed Work remain downloadable while that Work is supported.
-
-Mutable index replacement uses write-to-temp, fsync where supported, then
-rename. Clients still verify declared size and SHA-256.
-
-## Operations
-
-- Back up `picopg.git`, the database, and artifacts as one recovery set.
-- Run startup checks for database schema, Git ref validity, writable storage,
-  and artifact index integrity.
-- Log actor, operation, target ID, result, and request ID without session tokens
-  or student source contents.
-- Provide repair commands for cache regeneration and dangling Git object
-  inspection before adding background orchestration.
+- 数据库事务原子写入业务对象及其幂等结果。
+- Git 与数据库不能共用事务：先确保 Git object 存在，再写数据库引用；Git ref 更新必须可重试。
+- manifest、bootstrap 和 artifact index 通过临时文件原子替换，并可从权威数据重建。
+- runtime/EXE 按版本不可变发布；Client 校验 size 与 SHA-256。
+- Git、数据库和 artifact 作为一个恢复集合备份；日志记录 actor、目标、结果和 request ID，不记录 token 或源码。

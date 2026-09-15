@@ -1,102 +1,25 @@
-# Web and Client contract
+# Client 契约
 
-## Shared frontend
+Web 与桌面端共享路由、组件、状态与 API 类型。平台能力集中在 host adapter：Web 使用浏览器存储和 Pyodide，桌面使用文件缓存与隔离 bridge。
 
-Web and desktop Client share routes, components, state transitions, API types,
-and conflict behavior. Platform differences live behind one small host adapter:
+## Local-first
 
-- Web uses browser storage and browser Pyodide loading.
-- Desktop uses the file-backed cache and isolated host bridge below.
+Client 启动时先读取本地 manifest、内容、Draft 和 runtime，再增量刷新网络数据。失败的刷新或安装不影响已安装版本。
 
-Do not scatter platform checks through feature components. Desktop guarantees
-offline-installed use; Web provides the same guarantee only after its browser
-storage has completed installation.
+Draft 按用户和 Playground 隔离，记录 Playground commit、base Work commit、文件、dirty 状态和保存时间。本地保存失败必须显式展示；缓存清理不得删除 manifest 或 Draft 引用的 blob。
 
-## Local-first behavior
+下载的 blob/runtime 通过 size 与 SHA-256 校验。manifest 在依赖完整后原子替换，保证中断后旧版本仍可打开。
 
-Client opens without a network connection and immediately lists installed
-Playgrounds. Network refresh is additive: failed requests do not hide installed
-content or discard Drafts.
+## 编辑、同步与提交
 
-Suggested logical storage:
+- 编辑立即落入本地 Draft；Python 在隔离 renderer 的 Pyodide 中运行。
+- Sync 发送有界的完整 `work/**` 快照。成功后先更新本地 HEAD，再按 Draft 版本决定是否标为 clean。
+- `409 work_head_changed` 保留 Draft，并让用户选择 reload、显式 overwrite 或本地 merge。
+- Submit 先同步脏 Draft，再创建固定 Work commit 的 Submission；每一步单独显示失败，重试沿用幂等键。
+- 重连后刷新 Release、Submission 和 Comment；本地数据按稳定 ID 去重。
 
-```text
-content/blobs/<sha256>
-content/manifests/<playgroundId>/<commitId>.json
-runtimes/<runtimeVersion>/...
-drafts/<userId>/<playgroundId>.json
-state/<userId>.json
-```
+## 安全边界
 
-The exact physical layout is private to Client. Drafts are namespaced by user
-so switching accounts cannot expose or overwrite another student's edits.
+课程运行在无 Node.js/系统权限的 renderer 中，并使用严格 CSP。Bridge 仅暴露加载/保存 Draft、提交与受控事件；两端校验消息，不提供通用命令通道。
 
-## Download and install
-
-1. Fetch public bootstrap and the signed-in user's open Releases, then merge
-   them into one visible collection.
-2. Compare their commit IDs with installed manifests.
-3. Download missing blobs and runtimes.
-4. Verify size and SHA-256 before admitting each blob to the cache.
-5. Write the new manifest to a temporary file and rename it into place.
-
-An interrupted install leaves the previous manifest usable. Cache cleanup may
-remove only blobs not referenced by an installed manifest or Draft.
-
-## Renderer boundary
-
-Playground content opens at:
-
-```text
-app://pico/playgrounds/<playgroundId>/<commitId>/<entryPath>
-```
-
-Use an isolated renderer with no Node.js access and a restrictive Content
-Security Policy. The bridge exposes only:
-
-```text
-files.load()
-files.save(draft)
-submit()
-on(eventName, handler)
-```
-
-Validate every message on both sides. The page owns Pyodide execution; the host
-does not expose a general command channel.
-
-## Draft and sync state
-
-A Draft records its base Work commit, Playground commit, editable files, dirty
-state, and last local save time. Local save errors are visible and block any UI
-claim that work is safely saved.
-
-Sync sends one complete bounded `work/**` snapshot. On success, Client updates
-the local head before marking the matching Draft clean. If the Draft changed
-during the request, it remains dirty.
-
-On `409 work_head_changed`, keep the Draft and show the current server head.
-User choice controls reload, overwrite, or local merge. Overwrite is a new
-explicit sync against the latest base, not a force-push.
-
-## Submission
-
-Submit is a two-step user action:
-
-1. synchronize a dirty Draft;
-2. create a Submission pinned to the resulting Work commit.
-
-If either step fails, show which step failed. Retrying Submission uses the same
-idempotency key until the outcome is known.
-
-## Change feed
-
-For each user, persist change items and `nextCursor` atomically. Store items by
-stable ID so page replay is harmless. Change events trigger fetching canonical
-Release, Submission, or Comment data; they are not a second copy of it. Teacher,
-AI, and system feedback all arrive as Comments with an explicit source.
-
-## Credentials
-
-The main process stores session tokens with the operating system credential
-facility, such as Electron `safeStorage`. Tokens and authenticated response
-bodies are never exposed to untrusted Playground content.
+Session token 由 host 的凭据设施保存。token 与认证响应不得进入不可信课程页面。

@@ -1,113 +1,47 @@
-# Core model
+# 核心模型
 
-## The two versioned objects
+## 对象
 
-PicoPG has two Git-backed objects:
+| 对象 | 存储 | 含义 |
+| --- | --- | --- |
+| `Playground` | Git | 发布者创建的不可变课程版本 |
+| `Work` | Git | 学生对一个 Playground 的线性编辑历史 |
+| `Release` | 数据库 | 教师向学生开放的确切 Playground commit |
+| `Submission` | 数据库 | 一次提交，固定 Release 与 Work commit |
+| `Comment` | 数据库 | 附属于 Submission 的不可变反馈 |
 
-- **Playground**: publisher-owned lesson content.
-- **Work**: one student's evolving work for one Playground.
+账号、会话、师生关系和访问策略是普通数据库数据。
 
-Everything else is conventional application data.
+## Git
 
-## Git layout
-
-Server owns one private bare repository, `data/picopg.git`.
+Server 独占一个私有裸仓库：
 
 ```text
 refs/heads/playgrounds/<playgroundId>
 refs/heads/works/<playgroundId>/<studentId>
 ```
 
-A Playground ref points to the latest published content commit. A Work ref
-points to the student's current work commit.
+Playground tree 只含 `course/**`、`starter/**` 和 `picopg.json`。Work tree 在此基础上增加学生拥有的 `work/**`；Server 写入 `.picopg/work.json`，记录固定的 `playgroundCommitId`。
 
-The first Work commit has the selected Playground commit as its parent. This
-makes the origin of the work part of the real Git graph. Later Work commits
-form a normal linear history.
+首个 Work commit 的 parent 是其 Playground commit；后续 commit 以当前 Work HEAD 为 parent。发布与同步都以 compare-and-swap 更新 ref。恢复历史也创建新 commit，不回退 ref。
 
-## Tree ownership
+v0.1 不升级 Work 的 Playground 版本，也不产生 merge commit。
 
-```text
-course/**             publisher-owned built lesson files
-starter/**            publisher-owned starter files
-work/**               student-owned editable files
-.picopg/work.json     server-owned Work metadata
-```
+## 权威来源
 
-`.picopg/work.json` contains:
-
-```json
-{
-  "playgroundCommitId": "opaque-git-object-id"
-}
-```
-
-Publisher requests may change only `course/**` and `starter/**`. Student sync
-may change only `work/**`. Only Server writes `.picopg/**`.
-
-## Git operations
-
-- Publish: create a Playground commit and compare-and-swap its ref.
-- Sync Work: create a Work commit and compare-and-swap its ref.
-- Restore: create a new Work commit containing a historical Work tree; never
-  move the ref backward.
-- Upgrade course content: create a controlled merge commit whose first parent
-  is current Work and second parent is the target Playground commit. Keep
-  current `work/**`, replace publisher-owned paths, and update `work.json`.
-
-Course upgrade is optional after v0.1. It is the only supported merge; Server
-does not auto-merge concurrent student edits.
-
-## Database objects
-
-- `User`, `Session`, `TeacherStudent`
-- `PlaygroundCatalog`
-- `Release`
-- `Submission`
-- `Comment`
-- `ChangeEvent`
-
-`PlaygroundCatalog` stores policy, not content:
-
-```text
-playgroundId, access(public | release_only), archived
-```
-
-A Release pins one exact Playground commit and has `openAt`, optional `dueAt`,
-and `requiresSubmission`. Releases are immutable; a correction creates another
-Release with `supersedesReleaseId`.
-
-A Submission pins `releaseId` and `workCommitId`. It never moves a Work ref.
-A Comment is immutable feedback attached to a Submission. Its source is
-`teacher`, `ai`, or `system`; teacher comments also record `authorUserId`.
-
-A ChangeEvent is a durable notification hint with `availableAt`. Release events
-become available at `max(createdAt, openAt)`; other events use `createdAt`.
-Canonical rows remain the authority.
-
-In v0.1 a teacher's Release applies to that teacher's current
-`TeacherStudent` relationships. Recipient snapshots are added only if the
-product later requires historical class membership.
-
-## Sources of truth
-
-| Fact | Authority |
+| 事实 | 权威来源 |
 | --- | --- |
-| Playground and Work contents/history | Git objects and refs |
-| Access, relationships, releases, submissions, comments | database |
-| Commit manifests and public `bootstrap.json` | rebuildable cache |
-| Installed content, blobs, drafts, cursor | Client local storage |
-| Runtime and EXE packages | immutable artifact storage |
+| Playground、Work 的内容与历史 | Git object/ref |
+| 账号、策略、关系、Release、Submission、Comment | 数据库 |
+| manifest、bootstrap、索引 | 可重建缓存 |
+| 安装内容、Draft、运行环境 | Client 本地存储或不可变 artifact |
 
-## Invariants
+## 不变量
 
-1. A public API commit ID is opaque; never assume SHA-1 length or syntax.
-2. Every Release and Submission pins an immutable commit.
-3. Sync succeeds only when `baseCommitId` equals current Work HEAD.
-4. A dirty Draft is never discarded after a conflict or failed sync.
-5. `release_only` content requires authorization even if its commit ID leaks.
-6. Teacher reads only submissions made under that teacher's Releases; live
-   student Work is private by default.
-7. Admin manages policy and identities but does not read student Work by
-   default.
-8. Git holds durable source snapshots, not application workflow state.
+1. API 中的 ID（包括 commit ID）都是不透明字符串。
+2. Release 与 Submission 固定不可变 commit；更正会创建新记录。
+3. 学生只能写自己的 `work/**`；发布者只能写 Playground tree；`.picopg/**` 只由 Server 写。
+4. Sync 仅在 `baseCommitId` 等于 Work HEAD 时成功；冲突不丢 Draft、不自动合并。
+5. commit ID 不代表授权；`release_only` 内容始终检查身份与关系。
+6. 教师只读自己 Release 下的 Submission；Admin 默认不读学生 Work。
+7. Git 只保存源码快照，数据库只保存业务状态。

@@ -1,45 +1,27 @@
-# PicoPG contracts
+# PicoPG 设计
 
-These documents define the contract shared by Server, Client, Admin, and the
-`learn-python` publisher.
+PicoPG 是 local-first 的 Python 学习系统：`learn-python` 发布课程，Client 本地安装、编辑和运行，Server 负责同步、历史与教学协作。
 
-Read them in this order:
+按需阅读：
 
-1. [core.md](core.md) — authoritative model and invariants
-2. [flows.md](flows.md) — end-to-end behavior
-3. [api-conventions.md](api-conventions.md) — HTTP rules
-4. [server.md](server.md) — persistence and deployment
-5. [client.md](client.md) — local-first Client behavior
-6. [account.md](account.md) — identity and authorization
+1. [core.md](core.md)：领域模型与不变量（权威定义）
+2. [flows.md](flows.md)：端到端状态迁移
+3. [api-conventions.md](api-conventions.md)：HTTP 约定
+4. [server.md](server.md)、[client.md](client.md)、[account.md](account.md)：组件边界
 
-`core.md` owns terminology. Other files describe projections of that model and
-must not redefine it.
+冲突时，以 `core.md`、相关组件契约、实现注释的顺序为准。
 
-## Scope
+## 非目标
 
-PicoPG is a local-first Python learning system:
+- Client 不操作 Git；Git 不保存账号、权限和教学流程。
+- Server 不运行学生代码，也不自动合并学生编辑。
+- v0.1 不拆分多个 Git 仓库，不实现课程升级或实时推送。
 
-- `learn-python` is the only source of Playground content.
-- Server distributes immutable content, records learning history, and handles
-  collaboration.
-- Web and desktop Client share one frontend application layer. Host adapters
-  provide storage and runtime capabilities.
-- Client downloads lessons, edits and runs Python locally, and synchronizes on
-  explicit submission or user-requested sync.
-- Teacher and Admin are ordinary role-based views over the same Server API.
+## 实施计划
 
-## Deliberate non-goals
-
-- Clients do not clone or push Git repositories.
-- Git does not manage accounts, permissions, releases, submissions, comments,
-  notifications, runtime binaries, or transient execution output.
-- Server does not silently merge conflicting student edits.
-- v0.1 does not require one physical Git repository per student or Playground.
-
-## Authority
-
-When documents disagree, use this order:
-
-1. `core.md`
-2. the relevant contract in this directory
-3. implementation comments and older notes
+1. 建立数据库、认证、Playground 目录和内容发布。
+2. 完成公开/授权内容下载、manifest 与 runtime 分发。
+3. 完成 Client 离线安装、Draft、Pyodide 与隔离边界。
+4. 完成 Work 初始化、CAS 同步和追加式恢复。
+5. 完成 Release、Submission、Comment 与角色授权。
+6. 补齐备份、缓存重建、审计和端到端故障测试。

@@ -1,96 +1,38 @@
-# End-to-end flows
+# 端到端流程
 
-This file applies the model in [core.md](core.md).
+本文只描述状态迁移；对象含义见 [core.md](core.md)。
 
-## 1. Publish content
+## 发布
 
-1. `learn-python` builds one Playground into `course/**` and `starter/**`.
-2. CI packs those files plus `picopg.json` as a gzip bundle.
-3. CI uploads the bundle with a publisher credential and idempotency key.
-4. Server validates paths, limits, metadata, and `runtimeVersion`.
-5. Server writes Git objects, creates a commit, and compare-and-swaps
-   `refs/heads/playgrounds/<playgroundId>`.
-6. Server regenerates the commit manifest and atomically replaces the public
-   `bootstrap.json` cache.
+1. `learn-python` 构建 `course/**`、`starter/**` 和 `picopg.json`，以幂等请求上传 bundle。
+2. Server 校验内容与限制，写 Git commit，并以 compare-and-swap 更新 Playground ref。
+3. Server 重建 manifest 和公开 bootstrap 缓存。
 
-Publishing never grants access. A new catalog entry defaults to
-`release_only`; Admin changes access separately. Retrying the same bundle is a
-no-op when the ref already points to the same tree.
+发布不授予访问权。新 Playground 默认 `release_only`；相同 tree 的重复发布是 no-op。
 
-## 2. Release a Playground
+## 安装与运行
 
-1. Teacher lists non-archived Playground catalog entries.
-2. Teacher creates an immutable Release pinned to an exact Playground commit.
-3. Before `openAt`, students cannot see the Release.
-4. At or after `openAt`, current students of that teacher see it.
-5. `dueAt` closes new submissions when `requiresSubmission` is true.
+1. Client 先展示本地内容，再合并公开目录与用户可见的 Release。
+2. Client 按 commit manifest 下载缺失 blob/runtime，校验 size 与 SHA-256 后原子安装。
+3. Client 在隔离 renderer 中打开课程；Pyodide 与执行输出留在本地。
+4. 每次编辑立即保存到当前用户的本地 Draft。
 
-No scheduled job is needed to open a Release: visibility is computed from
-current time when queried. Creation writes a `ChangeEvent` in the same database
-transaction, with `availableAt` no earlier than `openAt`.
+离线时只使用已安装内容。刷新或安装失败不得隐藏旧版本或丢失 Draft。
 
-## 3. Install and open
+## 同步与恢复
 
-1. Client immediately shows locally installed Playgrounds.
-2. When online, it fetches public `bootstrap.json` and the signed-in user's open
-   Releases, then merges them into the visible collection.
-3. It compares local commit IDs with public heads and pinned Release commits.
-4. It downloads only missing SHA-256 blobs, verifies them, then atomically
-   installs the manifest.
-5. It opens
-   `app://pico/playgrounds/<playgroundId>/<commitId>/<entryPath>` in an isolated
-   renderer.
+1. Client 上传完整且有界的 `work/**` 快照、`playgroundCommitId` 与 `baseCommitId`。
+2. Server 校验所有权、内容授权和当前 Work HEAD，创建 commit 后以 compare-and-swap 更新 ref。
+3. Client 记录返回的 commit ID；仅当 Draft 未在请求期间变化时将其标为 clean。
 
-Offline mode uses only installed commits and cached runtimes.
+HEAD 不匹配时返回冲突和最新 HEAD。Client 保留 Draft，由用户 reload、基于最新 HEAD 再次 overwrite，或在本地 merge。
 
-## 4. Edit and run
+恢复历史时，Server 以历史 tree 为内容、当前 HEAD 为 parent 创建新 commit。
 
-1. The renderer receives files through the narrow Client bridge.
-2. Every edit updates `drafts/<userId>/<playgroundId>.json` locally.
-3. The lesson runs Pyodide inside the isolated renderer.
-4. Execution output stays local unless a future submission contract explicitly
-   includes a bounded result artifact.
+## 发布作业与审阅
 
-The host bridge transports files and events; execution stays inside the page.
+1. Teacher 创建固定 Playground commit 的 Release；学生仅在 `openAt` 后且师生关系仍有效时可见。
+2. Client 提交前先同步脏 Draft，再以同一 Playground 版本的 Work commit 创建 Submission。
+3. Teacher 读取该快照并添加 Comment；授权的 AI/system 也使用 Comment，且显式记录 source。
 
-## 5. Sync Work
-
-1. Client sends editable `work/**`, current `baseCommitId`, and the installed
-   `playgroundCommitId`.
-2. Server verifies the student owns the Work and can access that Playground
-   commit.
-3. For an existing Work, Server requires `baseCommitId` to equal Work HEAD.
-4. Server creates a commit and compare-and-swaps the Work ref.
-5. Client records the returned commit ID, then marks the matching Draft clean.
-
-If HEAD changed, Server returns `409` with `currentHeadCommitId`. Client keeps
-the Draft and asks the user to reload, overwrite after confirmation, or merge
-locally. Server never silently merges.
-
-## 6. Restore history
-
-Client selects a commit from Work history. Server verifies it belongs to that
-Work, then creates a new commit with the selected tree and current HEAD as its
-parent. History remains append-only and the restore itself can be undone.
-
-## 7. Submit and review
-
-1. Submit first synchronizes a dirty Draft.
-2. Server creates an immutable Submission pinned to `releaseId` and the new or
-   existing `workCommitId`.
-3. For assignments, the Work metadata's `playgroundCommitId` must equal the
-   Release's pinned Playground commit.
-4. The same Work commit may be submitted more than once; each request creates a
-   new `submissionId` unless its idempotency key is a retry.
-5. Teacher reads that snapshot and posts immutable Comments. Authorized AI or
-   system jobs use the same feedback object for reviews and learning guidance.
-
-Submission and Comment creation each emit a `ChangeEvent` in the same database
-transaction.
-
-## 8. Pull changes
-
-Client calls `GET /changes?after=<cursor>`, stores returned records by ID, and
-atomically persists them with `nextCursor`. Replaying a page is safe. Events
-announce durable facts; the Client fetches canonical resources as needed and
-refreshes Releases on reconnect because the feed is not an access snapshot.
+Release、Submission 和 Comment 均为不可变记录。`requiresSubmission` 为真时，`dueAt` 后拒绝新 Submission。Client 重连后重新读取当前 canonical 数据，不依赖实时通知。
