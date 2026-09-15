@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def open_database(path):
@@ -45,10 +45,30 @@ def _initialize_schema(connection):
                 f"database schema {version} is newer than supported {SCHEMA_VERSION}"
             )
 
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO schema_migrations (version, applied_at)
-            VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            """,
-            (SCHEMA_VERSION,),
-        )
+        if version < 1:
+            _record_migration(connection, 1)
+
+        if version < 2:
+            connection.execute(
+                """
+                CREATE TABLE users (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    role TEXT NOT NULL
+                        CHECK (role IN ('student', 'teacher', 'admin')),
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            _record_migration(connection, 2)
+
+
+def _record_migration(connection, version):
+    connection.execute(
+        """
+        INSERT INTO schema_migrations (version, applied_at)
+        VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        """,
+        (version,),
+    )
