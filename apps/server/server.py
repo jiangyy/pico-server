@@ -41,6 +41,13 @@ from classes import (
     list_classes,
     remove_membership,
 )
+from comments import (
+    MAX_COMMENT_BODY_BYTES,
+    InvalidCommentRequestError,
+    comment_to_mapping,
+    create_comment,
+    list_comments,
+)
 from database import open_database
 from idempotency import (
     IdempotencyConflict,
@@ -100,6 +107,10 @@ DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
 MAX_JSON_BODY_BYTES = 16 * 1024
+# A Comment body may use the full Comment-domain byte ceiling, and JSON string
+# escaping can expand it several times over.  The comment route accepts a
+# larger envelope and lets the Comment domain enforce the body's own limit.
+MAX_COMMENT_JSON_BODY_BYTES = 6 * MAX_COMMENT_BODY_BYTES + 1024
 
 ALLOWED_METHODS = ("GET", "HEAD")
 ROUTE_METHODS = {
@@ -128,6 +139,7 @@ CATALOG_PATH = "/api/v1/catalog"
 RELEASES_PATH = "/api/v1/releases"
 CLASS_RELEASES_SUFFIX = "/releases"
 SUBMISSIONS_PATH = "/api/v1/submissions"
+SUBMISSION_COMMENTS_SUFFIX = "/comments"
 RELEASE_SUBMISSIONS_SUFFIX = "/submissions"
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
@@ -350,6 +362,20 @@ def _match_submission(path):
     return submission_id
 
 
+def _match_submission_comments(path):
+    """Return the opaque submission ID in a submission comment path."""
+    prefix = SUBMISSIONS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(
+        SUBMISSION_COMMENTS_SUFFIX
+    ):
+        return None
+
+    submission_id = path[len(prefix): -len(SUBMISSION_COMMENTS_SUFFIX)]
+    if not submission_id or "/" in submission_id:
+        return None
+    return submission_id
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -390,6 +416,8 @@ def _allowed_methods(path):
     if path == RELEASES_PATH:
         return ALLOWED_METHODS
     if _match_release_submissions(path) is not None:
+        return ("GET", "HEAD", "POST")
+    if _match_submission_comments(path) is not None:
         return ("GET", "HEAD", "POST")
     if _match_submission(path) is not None:
         return ALLOWED_METHODS
@@ -489,6 +517,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_release_submissions(
                 _match_release_submissions(path), head_only=head_only
             )
+        elif _match_submission_comments(path) is not None:
+            self._get_submission_comments(
+                _match_submission_comments(path), head_only=head_only
+            )
         elif _match_submission(path) is not None:
             self._get_submission(
                 _match_submission(path), head_only=head_only
@@ -525,6 +557,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_class_release(_match_class_releases(path))
         elif _match_release_submissions(path) is not None:
             self._post_release_submission(_match_release_submissions(path))
+        elif _match_submission_comments(path) is not None:
+            self._post_submission_comment(_match_submission_comments(path))
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -1336,6 +1370,83 @@ class Handler(BaseHTTPRequestHandler):
             {"submission": submission_to_mapping(submission)},
             head_only=head_only,
         )
+
+    def _get_submission_comments(self, submission_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                records = list_comments(connection, actor, submission_id)
+        except MissingSubmissionError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except InvalidCommentRequestError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"comments": [comment_to_mapping(item) for item in records]},
+            head_only=head_only,
+        )
+
+    def _post_submission_comment(self, submission_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        request_key = self.headers.get("Idempotency-Key")
+        if request_key is None or not request_key.strip():
+            self._api_error(400, "invalid_request")
+            return
+        if len(request_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+            self._api_error(400, "invalid_request")
+            return
+
+        payload = self._read_json(max_bytes=MAX_COMMENT_JSON_BODY_BYTES)
+        if payload is None:
+            return
+
+        # Author and source are server-owned.  A caller that tries to select
+        # either is rejected instead of being silently ignored.
+        if "authorUserId" in payload or "source" in payload:
+            self._api_error(400, "invalid_request")
+            return
+
+        try:
+            with self._database() as connection:
+                status, body = create_comment(
+                    connection,
+                    actor,
+                    submission_id,
+                    payload["body"],
+                    request_key,
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidCommentRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingSubmissionError:
+            self._api_error(404, "not_found")
+            return
+        except IdempotencyConflict:
+            self._api_error(409, "idempotency_conflict")
+            return
+        except IdempotencyRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+
+        self._respond_json(status, body)
 
     def _post_class_release(self, class_id):
         actor = self._authenticate()

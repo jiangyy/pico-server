@@ -19,8 +19,13 @@ import bundles
 import generated
 import repository
 import works
+from comments import MAX_COMMENT_BODY_BYTES
 from database import open_database
-from server import MAX_JSON_BODY_BYTES, make_server
+from server import (
+    MAX_COMMENT_JSON_BODY_BYTES,
+    MAX_JSON_BODY_BYTES,
+    make_server,
+)
 
 
 class AccountApiTest(unittest.TestCase):
@@ -4923,6 +4928,641 @@ class SubmissionApiTest(unittest.TestCase):
             ("POST", "/api/v1/releases//submissions"),
         )
         for method, path in not_found:
+            status, _, body = self.request(method, path)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), (method, path)
+            )
+
+
+class CommentApiTest(unittest.TestCase):
+    """HTTP contract for the immutable Comment API."""
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        base = Path(cls.temporary_directory.name)
+        cls.database_path = base / "app.db"
+        cls.repository_path = base / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def count_comments_for(self, submission_id):
+        connection = open_database(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM comments"
+                " WHERE submission_id = ?",
+                (submission_id,),
+            ).fetchone()
+            return row["total"]
+        finally:
+            connection.close()
+
+    def create_class(self, admin_token, teacher_id, name="Class"):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/admin/classes",
+            {"name": name, "teacherId": teacher_id},
+            token=admin_token,
+        )
+        self.assertEqual(status, 201)
+        return body["class"]
+
+    def assign_student(self, admin_token, class_id, student_id):
+        status, _, _ = self.request(
+            "PUT",
+            f"/api/v1/admin/classes/{class_id}/members/{student_id}",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+
+    def change_owner(self, admin_token, class_id, teacher_id):
+        return self.request(
+            "PATCH",
+            f"/api/v1/admin/classes/{class_id}/owner",
+            {"teacherId": teacher_id},
+            token=admin_token,
+        )
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def publish(self, token, playground_id, course_data=b"print(1)"):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("picopg.json", self.MANIFEST)
+            archive.writestr("course/module/app.py", course_data)
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=buffer.getvalue(),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": self.unique("key")},
+        )
+        self.assertEqual(status, 201)
+        return body["commitId"]
+
+    def post_release(self, token, class_id, key, payload):
+        headers = {} if key is None else {"Idempotency-Key": key}
+        return self.request(
+            "POST",
+            f"/api/v1/classes/{class_id}/releases",
+            payload,
+            token=token,
+            extra_headers=headers,
+        )
+
+    def release_payload(
+        self,
+        playground_id,
+        commit_id,
+        open_at="2020-01-01T00:00:00Z",
+        due_at=None,
+        requires_submission=False,
+    ):
+        payload = {
+            "playgroundId": playground_id,
+            "playgroundCommitId": commit_id,
+            "openAt": open_at,
+            "requiresSubmission": requires_submission,
+        }
+        if due_at is not None:
+            payload["dueAt"] = due_at
+        return payload
+
+    def sync(
+        self, token, playground_id, playground_commit_id, mapping, base=None
+    ):
+        files = [
+            {"path": path, "data": base64.b64encode(data).decode("ascii")}
+            for path, data in mapping.items()
+        ]
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/works/{playground_id}/sync",
+            {
+                "playgroundCommitId": playground_commit_id,
+                "baseCommitId": base,
+                "files": files,
+            },
+            token=token,
+        )
+        self.assertIn(status, (200, 201), body)
+        return body["workCommitId"]
+
+    def submit(self, token, release_id, work_commit_id, key):
+        headers = {} if key is None else {"Idempotency-Key": key}
+        return self.request(
+            "POST",
+            f"/api/v1/releases/{release_id}/submissions",
+            {"workCommitId": work_commit_id},
+            token=token,
+            extra_headers=headers,
+        )
+
+    def post_comment(self, token, submission_id, payload, key):
+        headers = {} if key is None else {"Idempotency-Key": key}
+        return self.request(
+            "POST",
+            f"/api/v1/submissions/{submission_id}/comments",
+            payload,
+            token=token,
+            extra_headers=headers,
+        )
+
+    def get_comments(self, token, submission_id):
+        return self.request(
+            "GET",
+            f"/api/v1/submissions/{submission_id}/comments",
+            token=token,
+        )
+
+    def get_submission(self, token, submission_id):
+        return self.request(
+            "GET",
+            f"/api/v1/submissions/{submission_id}",
+            token=token,
+        )
+
+    def course(self):
+        """Return an Admin/Teacher/Student course with one Submission."""
+
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        commit_id = self.publish(admin_token, playground_id)
+        klass = self.create_class(admin_token, teacher.id)
+        self.assign_student(admin_token, klass["id"], student.id)
+        release = self.post_release(
+            teacher_token,
+            klass["id"],
+            self.unique("rel"),
+            self.release_payload(playground_id, commit_id),
+        )[2]["release"]
+        work_commit_id = self.sync(
+            student_token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"print('work')"},
+        )
+        submission = self.submit(
+            student_token,
+            release["id"],
+            work_commit_id,
+            self.unique("submit"),
+        )[2]["submission"]
+        return {
+            "admin": admin,
+            "teacher": teacher,
+            "student": student,
+            "admin_token": admin_token,
+            "teacher_token": teacher_token,
+            "student_token": student_token,
+            "class": klass,
+            "playground_id": playground_id,
+            "commit_id": commit_id,
+            "release": release,
+            "work_commit_id": work_commit_id,
+            "submission": submission,
+        }
+
+    def raw_status(self, method, path, payload=None):
+        headers = {}
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response.read()
+        status = response.status
+        connection.close()
+        return status
+
+    def test_create_list_and_exact_retry(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+
+        # The owning Student sees an empty history before any feedback.
+        status, _, listed = self.get_comments(
+            ctx["student_token"], submission_id
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["comments"], [])
+
+        key = self.unique("comment")
+        status, _, body = self.post_comment(
+            ctx["teacher_token"], submission_id, {"body": "Nice work"}, key
+        )
+        self.assertEqual(status, 201)
+        record = body["comment"]
+        self.assertEqual(
+            set(record),
+            {
+                "id",
+                "submissionId",
+                "authorUserId",
+                "source",
+                "body",
+                "createdAt",
+            },
+        )
+        self.assertEqual(record["submissionId"], submission_id)
+        self.assertEqual(record["authorUserId"], ctx["teacher"].id)
+        self.assertEqual(record["source"], "teacher")
+        self.assertEqual(record["body"], "Nice work")
+        self.assertTrue(record["createdAt"])
+        # The metadata response never contains Work source.
+        self.assertNotIn("files", record)
+        self.assertNotIn("content", record)
+
+        # An exact retry replays the stored result without a duplicate row.
+        retry_status, _, retry = self.post_comment(
+            ctx["teacher_token"], submission_id, {"body": "Nice work"}, key
+        )
+        self.assertEqual(retry_status, 201)
+        self.assertEqual(retry, body)
+        self.assertEqual(self.count_comments_for(submission_id), 1)
+
+        # The owning Student and the owning Teacher see the same list.
+        for token in (ctx["student_token"], ctx["teacher_token"]):
+            status, _, listed = self.get_comments(token, submission_id)
+            self.assertEqual(status, 200)
+            self.assertEqual(listed["comments"], [record])
+
+    def test_changed_body_under_same_key_conflicts(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+        key = self.unique("comment")
+
+        self.assertEqual(
+            self.post_comment(
+                ctx["teacher_token"], submission_id, {"body": "one"}, key
+            )[0],
+            201,
+        )
+        status, _, body = self.post_comment(
+            ctx["teacher_token"], submission_id, {"body": "two"}, key
+        )
+        self.assertEqual((status, body["code"]), (409, "idempotency_conflict"))
+        self.assertEqual(self.count_comments_for(submission_id), 1)
+
+    def test_caller_selected_author_or_source_is_rejected(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+
+        for spoof in (
+            {"body": "hi", "source": "ai"},
+            {"body": "hi", "source": "system"},
+            {"body": "hi", "source": "teacher"},
+            {"body": "hi", "authorUserId": ctx["student"].id},
+            {"body": "hi", "authorUserId": None},
+            {
+                "body": "hi",
+                "source": "ai",
+                "authorUserId": ctx["teacher"].id,
+            },
+        ):
+            status, _, body = self.post_comment(
+                ctx["teacher_token"], submission_id, spoof, self.unique("key")
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), spoof
+            )
+        self.assertEqual(self.count_comments_for(submission_id), 0)
+
+        # A body-only request still records the actor as the server-owned
+        # Teacher author.
+        status, _, body = self.post_comment(
+            ctx["teacher_token"],
+            submission_id,
+            {"body": "ok"},
+            self.unique("key"),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["comment"]["source"], "teacher")
+        self.assertEqual(body["comment"]["authorUserId"], ctx["teacher"].id)
+
+    def test_read_and_create_authorization(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+        self.assertEqual(
+            self.post_comment(
+                ctx["teacher_token"],
+                submission_id,
+                {"body": "feedback"},
+                self.unique("key"),
+            )[0],
+            201,
+        )
+
+        # A Student may never create feedback.
+        status, _, body = self.post_comment(
+            ctx["student_token"],
+            submission_id,
+            {"body": "x"},
+            self.unique("key"),
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # Another Student, even in the same Class, cannot read the history.
+        other = self.seed_user("student")
+        self.assign_student(ctx["admin_token"], ctx["class"]["id"], other.id)
+        other_token = self.login_token(other.username)
+        status, _, body = self.get_comments(other_token, submission_id)
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        # An unrelated Teacher can neither read nor create.
+        outsider = self.seed_user("teacher")
+        outsider_token = self.login_token(outsider.username)
+        status, _, body = self.get_comments(outsider_token, submission_id)
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.post_comment(
+            outsider_token, submission_id, {"body": "x"}, self.unique("key")
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # Admin management access is not comment body access.
+        status, _, body = self.get_comments(ctx["admin_token"], submission_id)
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+        status, _, body = self.post_comment(
+            ctx["admin_token"],
+            submission_id,
+            {"body": "x"},
+            self.unique("key"),
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # Missing and foreign submissions are hidden behind the same 404.
+        missing = uuid.uuid4().hex
+        status, _, body = self.get_comments(ctx["teacher_token"], missing)
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.post_comment(
+            ctx["teacher_token"], missing, {"body": "x"}, self.unique("key")
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_owner_transfer_preserves_submission_and_old_comments(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+        first = self.post_comment(
+            ctx["teacher_token"],
+            submission_id,
+            {"body": "from first teacher"},
+            self.unique("key"),
+        )[2]["comment"]
+
+        new_teacher = self.seed_user("teacher")
+        status, _, _ = self.change_owner(
+            ctx["admin_token"], ctx["class"]["id"], new_teacher.id
+        )
+        self.assertEqual(status, 200)
+        new_token = self.login_token(new_teacher.username)
+
+        # The old Teacher loses both read and create access.
+        status, _, body = self.get_comments(
+            ctx["teacher_token"], submission_id
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.post_comment(
+            ctx["teacher_token"],
+            submission_id,
+            {"body": "x"},
+            self.unique("key"),
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # The new Teacher sees the old comment and can append to the chain.
+        status, _, listed = self.get_comments(new_token, submission_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["comments"], [first])
+        status, _, body = self.post_comment(
+            new_token,
+            submission_id,
+            {"body": "from new teacher"},
+            self.unique("key"),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["comment"]["authorUserId"], new_teacher.id)
+
+        # The transfer does not change the Submission or its history.
+        status, _, body = self.get_submission(new_token, submission_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["submission"], ctx["submission"])
+        status, _, listed = self.get_comments(
+            ctx["student_token"], submission_id
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            sorted(item["body"] for item in listed["comments"]),
+            ["from first teacher", "from new teacher"],
+        )
+        self.assertEqual(self.count_comments_for(submission_id), 2)
+
+    def test_body_and_idempotency_key_limits(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+        path = f"/api/v1/submissions/{submission_id}/comments"
+
+        # A missing, blank, or oversized idempotency key is rejected before the
+        # body is read.
+        for headers in (
+            {},
+            {"Idempotency-Key": "  "},
+            {"Idempotency-Key": "k" * 256},
+        ):
+            status, _, body = self.request(
+                "POST",
+                path,
+                {"body": "hi"},
+                token=ctx["teacher_token"],
+                extra_headers=headers,
+            )
+            self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+        # A missing or malformed body is an invalid request.
+        for invalid in ({}, {"body": ""}, {"body": None}, {"body": 7}):
+            status, _, body = self.post_comment(
+                ctx["teacher_token"],
+                submission_id,
+                invalid,
+                self.unique("key"),
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), invalid
+            )
+        self.assertEqual(self.count_comments_for(submission_id), 0)
+
+        # The full Comment-domain body ceiling is accepted over HTTP.
+        exact = "x" * MAX_COMMENT_BODY_BYTES
+        status, _, body = self.post_comment(
+            ctx["teacher_token"],
+            submission_id,
+            {"body": exact},
+            self.unique("key"),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["comment"]["body"], exact)
+
+        # One byte past the ceiling is rejected by the domain, not by a
+        # transport cap, and stores nothing.
+        over = "x" * (MAX_COMMENT_BODY_BYTES - 1) + "\u00e9"
+        status, _, body = self.post_comment(
+            ctx["teacher_token"],
+            submission_id,
+            {"body": over},
+            self.unique("key"),
+        )
+        self.assertEqual((status, body["code"]), (400, "invalid_request"))
+        self.assertEqual(self.count_comments_for(submission_id), 1)
+
+        # A JSON envelope beyond the transport cap is rejected before reading.
+        huge = "x" * (MAX_COMMENT_JSON_BODY_BYTES + 1)
+        status, _, body = self.post_comment(
+            ctx["teacher_token"],
+            submission_id,
+            {"body": huge},
+            self.unique("key"),
+        )
+        self.assertEqual((status, body["code"]), (413, "request_too_large"))
+
+    def test_authentication_is_required(self):
+        ctx = self.course()
+        submission_id = ctx["submission"]["id"]
+        calls = (
+            self.get_comments(None, submission_id),
+            self.get_comments("bogus", submission_id),
+            self.post_comment(None, submission_id, {"body": "x"}, "key"),
+            self.post_comment("bogus", submission_id, {"body": "x"}, "key"),
+        )
+        for status, _, body in calls:
+            self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+    def test_route_methods_and_paths(self):
+        submission_id = self.unique("sub")
+        comment_path = f"/api/v1/submissions/{submission_id}/comments"
+
+        # There is no mutable or AI/system public route.
+        for method in ("PUT", "PATCH", "DELETE"):
+            status, headers, body = self.request(method, comment_path)
+            self.assertEqual(status, 405, method)
+            self.assertEqual(headers.get("allow"), "GET, HEAD, POST", method)
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        # The internal AI/system endpoint is not a public route.
+        for method in ("GET", "POST"):
+            status = self.raw_status(
+                method,
+                "/internal/v1/comments",
+                {"source": "ai", "body": "x"},
+            )
+            self.assertEqual(status, 404, method)
+
+        # A malformed comment path is not a route.
+        for method, path in (
+            ("GET", "/api/v1/submissions//comments"),
+            ("GET", f"/api/v1/submissions/{submission_id}/comments/extra"),
+            ("POST", f"/api/v1/submissions/{submission_id}/comments/extra"),
+        ):
             status, _, body = self.request(method, path)
             self.assertEqual(
                 (status, body["code"]), (404, "not_found"), (method, path)
