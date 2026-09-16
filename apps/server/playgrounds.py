@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import repository as _repository
 from accounts import ForbiddenActionError, MissingUserError, User
 
 
@@ -225,3 +226,34 @@ def update_playground(connection, actor, playground_id, mutation):
         updated = _playground_row(connection, playground_id)
 
     return _playground_from_row(updated)
+
+
+def publish_playground(
+    connection, actor, playground_id, repository, bundle, metadata
+):
+    """Publish a validated bundle to a Playground's Git history.
+
+    Authorization (admin or the existing creator) and unarchived metadata are
+    resolved before any Git subprocess is started.  A granted publisher that
+    is not the creator has no publishing rights here, while a creator whose
+    grant was revoked remains the creator.  The Git work itself lives in
+    :func:`repository.publish_playground`.
+    """
+
+    _require_actor(actor)
+    playground_id = _require_opaque_id(playground_id)
+
+    row = _playground_row(connection, playground_id)
+    if row is None:
+        raise MissingPlaygroundError("playground does not exist")
+    if row["archived_at"] is not None:
+        raise ForbiddenActionError("playground is archived")
+
+    is_admin = actor.role == "admin"
+    is_creator = actor.id == row["creator_id"]
+    if not is_admin and not is_creator:
+        raise ForbiddenActionError("not allowed to publish playground")
+
+    return _repository.publish_playground(
+        repository, playground_id, bundle, metadata
+    )
