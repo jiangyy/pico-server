@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def open_database(path):
@@ -225,6 +225,29 @@ def _initialize_schema(connection):
                 "ON submissions(student_id)"
             )
             _record_migration(connection, 8)
+
+        if version < 9:
+            connection.execute(
+                """
+                CREATE TABLE comments (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    submission_id TEXT NOT NULL
+                        REFERENCES submissions(id) ON DELETE RESTRICT,
+                    author_user_id TEXT
+                        REFERENCES users(id) ON DELETE RESTRICT,
+                    source TEXT NOT NULL
+                        CHECK (source IN ('teacher', 'ai', 'system')),
+                    body TEXT NOT NULL CHECK (body <> ''),
+                    created_at TEXT NOT NULL,
+                    CHECK (source <> 'teacher' OR author_user_id IS NOT NULL)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX comments_submission_id_created_at_idx "
+                "ON comments(submission_id, created_at, id)"
+            )
+            _record_migration(connection, 9)
 
 
 def _record_migration(connection, version):

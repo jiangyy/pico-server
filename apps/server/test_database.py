@@ -182,6 +182,37 @@ class DatabaseTest(unittest.TestCase):
         self.insert_user(connection, user_id="student-1", username="student")
         self.insert_release(connection)
 
+    def insert_comment(
+        self,
+        connection,
+        comment_id="comment-1",
+        submission_id="submission-1",
+        author_user_id="teacher-1",
+        source="teacher",
+        body="Nice work",
+        created_at="2026-09-22T00:00:00Z",
+    ):
+        connection.execute(
+            """
+            INSERT INTO comments (
+                id, submission_id, author_user_id, source, body, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                comment_id,
+                submission_id,
+                author_user_id,
+                source,
+                body,
+                created_at,
+            ),
+        )
+
+    def insert_comment_parents(self, connection):
+        self.insert_submission_parents(connection)
+        self.insert_submission(connection)
+
     def create_version_three_database(self):
         self.database_path.parent.mkdir(parents=True)
         connection = sqlite3.connect(self.database_path)
@@ -440,6 +471,36 @@ class DatabaseTest(unittest.TestCase):
         )
         connection.close()
 
+    def create_version_eight_database(self):
+        self.create_version_seven_database()
+        connection = sqlite3.connect(self.database_path)
+        connection.executescript(
+            """
+            CREATE TABLE submissions (
+                id TEXT PRIMARY KEY NOT NULL,
+                release_id TEXT NOT NULL
+                    REFERENCES releases(id) ON DELETE RESTRICT,
+                student_id TEXT NOT NULL
+                    REFERENCES users(id) ON DELETE RESTRICT,
+                work_commit_id TEXT NOT NULL
+                    CHECK (work_commit_id <> ''),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX submissions_release_id_idx ON submissions(release_id);
+            CREATE INDEX submissions_student_id_idx ON submissions(student_id);
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (8, '2026-09-15T00:00:07Z');
+            INSERT INTO submissions (
+                id, release_id, student_id, work_commit_id, created_at
+            ) VALUES
+                ('submission-1', 'release-1', 'student-1', 'work-commit-1',
+                 '2026-09-21T00:00:00Z'),
+                ('submission-2', 'release-1', 'student-1', 'work-commit-2',
+                 '2026-09-21T00:00:01Z');
+            """
+        )
+        connection.close()
+
     def test_open_creates_database_with_foreign_keys_enabled(self):
         connection = self.open()
 
@@ -669,9 +730,11 @@ class DatabaseTest(unittest.TestCase):
     def test_version_five_database_is_upgraded(self):
         connection = self.open()
         self.insert_user(connection)
+        connection.execute("DROP TABLE comments")
         connection.execute("DROP TABLE submissions")
         connection.execute("DROP TABLE releases")
         connection.execute("DROP TABLE idempotency_results")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
         connection.execute("DELETE FROM schema_migrations WHERE version = 8")
         connection.execute("DELETE FROM schema_migrations WHERE version = 7")
         connection.execute("DELETE FROM schema_migrations WHERE version = 6")
@@ -692,14 +755,14 @@ class DatabaseTest(unittest.TestCase):
             """
             SELECT name FROM sqlite_master
             WHERE type = 'table' AND name IN (
-                'idempotency_results', 'releases', 'submissions'
+                'idempotency_results', 'releases', 'submissions', 'comments'
             )
             ORDER BY name
             """
         ).fetchall()
         self.assertEqual(
             [row["name"] for row in tables],
-            ["idempotency_results", "releases", "submissions"],
+            ["comments", "idempotency_results", "releases", "submissions"],
         )
 
     def test_idempotency_schema_is_created(self):
@@ -869,7 +932,8 @@ class DatabaseTest(unittest.TestCase):
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
         self.assertEqual(
-            [row["version"] for row in versions], [1, 2, 3, 4, 5, 6, 7, 8]
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
         )
         self.assertEqual(
             connection.execute(
@@ -1791,6 +1855,556 @@ class DatabaseTest(unittest.TestCase):
             ).fetchall()
         ]
         self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+
+    def test_comment_schema_is_created(self):
+        connection = self.open()
+
+        columns = connection.execute("PRAGMA table_info(comments)").fetchall()
+        self.assertEqual(
+            {row["name"] for row in columns},
+            {
+                "id",
+                "submission_id",
+                "author_user_id",
+                "source",
+                "body",
+                "created_at",
+            },
+        )
+        primary_key = [row["name"] for row in columns if row["pk"] > 0]
+        self.assertEqual(primary_key, ["id"])
+
+    def test_comment_required_columns_are_not_null(self):
+        connection = self.open()
+        required = {"id", "submission_id", "source", "body", "created_at"}
+        columns = connection.execute("PRAGMA table_info(comments)").fetchall()
+        not_null = {row["name"] for row in columns if row["notnull"] == 1}
+        self.assertEqual(not_null, required)
+        self.assertEqual(
+            {row["name"] for row in columns if row["notnull"] == 0},
+            {"author_user_id"},
+        )
+
+        self.insert_comment_parents(connection)
+        values = {
+            "comment_id": "comment-1",
+            "submission_id": "submission-1",
+            "author_user_id": "teacher-1",
+            "source": "teacher",
+            "body": "Nice work",
+            "created_at": "2026-09-22T00:00:00Z",
+        }
+        for column, key in (
+            ("id", "comment_id"),
+            ("submission_id", "submission_id"),
+            ("source", "source"),
+            ("body", "body"),
+            ("created_at", "created_at"),
+        ):
+            with self.subTest(column=column):
+                missing = dict(values)
+                missing[key] = None
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.insert_comment(connection, **missing)
+
+    def test_comment_foreign_key_shape(self):
+        connection = self.open()
+
+        foreign_keys = {
+            (row["from"], row["table"], row["to"], row["on_delete"])
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(comments)"
+            ).fetchall()
+        }
+        self.assertEqual(
+            foreign_keys,
+            {
+                ("submission_id", "submissions", "id", "RESTRICT"),
+                ("author_user_id", "users", "id", "RESTRICT"),
+            },
+        )
+
+    def test_comment_index_shape(self):
+        connection = self.open()
+
+        indexes = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA index_list(comments)").fetchall()
+        }
+        self.assertIn("comments_submission_id_created_at_idx", indexes)
+        self.assertEqual(
+            indexes["comments_submission_id_created_at_idx"]["unique"], 0
+        )
+        self.assertEqual(
+            indexes["comments_submission_id_created_at_idx"]["partial"], 0
+        )
+
+        columns = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_info(comments_submission_id_created_at_idx)"
+            ).fetchall()
+        ]
+        self.assertEqual(columns, ["submission_id", "created_at", "id"])
+
+    def test_comment_source_is_constrained(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_comment(connection, source="admin")
+
+        for source, author in (
+            ("teacher", "teacher-1"),
+            ("ai", None),
+            ("system", None),
+        ):
+            with self.subTest(source=source):
+                self.insert_comment(
+                    connection,
+                    comment_id=f"comment-{source}",
+                    source=source,
+                    author_user_id=author,
+                )
+
+        stored = connection.execute(
+            "SELECT id, source FROM comments ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["source"]) for row in stored],
+            [
+                ("comment-ai", "ai"),
+                ("comment-system", "system"),
+                ("comment-teacher", "teacher"),
+            ],
+        )
+
+    def test_teacher_comment_requires_author_user(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+
+        self.insert_comment(
+            connection, comment_id="comment-authored", source="teacher"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_comment(
+                connection,
+                comment_id="comment-unauthored",
+                source="teacher",
+                author_user_id=None,
+            )
+
+        authors = connection.execute(
+            "SELECT id, author_user_id FROM comments"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["author_user_id"]) for row in authors],
+            [("comment-authored", "teacher-1")],
+        )
+
+    def test_ai_and_system_comments_allow_optional_author(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+
+        for source in ("ai", "system"):
+            with self.subTest(source=source, author=None):
+                self.insert_comment(
+                    connection,
+                    comment_id=f"{source}-anonymous",
+                    source=source,
+                    author_user_id=None,
+                )
+            with self.subTest(source=source, author="teacher-1"):
+                self.insert_comment(
+                    connection,
+                    comment_id=f"{source}-attributed",
+                    source=source,
+                    author_user_id="teacher-1",
+                )
+
+        stored = connection.execute(
+            "SELECT id, source, author_user_id FROM comments ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["id"], row["source"], row["author_user_id"])
+                for row in stored
+            ],
+            [
+                ("ai-anonymous", "ai", None),
+                ("ai-attributed", "ai", "teacher-1"),
+                ("system-anonymous", "system", None),
+                ("system-attributed", "system", "teacher-1"),
+            ],
+        )
+
+    def test_comment_body_must_not_be_empty(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+
+        self.insert_comment(connection, comment_id="comment-ok", body="Feedback")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_comment(connection, comment_id="comment-empty", body="")
+
+        bodies = connection.execute(
+            "SELECT id, body FROM comments ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["body"]) for row in bodies],
+            [("comment-ok", "Feedback")],
+        )
+
+    def test_comment_requires_existing_submission_and_author(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_comment(connection, submission_id="missing")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_comment(connection, author_user_id="missing")
+
+        self.insert_comment(
+            connection,
+            comment_id="comment-anonymous",
+            source="system",
+            author_user_id=None,
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM comments").fetchone()[0], 1
+        )
+
+    def test_deleting_comment_references_is_restricted(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+        self.insert_comment(connection)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM submissions WHERE id = 'submission-1'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM users WHERE id = 'teacher-1'")
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM comments").fetchone()[0], 1
+        )
+
+    def test_multiple_comments_are_stable_with_equal_timestamps(self):
+        connection = self.open()
+        self.insert_comment_parents(connection)
+        self.insert_user(connection, user_id="teacher-2", username="teacher-two")
+
+        for comment_id, author, source in (
+            ("comment-b", "teacher-1", "teacher"),
+            ("comment-a", "teacher-2", "teacher"),
+            ("comment-c", None, "system"),
+        ):
+            self.insert_comment(
+                connection,
+                comment_id=comment_id,
+                author_user_id=author,
+                source=source,
+                created_at="2026-09-22T00:00:00Z",
+            )
+        self.insert_comment(
+            connection,
+            comment_id="comment-d",
+            source="system",
+            author_user_id=None,
+            created_at="2026-09-23T00:00:00Z",
+        )
+
+        rows = connection.execute(
+            """
+            SELECT id, submission_id, author_user_id, source, body, created_at
+            FROM comments ORDER BY submission_id, created_at, id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["submission_id"],
+                    row["author_user_id"],
+                    row["source"],
+                    row["body"],
+                    row["created_at"],
+                )
+                for row in rows
+            ],
+            [
+                (
+                    "comment-a",
+                    "submission-1",
+                    "teacher-2",
+                    "teacher",
+                    "Nice work",
+                    "2026-09-22T00:00:00Z",
+                ),
+                (
+                    "comment-b",
+                    "submission-1",
+                    "teacher-1",
+                    "teacher",
+                    "Nice work",
+                    "2026-09-22T00:00:00Z",
+                ),
+                (
+                    "comment-c",
+                    "submission-1",
+                    None,
+                    "system",
+                    "Nice work",
+                    "2026-09-22T00:00:00Z",
+                ),
+                (
+                    "comment-d",
+                    "submission-1",
+                    None,
+                    "system",
+                    "Nice work",
+                    "2026-09-23T00:00:00Z",
+                ),
+            ],
+        )
+
+    def test_comment_stores_no_mutable_or_replacement_columns(self):
+        connection = self.open()
+        forbidden = {
+            "updated_at",
+            "edited_at",
+            "edit",
+            "edited",
+            "edits",
+            "revision",
+            "revision_id",
+            "replacement",
+            "replacement_id",
+            "replaced",
+            "replaced_by",
+            "deleted_at",
+            "deleted",
+            "status",
+            "state",
+            "version",
+            "supersedes",
+            "superseded_by",
+        }
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(comments)").fetchall()
+        }
+        self.assertEqual(
+            columns & forbidden,
+            set(),
+            "comments must stay immutable with no edit or replacement columns",
+        )
+
+    def test_comment_initialization_is_repeatable(self):
+        self.open().close()
+        connection = self.open()
+
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        self.assertEqual(
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
+        )
+        columns = connection.execute("PRAGMA table_info(comments)").fetchall()
+        self.assertEqual(
+            {row["name"] for row in columns},
+            {
+                "id",
+                "submission_id",
+                "author_user_id",
+                "source",
+                "body",
+                "created_at",
+            },
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM comments").fetchone()[0], 0
+        )
+
+    def test_version_eight_database_is_upgraded(self):
+        self.create_version_eight_database()
+
+        connection = self.open()
+
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        self.assertEqual(
+            [row["version"] for row in versions],
+            list(range(1, SCHEMA_VERSION + 1)),
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 9"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM comments").fetchone()[0], 0
+        )
+
+        users = connection.execute(
+            "SELECT id, username, role FROM users ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["username"], row["role"]) for row in users],
+            [
+                ("admin-1", "admin", "admin"),
+                ("student-1", "student", "student"),
+                ("teacher-1", "teacher", "teacher"),
+            ],
+        )
+        sessions = connection.execute(
+            "SELECT token_hash, user_id, expires_at FROM sessions"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["token_hash"], row["user_id"], row["expires_at"])
+                for row in sessions
+            ],
+            [("token-hash", "teacher-1", "2026-09-16T00:00:00Z")],
+        )
+        classes = connection.execute(
+            "SELECT id, name, teacher_id, archived_at FROM classes"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["id"], row["name"], row["teacher_id"], row["archived_at"])
+                for row in classes
+            ],
+            [("class-1", "Algebra", "teacher-1", None)],
+        )
+        memberships = connection.execute(
+            "SELECT student_id, class_id, joined_at FROM class_memberships"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["student_id"], row["class_id"], row["joined_at"])
+                for row in memberships
+            ],
+            [("student-1", "class-1", "2026-09-15T00:00:00Z")],
+        )
+        playgrounds = connection.execute(
+            "SELECT id, creator_id, policy FROM playgrounds"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["creator_id"], row["policy"]) for row in playgrounds],
+            [("playground-1", "teacher-1", "release_only")],
+        )
+        grants = connection.execute(
+            "SELECT user_id, granted_by FROM publisher_grants"
+        ).fetchall()
+        self.assertEqual(
+            [(row["user_id"], row["granted_by"]) for row in grants],
+            [("teacher-1", "admin-1")],
+        )
+        idempotency = connection.execute(
+            "SELECT actor_id, endpoint, request_key FROM idempotency_results"
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["actor_id"], row["endpoint"], row["request_key"])
+                for row in idempotency
+            ],
+            [("teacher-1", "/playgrounds", "key-1")],
+        )
+        releases = connection.execute(
+            """
+            SELECT id, class_id, playground_id, playground_commit_id,
+                   created_by, requires_submission
+            FROM releases
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["class_id"],
+                    row["playground_id"],
+                    row["playground_commit_id"],
+                    row["created_by"],
+                    row["requires_submission"],
+                )
+                for row in releases
+            ],
+            [("release-1", "class-1", "playground-1", "commit-1", "teacher-1", 1)],
+        )
+        submissions = connection.execute(
+            """
+            SELECT id, release_id, student_id, work_commit_id, created_at
+            FROM submissions ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["release_id"],
+                    row["student_id"],
+                    row["work_commit_id"],
+                    row["created_at"],
+                )
+                for row in submissions
+            ],
+            [
+                (
+                    "submission-1",
+                    "release-1",
+                    "student-1",
+                    "work-commit-1",
+                    "2026-09-21T00:00:00Z",
+                ),
+                (
+                    "submission-2",
+                    "release-1",
+                    "student-1",
+                    "work-commit-2",
+                    "2026-09-21T00:00:01Z",
+                ),
+            ],
+        )
+
+    def test_failed_comment_migration_rolls_back(self):
+        self.create_version_eight_database()
+        blocker = sqlite3.connect(self.database_path)
+        blocker.execute(
+            "CREATE TABLE comments_submission_id_created_at_idx "
+            "(marker INTEGER)"
+        )
+        blocker.commit()
+        blocker.close()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            open_database(self.database_path)
+
+        connection = sqlite3.connect(self.database_path)
+        self.addCleanup(connection.close)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertNotIn("comments", tables)
+        self.assertIn("comments_submission_id_created_at_idx", tables)
+        versions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8])
+        submissions = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM submissions ORDER BY id"
+            ).fetchall()
+        ]
+        self.assertEqual(submissions, ["submission-1", "submission-2"])
 
     def test_newer_schema_is_rejected(self):
         connection = self.open()
