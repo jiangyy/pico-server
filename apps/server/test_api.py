@@ -1727,5 +1727,553 @@ class PlaygroundApiTest(unittest.TestCase):
             )
 
 
+class ReleaseApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        cls.database_path = Path(cls.temporary_directory.name) / "app.db"
+        cls.repository_path = Path(cls.temporary_directory.name) / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def grant_publisher(self, token, user_id):
+        status, _, body = self.request(
+            "PUT", f"/api/v1/admin/publishers/{user_id}", token=token
+        )
+        self.assertEqual(status, 204)
+        self.assertIsNone(body)
+
+    def create_class(self, admin_token, teacher_id, name="Class"):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/admin/classes",
+            {"name": name, "teacherId": teacher_id},
+            token=admin_token,
+        )
+        self.assertEqual(status, 201)
+        return body["class"]
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def build_zip(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "picopg.json", b'{"schemaVersion":1,"runtime":"python"}'
+            )
+            archive.writestr("course/module/app.py", b"print(1)")
+        return buffer.getvalue()
+
+    def publish(self, token, playground_id, key):
+        return self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=self.build_zip(),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": key},
+        )
+
+    def post_release(self, token, class_id, key, payload):
+        headers = {} if key is None else {"Idempotency-Key": key}
+        return self.request(
+            "POST",
+            f"/api/v1/classes/{class_id}/releases",
+            payload,
+            token=token,
+            extra_headers=headers,
+        )
+
+    def release_payload(
+        self,
+        playground_id,
+        commit_id,
+        open_at="2020-01-01T00:00:00Z",
+        due_at=None,
+        requires_submission=False,
+    ):
+        payload = {
+            "playgroundId": playground_id,
+            "playgroundCommitId": commit_id,
+            "openAt": open_at,
+            "requiresSubmission": requires_submission,
+        }
+        if due_at is not None:
+            payload["dueAt"] = due_at
+        return payload
+
+    def teacher_class_playground(self):
+        """Return an owning teacher token, a Class, and a real commit."""
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        self.grant_publisher(admin_token, teacher.id)
+        playground_id = self.unique("pg")
+        self.create_playground(teacher_token, playground_id)
+        _, _, published = self.publish(
+            teacher_token, playground_id, self.unique("key")
+        )
+        klass = self.create_class(admin_token, teacher.id)
+        return admin_token, teacher_token, klass, playground_id, published[
+            "commitId"
+        ]
+
+    def test_create_release_success_shape_and_exact_retry(self):
+        admin_token, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        payload = self.release_payload(
+            playground_id, commit_id, requires_submission=True
+        )
+
+        status, _, body = self.post_release(
+            teacher_token, klass["id"], "key-create", payload
+        )
+        self.assertEqual(status, 201)
+        release = body["release"]
+        self.assertEqual(
+            set(release),
+            {
+                "id",
+                "classId",
+                "playgroundId",
+                "playgroundCommitId",
+                "createdBy",
+                "openAt",
+                "dueAt",
+                "requiresSubmission",
+                "createdAt",
+            },
+        )
+        self.assertEqual(release["classId"], klass["id"])
+        self.assertEqual(release["playgroundId"], playground_id)
+        self.assertEqual(release["playgroundCommitId"], commit_id)
+        self.assertIs(release["requiresSubmission"], True)
+        self.assertIsNone(release["dueAt"])
+        self.assertEqual(release["openAt"], "2020-01-01T00:00:00.000000Z")
+        # No source bundle content is echoed in the metadata response.
+        self.assertNotIn("files", release)
+        self.assertNotIn("content", release)
+
+        retry_status, _, retry = self.post_release(
+            teacher_token, klass["id"], "key-create", payload
+        )
+        self.assertEqual(retry_status, 201)
+        self.assertEqual(retry, body)
+
+        status, _, listed = self.request(
+            "GET", "/api/v1/releases", token=admin_token
+        )
+        self.assertEqual(status, 200)
+        matching = [
+            item for item in listed["releases"] if item["id"] == release["id"]
+        ]
+        self.assertEqual(len(matching), 1)
+
+    def test_due_date_and_null_due_date_serialization(self):
+        _, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        with_due = self.release_payload(
+            playground_id,
+            commit_id,
+            open_at="2026-01-01T00:00:00Z",
+            due_at="2026-02-01T00:00:00Z",
+        )
+        status, _, body = self.post_release(
+            teacher_token, klass["id"], "key-due", with_due
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            body["release"]["dueAt"], "2026-02-01T00:00:00.000000Z"
+        )
+
+        without_due = self.release_payload(playground_id, commit_id)
+        status, _, body = self.post_release(
+            teacher_token, klass["id"], "key-nodue", without_due
+        )
+        self.assertEqual(status, 201)
+        self.assertIsNone(body["release"]["dueAt"])
+
+    def test_creation_authorization_by_role(self):
+        admin_token, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        student = self.seed_user("student")
+        other_teacher = self.seed_user("teacher")
+        student_token = self.login_token(student.username)
+        other_token = self.login_token(other_teacher.username)
+        payload = self.release_payload(playground_id, commit_id)
+
+        for token in (student_token, other_token, admin_token):
+            status, _, body = self.post_release(
+                token, klass["id"], self.unique("key"), payload
+            )
+            self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+    def test_wrong_class_and_commit_are_rejected(self):
+        admin_token, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        other_teacher = self.seed_user("teacher")
+        other_class = self.create_class(
+            admin_token, other_teacher.id, "Other class"
+        )
+
+        status, _, body = self.post_release(
+            teacher_token,
+            "missing-class",
+            "key-noclass",
+            self.release_payload(playground_id, commit_id),
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        # A class owned by another teacher is forbidden, not found.
+        status, _, body = self.post_release(
+            teacher_token,
+            other_class["id"],
+            "key-wrongclass",
+            self.release_payload(playground_id, commit_id),
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # A well-formed but foreign commit is not part of this history.
+        status, _, body = self.post_release(
+            teacher_token,
+            klass["id"],
+            "key-foreign",
+            self.release_payload(playground_id, "f" * 40),
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        # A malformed commit is an invalid request, not a lookup miss.
+        status, _, body = self.post_release(
+            teacher_token,
+            klass["id"],
+            "key-malformed",
+            self.release_payload(playground_id, "not-a-commit"),
+        )
+        self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+    def test_creation_request_validation(self):
+        _, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        path = f"/api/v1/classes/{klass['id']}/releases"
+        valid = self.release_payload(playground_id, commit_id)
+
+        # Missing or blank keys are rejected before any body is read.
+        for headers in ({}, {"Idempotency-Key": "  "}):
+            status, _, body = self.request(
+                "POST",
+                path,
+                valid,
+                token=teacher_token,
+                extra_headers=headers,
+            )
+            self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+        status, _, body = self.post_release(
+            teacher_token, klass["id"], "k" * 256, valid
+        )
+        self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+        invalid_bodies = (
+            {"playgroundCommitId": commit_id, "openAt": "2020-01-01T00:00:00Z"},
+            {"playgroundId": playground_id, "openAt": "2020-01-01T00:00:00Z"},
+            {"playgroundId": playground_id, "playgroundCommitId": commit_id},
+            {
+                "playgroundId": playground_id,
+                "playgroundCommitId": commit_id,
+                "openAt": "2020-01-01T00:00:00Z",
+                "requiresSubmission": "true",
+            },
+            {
+                "playgroundId": playground_id,
+                "playgroundCommitId": commit_id,
+                "openAt": "2020-01-01T00:00:00",
+                "requiresSubmission": False,
+            },
+            {
+                "playgroundId": playground_id,
+                "playgroundCommitId": commit_id,
+                "openAt": "2020-01-01T00:00:00Z",
+                "dueAt": "2019-12-31T00:00:00Z",
+                "requiresSubmission": False,
+            },
+        )
+        for invalid in invalid_bodies:
+            status, _, body = self.post_release(
+                teacher_token, klass["id"], self.unique("key"), invalid
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), invalid
+            )
+
+        status, _, body = self.post_release(
+            teacher_token, klass["id"], self.unique("key"), {}
+        )
+        self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+    def test_idempotency_conflict_on_changed_body(self):
+        _, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        first = self.release_payload(
+            playground_id, commit_id, open_at="2020-01-01T00:00:00Z"
+        )
+        status, _, _ = self.post_release(
+            teacher_token, klass["id"], "key-conflict", first
+        )
+        self.assertEqual(status, 201)
+
+        changed = self.release_payload(
+            playground_id, commit_id, open_at="2021-01-01T00:00:00Z"
+        )
+        status, _, body = self.post_release(
+            teacher_token, klass["id"], "key-conflict", changed
+        )
+        self.assertEqual(
+            (status, body["code"]), (409, "idempotency_conflict")
+        )
+
+        status, _, listed = self.request(
+            "GET", "/api/v1/releases", token=teacher_token
+        )
+        matching = [
+            item
+            for item in listed["releases"]
+            if item["classId"] == klass["id"]
+        ]
+        self.assertEqual(len(matching), 1)
+
+    def test_unauthenticated_calls_are_rejected_first(self):
+        _, _, klass, playground_id, commit_id = self.teacher_class_playground()
+        valid = self.release_payload(playground_id, commit_id)
+        calls = (
+            self.request(
+                "POST",
+                f"/api/v1/classes/{klass['id']}/releases",
+                valid,
+                extra_headers={"Idempotency-Key": "key"},
+            ),
+            self.request(
+                "POST",
+                f"/api/v1/classes/{klass['id']}/releases",
+                valid,
+                token="bogus",
+                extra_headers={"Idempotency-Key": "key"},
+            ),
+            self.request("GET", "/api/v1/releases"),
+            self.request("GET", "/api/v1/releases/missing-release"),
+        )
+        for status, _, body in calls:
+            self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+    def test_visibility_and_hidden_reads(self):
+        admin_token, teacher_token, klass, playground_id, commit_id = (
+            self.teacher_class_playground()
+        )
+        student = self.seed_user("student")
+        outsider = self.seed_user("student")
+        student_token = self.login_token(student.username)
+        outsider_token = self.login_token(outsider.username)
+        status, _, _ = self.request(
+            "PUT",
+            f"/api/v1/admin/classes/{klass['id']}/members/{student.id}",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+
+        open_release = self.post_release(
+            teacher_token,
+            klass["id"],
+            "key-open",
+            self.release_payload(playground_id, commit_id),
+        )[2]["release"]
+        future_release = self.post_release(
+            teacher_token,
+            klass["id"],
+            "key-future",
+            self.release_payload(
+                playground_id, commit_id, open_at="2999-01-01T00:00:00Z"
+            ),
+        )[2]["release"]
+
+        status, _, body = self.request(
+            "GET", "/api/v1/releases", token=student_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in body["releases"]], [open_release["id"]]
+        )
+
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/releases/{future_release['id']}",
+            token=student_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/releases/{open_release['id']}",
+            token=student_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["release"]["id"], open_release["id"])
+
+        # The owning Teacher and Admin see the future Release.
+        for token in (teacher_token, admin_token):
+            status, _, listing = self.request(
+                "GET", "/api/v1/releases", token=token
+            )
+            ids = [item["id"] for item in listing["releases"]]
+            self.assertIn(future_release["id"], ids)
+            status, _, body = self.request(
+                "GET", f"/api/v1/releases/{future_release['id']}", token=token
+            )
+            self.assertEqual(status, 200)
+
+        # An unrelated student cannot see or read the open Release.
+        status, _, body = self.request(
+            "GET", "/api/v1/releases", token=outsider_token
+        )
+        self.assertEqual(body["releases"], [])
+        status, _, body = self.request(
+            "GET", f"/api/v1/releases/{open_release['id']}", token=outsider_token
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        status, _, body = self.request(
+            "GET", "/api/v1/releases/does-not-exist", token=admin_token
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_release_route_methods_and_allow_headers(self):
+        _, _, klass, _, _ = self.teacher_class_playground()
+        method_not_allowed = (
+            ("GET", f"/api/v1/classes/{klass['id']}/releases", "POST"),
+            ("PUT", f"/api/v1/classes/{klass['id']}/releases", "POST"),
+            ("PATCH", f"/api/v1/classes/{klass['id']}/releases", "POST"),
+            ("DELETE", f"/api/v1/classes/{klass['id']}/releases", "POST"),
+            ("POST", "/api/v1/releases", "GET, HEAD"),
+            ("PUT", "/api/v1/releases", "GET, HEAD"),
+            ("PATCH", "/api/v1/releases", "GET, HEAD"),
+            ("DELETE", "/api/v1/releases", "GET, HEAD"),
+            ("POST", "/api/v1/releases/some-id", "GET, HEAD"),
+            ("PUT", "/api/v1/releases/some-id", "GET, HEAD"),
+            ("PATCH", "/api/v1/releases/some-id", "GET, HEAD"),
+            ("DELETE", "/api/v1/releases/some-id", "GET, HEAD"),
+        )
+        for method, path, allow in method_not_allowed:
+            status, headers, body = self.request(method, path)
+            self.assertEqual(status, 405, (method, path))
+            self.assertEqual(headers.get("allow"), allow, (method, path))
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        not_found = (
+            ("GET", "/api/v1/releases/"),
+            ("GET", "/api/v1/releases/a/b"),
+            ("POST", "/api/v1/classes//releases"),
+            ("POST", "/api/v1/classes/some-id/releases/extra"),
+        )
+        for method, path in not_found:
+            status, _, body = self.request(method, path)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), (method, path)
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

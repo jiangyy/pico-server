@@ -54,6 +54,15 @@ from playgrounds import (
     revoke_publisher,
     update_playground,
 )
+from releases import (
+    InvalidReleaseRequestError,
+    MissingReleaseError,
+    UnknownPlaygroundCommitError,
+    create_release,
+    get_release,
+    list_releases,
+    release_to_mapping,
+)
 from repository import (
     DEFAULT_REPOSITORY_PATH,
     CommitMetadata,
@@ -93,6 +102,8 @@ CLASSES_PATH = "/api/v1/classes"
 ADMIN_PUBLISHERS_PATH = "/api/v1/admin/publishers"
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
+RELEASES_PATH = "/api/v1/releases"
+CLASS_RELEASES_SUFFIX = "/releases"
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
 
@@ -189,6 +200,32 @@ def _match_playground_commit(path):
     return playground_id
 
 
+def _match_class_releases(path):
+    """Return the opaque class ID in a class release creation path."""
+    prefix = CLASSES_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(
+        CLASS_RELEASES_SUFFIX
+    ):
+        return None
+
+    class_id = path[len(prefix): -len(CLASS_RELEASES_SUFFIX)]
+    if not class_id or "/" in class_id:
+        return None
+    return class_id
+
+
+def _match_release(path):
+    """Return the opaque release ID in a release read path, else None."""
+    prefix = RELEASES_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    release_id = path[len(prefix):]
+    if not release_id or "/" in release_id:
+        return None
+    return release_id
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -216,6 +253,12 @@ def _allowed_methods(path):
         return ("POST",)
     if _match_playground(path) is not None:
         return ("PATCH",)
+    if _match_class_releases(path) is not None:
+        return ("POST",)
+    if path == RELEASES_PATH:
+        return ALLOWED_METHODS
+    if _match_release(path) is not None:
+        return ALLOWED_METHODS
     return None
 
 
@@ -279,6 +322,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_classes(head_only=head_only)
         elif _match_class(path) is not None:
             self._get_class(_match_class(path), head_only=head_only)
+        elif path == RELEASES_PATH:
+            self._get_releases(head_only=head_only)
+        elif _match_release(path) is not None:
+            self._get_release(_match_release(path), head_only=head_only)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -301,6 +348,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_playground()
         elif _match_playground_commit(path) is not None:
             self._post_playground_commit(_match_playground_commit(path))
+        elif _match_class_releases(path) is not None:
+            self._post_class_release(_match_class_releases(path))
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -828,6 +877,106 @@ class Handler(BaseHTTPRequestHandler):
             "commitId": result.commit_id,
             "noOp": result.no_op,
         }
+
+    def _get_releases(self, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                releases = list_releases(connection, actor)
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"releases": [release_to_mapping(item) for item in releases]},
+            head_only=head_only,
+        )
+
+    def _get_release(self, release_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                release = get_release(connection, actor, release_id)
+        except MissingReleaseError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"release": release_to_mapping(release)},
+            head_only=head_only,
+        )
+
+    def _post_class_release(self, class_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        request_key = self.headers.get("Idempotency-Key")
+        if request_key is None or not request_key.strip():
+            self._api_error(400, "invalid_request")
+            return
+        if len(request_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+            self._api_error(400, "invalid_request")
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                status, body = create_release(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    class_id,
+                    payload["playgroundId"],
+                    payload["playgroundCommitId"],
+                    payload["openAt"],
+                    payload["requiresSubmission"],
+                    request_key,
+                    due_at=payload.get("dueAt"),
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidReleaseRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingClassError:
+            self._api_error(404, "not_found")
+            return
+        except MissingPlaygroundError:
+            self._api_error(404, "not_found")
+            return
+        except UnknownPlaygroundCommitError:
+            self._api_error(404, "not_found")
+            return
+        except IdempotencyConflict:
+            self._api_error(409, "idempotency_conflict")
+            return
+        except IdempotencyRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+        except RepositoryError:
+            self._api_error(400, "invalid_request")
+            return
+
+        self._respond_json(status, body)
 
     def _patch_playground(self, playground_id):
         actor = self._authenticate()
