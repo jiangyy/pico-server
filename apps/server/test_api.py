@@ -4170,5 +4170,764 @@ class WorkRestoreApiTest(unittest.TestCase):
             )
 
 
+class SubmissionApiTest(unittest.TestCase):
+    """HTTP contract for the immutable Submission API."""
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        base = Path(cls.temporary_directory.name)
+        cls.database_path = base / "app.db"
+        cls.repository_path = base / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def count_submissions_for(self, student_id):
+        connection = open_database(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM submissions"
+                " WHERE student_id = ?",
+                (student_id,),
+            ).fetchone()
+            return row["total"]
+        finally:
+            connection.close()
+
+    def create_class(self, admin_token, teacher_id, name="Class"):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/admin/classes",
+            {"name": name, "teacherId": teacher_id},
+            token=admin_token,
+        )
+        self.assertEqual(status, 201)
+        return body["class"]
+
+    def assign_student(self, admin_token, class_id, student_id):
+        status, _, _ = self.request(
+            "PUT",
+            f"/api/v1/admin/classes/{class_id}/members/{student_id}",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def publish(self, token, playground_id, course_data=b"print(1)"):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("picopg.json", self.MANIFEST)
+            archive.writestr("course/module/app.py", course_data)
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=buffer.getvalue(),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": self.unique("key")},
+        )
+        self.assertEqual(status, 201)
+        return body["commitId"]
+
+    def post_release(self, token, class_id, key, payload):
+        headers = {} if key is None else {"Idempotency-Key": key}
+        return self.request(
+            "POST",
+            f"/api/v1/classes/{class_id}/releases",
+            payload,
+            token=token,
+            extra_headers=headers,
+        )
+
+    def release_payload(
+        self,
+        playground_id,
+        commit_id,
+        open_at="2020-01-01T00:00:00Z",
+        due_at=None,
+        requires_submission=False,
+    ):
+        payload = {
+            "playgroundId": playground_id,
+            "playgroundCommitId": commit_id,
+            "openAt": open_at,
+            "requiresSubmission": requires_submission,
+        }
+        if due_at is not None:
+            payload["dueAt"] = due_at
+        return payload
+
+    def sync(
+        self, token, playground_id, playground_commit_id, mapping, base=None
+    ):
+        files = [
+            {"path": path, "data": base64.b64encode(data).decode("ascii")}
+            for path, data in mapping.items()
+        ]
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/works/{playground_id}/sync",
+            {
+                "playgroundCommitId": playground_commit_id,
+                "baseCommitId": base,
+                "files": files,
+            },
+            token=token,
+        )
+        self.assertIn(status, (200, 201), body)
+        return body["workCommitId"]
+
+    def submit(self, token, release_id, work_commit_id, key):
+        headers = {} if key is None else {"Idempotency-Key": key}
+        return self.request(
+            "POST",
+            f"/api/v1/releases/{release_id}/submissions",
+            {"workCommitId": work_commit_id},
+            token=token,
+            extra_headers=headers,
+        )
+
+    def list_submissions(self, token, release_id):
+        return self.request(
+            "GET",
+            f"/api/v1/releases/{release_id}/submissions",
+            token=token,
+        )
+
+    def get_submission(self, token, submission_id):
+        return self.request(
+            "GET",
+            f"/api/v1/submissions/{submission_id}",
+            token=token,
+        )
+
+    def course(self):
+        """Return an Admin/Teacher/Student course with open Release and Work."""
+
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        commit_id = self.publish(admin_token, playground_id)
+        klass = self.create_class(admin_token, teacher.id)
+        self.assign_student(admin_token, klass["id"], student.id)
+        release = self.post_release(
+            teacher_token,
+            klass["id"],
+            self.unique("rel"),
+            self.release_payload(playground_id, commit_id),
+        )[2]["release"]
+        work_commit_id = self.sync(
+            student_token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"print('work')"},
+        )
+        return {
+            "admin": admin,
+            "teacher": teacher,
+            "student": student,
+            "admin_token": admin_token,
+            "teacher_token": teacher_token,
+            "student_token": student_token,
+            "class": klass,
+            "playground_id": playground_id,
+            "commit_id": commit_id,
+            "release": release,
+            "work_commit_id": work_commit_id,
+        }
+
+    def test_submit_success_shape_and_exact_retry(self):
+        ctx = self.course()
+        key = self.unique("submit")
+
+        status, _, body = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            key,
+        )
+        self.assertEqual(status, 201)
+        record = body["submission"]
+        self.assertEqual(
+            set(record),
+            {"id", "releaseId", "studentId", "workCommitId", "createdAt"},
+        )
+        self.assertEqual(record["releaseId"], ctx["release"]["id"])
+        self.assertEqual(record["studentId"], ctx["student"].id)
+        self.assertEqual(record["workCommitId"], ctx["work_commit_id"])
+        self.assertTrue(record["createdAt"])
+        # No source or mutable status is embedded in the metadata response.
+        self.assertNotIn("files", record)
+        self.assertNotIn("content", record)
+        self.assertNotIn("status", record)
+
+        retry_status, _, retry = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            key,
+        )
+        self.assertEqual(retry_status, 201)
+        self.assertEqual(retry, body)
+
+        listed_status, _, listed = self.list_submissions(
+            ctx["student_token"], ctx["release"]["id"]
+        )
+        self.assertEqual(listed_status, 200)
+        self.assertEqual(listed["submissions"], [record])
+        self.assertEqual(self.count_submissions_for(ctx["student"].id), 1)
+
+    def test_changed_body_under_same_key_conflicts(self):
+        ctx = self.course()
+        key = self.unique("submit")
+        status, _, first = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            key,
+        )
+        self.assertEqual(status, 201)
+
+        second_work = self.sync(
+            ctx["student_token"],
+            ctx["playground_id"],
+            ctx["commit_id"],
+            {"work/main.py": b"print('second')"},
+            base=ctx["work_commit_id"],
+        )
+        self.assertNotEqual(second_work, ctx["work_commit_id"])
+
+        status, _, body = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            second_work,
+            key,
+        )
+        self.assertEqual(
+            (status, body["code"]), (409, "idempotency_conflict")
+        )
+
+        _, _, listed = self.list_submissions(
+            ctx["student_token"], ctx["release"]["id"]
+        )
+        self.assertEqual(len(listed["submissions"]), 1)
+        self.assertEqual(
+            listed["submissions"][0]["workCommitId"],
+            ctx["work_commit_id"],
+        )
+        self.assertEqual(self.count_submissions_for(ctx["student"].id), 1)
+
+    def test_time_window_failures(self):
+        ctx = self.course()
+
+        future = self.post_release(
+            ctx["teacher_token"],
+            ctx["class"]["id"],
+            self.unique("rel"),
+            self.release_payload(
+                ctx["playground_id"],
+                ctx["commit_id"],
+                open_at="2999-01-01T00:00:00Z",
+            ),
+        )[2]["release"]
+        status, _, body = self.submit(
+            ctx["student_token"],
+            future["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )
+        self.assertEqual((status, body["code"]), (409, "submission_closed"))
+
+        due = self.post_release(
+            ctx["teacher_token"],
+            ctx["class"]["id"],
+            self.unique("rel"),
+            self.release_payload(
+                ctx["playground_id"],
+                ctx["commit_id"],
+                due_at="2020-01-08T00:00:00Z",
+                requires_submission=True,
+            ),
+        )[2]["release"]
+        status, _, body = self.submit(
+            ctx["student_token"],
+            due["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )
+        self.assertEqual((status, body["code"]), (409, "submission_closed"))
+
+        self.assertEqual(self.count_submissions_for(ctx["student"].id), 0)
+
+    def test_membership_and_unknown_release_failures(self):
+        ctx = self.course()
+        outsider = self.seed_user("student")
+        outsider_token = self.login_token(outsider.username)
+
+        status, _, body = self.submit(
+            outsider_token,
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        status, _, body = self.submit(
+            ctx["student_token"],
+            "missing-release",
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        self.assertEqual(self.count_submissions_for(ctx["student"].id), 0)
+
+    def test_version_mismatch_failures(self):
+        ctx = self.course()
+
+        # A well-formed commit that is on no Work history.
+        status, _, body = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            "a" * 40,
+            self.unique("submit"),
+        )
+        self.assertEqual(
+            (status, body["code"]), (409, "playground_version_mismatch")
+        )
+
+        # A real Work commit that pins a different Playground commit than the
+        # Release fixes.
+        second_commit = self.publish(
+            ctx["admin_token"], ctx["playground_id"], b"print(2)"
+        )
+        self.post_release(
+            ctx["teacher_token"],
+            ctx["class"]["id"],
+            self.unique("rel"),
+            self.release_payload(ctx["playground_id"], second_commit),
+        )
+        second_student = self.seed_user("student")
+        self.assign_student(
+            ctx["admin_token"], ctx["class"]["id"], second_student.id
+        )
+        second_token = self.login_token(second_student.username)
+        second_work = self.sync(
+            second_token,
+            ctx["playground_id"],
+            second_commit,
+            {"work/main.py": b"print('other')"},
+        )
+        status, _, body = self.submit(
+            second_token,
+            ctx["release"]["id"],
+            second_work,
+            self.unique("submit"),
+        )
+        self.assertEqual(
+            (status, body["code"]), (409, "playground_version_mismatch")
+        )
+
+        # A malformed commit is an invalid request, not a version conflict.
+        for malformed in ("HEAD", "abc", "A" * 40):
+            status, _, body = self.submit(
+                ctx["student_token"],
+                ctx["release"]["id"],
+                malformed,
+                self.unique("submit"),
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), malformed
+            )
+
+        self.assertEqual(self.count_submissions_for(ctx["student"].id), 0)
+        self.assertEqual(self.count_submissions_for(second_student.id), 0)
+
+    def test_student_reads_only_own_submissions(self):
+        ctx = self.course()
+        other = self.seed_user("student")
+        self.assign_student(ctx["admin_token"], ctx["class"]["id"], other.id)
+        other_token = self.login_token(other.username)
+        other_work = self.sync(
+            other_token,
+            ctx["playground_id"],
+            ctx["commit_id"],
+            {"work/main.py": b"print('other')"},
+        )
+        first = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]
+        second = self.submit(
+            other_token,
+            ctx["release"]["id"],
+            other_work,
+            self.unique("submit"),
+        )[2]["submission"]
+
+        status, _, listed = self.list_submissions(
+            ctx["student_token"], ctx["release"]["id"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in listed["submissions"]], [first["id"]]
+        )
+
+        status, _, body = self.get_submission(
+            ctx["student_token"], first["id"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["submission"], first)
+
+        status, _, body = self.get_submission(
+            ctx["student_token"], second["id"]
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.get_submission(other_token, first["id"])
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        # An unrelated Student cannot see the Release or its Submissions.
+        outsider = self.seed_user("student")
+        outsider_token = self.login_token(outsider.username)
+        status, _, body = self.list_submissions(
+            outsider_token, ctx["release"]["id"]
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.get_submission(outsider_token, first["id"])
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_teacher_reads_are_scoped_to_owned_classes(self):
+        ctx = self.course()
+        other_teacher = self.seed_user("teacher")
+        other_class = self.create_class(
+            ctx["admin_token"], other_teacher.id, "Other"
+        )
+        other_teacher_token = self.login_token(other_teacher.username)
+        other_release = self.post_release(
+            other_teacher_token,
+            other_class["id"],
+            self.unique("rel"),
+            self.release_payload(ctx["playground_id"], ctx["commit_id"]),
+        )[2]["release"]
+        other_student = self.seed_user("student")
+        self.assign_student(
+            ctx["admin_token"], other_class["id"], other_student.id
+        )
+        other_student_token = self.login_token(other_student.username)
+        other_work = self.sync(
+            other_student_token,
+            ctx["playground_id"],
+            ctx["commit_id"],
+            {"work/main.py": b"print('other')"},
+        )
+        first = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]
+        second = self.submit(
+            other_student_token,
+            other_release["id"],
+            other_work,
+            self.unique("submit"),
+        )[2]["submission"]
+
+        status, _, listed = self.list_submissions(
+            ctx["teacher_token"], ctx["release"]["id"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in listed["submissions"]], [first["id"]]
+        )
+        status, _, body = self.list_submissions(
+            ctx["teacher_token"], other_release["id"]
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.get_submission(
+            ctx["teacher_token"], second["id"]
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        status, _, listed = self.list_submissions(
+            other_teacher_token, other_release["id"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in listed["submissions"]], [second["id"]]
+        )
+        status, _, body = self.get_submission(
+            other_teacher_token, first["id"]
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_admin_metadata_never_reveals_work_source(self):
+        ctx = self.course()
+        submission = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]
+
+        status, _, body = self.get_submission(
+            ctx["admin_token"], submission["id"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["submission"], submission)
+        self.assertNotIn("files", body["submission"])
+        self.assertNotIn("content", body["submission"])
+
+        status, _, listed = self.list_submissions(
+            ctx["admin_token"], ctx["release"]["id"]
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(
+            submission["id"],
+            [item["id"] for item in listed["submissions"]],
+        )
+
+        # Metadata access is not a content grant: the centralized content
+        # authorization denies the Work commit on the Playground path.
+        work_commit = ctx["work_commit_id"]
+        for path in (
+            f"/api/v1/playgrounds/{ctx['playground_id']}/commits"
+            f"/{work_commit}/manifest",
+            f"/api/v1/playgrounds/{ctx['playground_id']}/commits"
+            f"/{work_commit}/files/work/main.py",
+        ):
+            status, _, body = self.request(
+                "GET", path, token=ctx["admin_token"]
+            )
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), path
+            )
+
+    def test_create_request_validation(self):
+        ctx = self.course()
+        path = f"/api/v1/releases/{ctx['release']['id']}/submissions"
+        valid = {"workCommitId": ctx["work_commit_id"]}
+
+        # A missing or blank idempotency key is rejected before the body.
+        for headers in ({}, {"Idempotency-Key": "  "}):
+            status, _, body = self.request(
+                "POST",
+                path,
+                valid,
+                token=ctx["student_token"],
+                extra_headers=headers,
+            )
+            self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+        status, _, body = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            "k" * 256,
+        )
+        self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+        for invalid in (
+            {},
+            {"workCommitId": ""},
+            {"workCommitId": "abc"},
+            {"workCommitId": 7},
+            {"workCommitId": None},
+        ):
+            status, _, body = self.request(
+                "POST",
+                path,
+                invalid,
+                token=ctx["student_token"],
+                extra_headers={"Idempotency-Key": self.unique("submit")},
+            )
+            self.assertEqual(
+                (status, body["code"]), (400, "invalid_request"), invalid
+            )
+
+        self.assertEqual(self.count_submissions_for(ctx["student"].id), 0)
+
+    def test_unauthenticated_calls_are_rejected_first(self):
+        ctx = self.course()
+        calls = (
+            self.submit(
+                None,
+                ctx["release"]["id"],
+                ctx["work_commit_id"],
+                "key",
+            ),
+            self.submit(
+                "bogus",
+                ctx["release"]["id"],
+                ctx["work_commit_id"],
+                "key",
+            ),
+            self.list_submissions(None, ctx["release"]["id"]),
+            self.get_submission(None, "some-submission"),
+        )
+        for status, _, body in calls:
+            self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+    def test_route_methods_and_paths(self):
+        release_id = self.unique("rel")
+        submission_id = self.unique("sub")
+        method_not_allowed = (
+            (
+                "PUT",
+                f"/api/v1/releases/{release_id}/submissions",
+                "GET, HEAD, POST",
+            ),
+            (
+                "PATCH",
+                f"/api/v1/releases/{release_id}/submissions",
+                "GET, HEAD, POST",
+            ),
+            (
+                "DELETE",
+                f"/api/v1/releases/{release_id}/submissions",
+                "GET, HEAD, POST",
+            ),
+            (
+                "POST",
+                f"/api/v1/submissions/{submission_id}",
+                "GET, HEAD",
+            ),
+            (
+                "PUT",
+                f"/api/v1/submissions/{submission_id}",
+                "GET, HEAD",
+            ),
+            (
+                "PATCH",
+                f"/api/v1/submissions/{submission_id}",
+                "GET, HEAD",
+            ),
+            (
+                "DELETE",
+                f"/api/v1/submissions/{submission_id}",
+                "GET, HEAD",
+            ),
+        )
+        for method, path, allow in method_not_allowed:
+            status, headers, body = self.request(method, path)
+            self.assertEqual(status, 405, (method, path))
+            self.assertEqual(headers.get("allow"), allow, (method, path))
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        not_found = (
+            ("GET", "/api/v1/submissions"),
+            ("POST", "/api/v1/submissions"),
+            ("GET", "/api/v1/submissions/"),
+            ("GET", "/api/v1/submissions/a/b"),
+            ("GET", f"/api/v1/releases/{release_id}/submissions/extra"),
+            ("POST", "/api/v1/releases//submissions"),
+        )
+        for method, path in not_found:
+            status, _, body = self.request(method, path)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), (method, path)
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

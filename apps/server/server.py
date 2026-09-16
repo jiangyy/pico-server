@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 import authorization
 import manifests
+import submissions
 import works
 from accounts import (
     ForbiddenActionError,
@@ -80,6 +81,17 @@ from sessions import (
     login,
     revoke_session,
 )
+from submissions import (
+    InvalidSubmissionRequestError,
+    MissingSubmissionError,
+    SubmissionNotAllowedError,
+    UnknownReleaseError,
+    UnknownWorkCommitError,
+    create_submission,
+    get_submission,
+    list_submissions,
+    submission_to_mapping,
+)
 
 
 HOST = "127.0.0.1"
@@ -115,6 +127,8 @@ MANIFEST_SEGMENT = "manifest"
 CATALOG_PATH = "/api/v1/catalog"
 RELEASES_PATH = "/api/v1/releases"
 CLASS_RELEASES_SUFFIX = "/releases"
+SUBMISSIONS_PATH = "/api/v1/submissions"
+RELEASE_SUBMISSIONS_SUFFIX = "/submissions"
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
 # Returned by optional authentication when an Authorization header was present
@@ -310,6 +324,32 @@ def _match_release(path):
     return release_id
 
 
+def _match_release_submissions(path):
+    """Return the opaque release ID in a release submission path."""
+    prefix = RELEASES_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(
+        RELEASE_SUBMISSIONS_SUFFIX
+    ):
+        return None
+
+    release_id = path[len(prefix): -len(RELEASE_SUBMISSIONS_SUFFIX)]
+    if not release_id or "/" in release_id:
+        return None
+    return release_id
+
+
+def _match_submission(path):
+    """Return the opaque submission ID in a submission path, else None."""
+    prefix = SUBMISSIONS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    submission_id = path[len(prefix):]
+    if not submission_id or "/" in submission_id:
+        return None
+    return submission_id
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -348,6 +388,10 @@ def _allowed_methods(path):
     if path == CATALOG_PATH:
         return ALLOWED_METHODS
     if path == RELEASES_PATH:
+        return ALLOWED_METHODS
+    if _match_release_submissions(path) is not None:
+        return ("GET", "HEAD", "POST")
+    if _match_submission(path) is not None:
         return ALLOWED_METHODS
     if _match_release(path) is not None:
         return ALLOWED_METHODS
@@ -441,6 +485,14 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif path == RELEASES_PATH:
             self._get_releases(head_only=head_only)
+        elif _match_release_submissions(path) is not None:
+            self._get_release_submissions(
+                _match_release_submissions(path), head_only=head_only
+            )
+        elif _match_submission(path) is not None:
+            self._get_submission(
+                _match_submission(path), head_only=head_only
+            )
         elif _match_release(path) is not None:
             self._get_release(_match_release(path), head_only=head_only)
         elif _allowed_methods(path) is not None:
@@ -471,6 +523,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_work_restore(_match_work_restore(path))
         elif _match_class_releases(path) is not None:
             self._post_class_release(_match_class_releases(path))
+        elif _match_release_submissions(path) is not None:
+            self._post_release_submission(_match_release_submissions(path))
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -1234,6 +1288,55 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
+    def _get_release_submissions(self, release_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                release = get_release(connection, actor, release_id)
+                records = list_submissions(connection, actor)
+        except MissingReleaseError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        listed = [
+            record for record in records if record.release_id == release.id
+        ]
+        self._respond_json(
+            200,
+            {"submissions": [submission_to_mapping(item) for item in listed]},
+            head_only=head_only,
+        )
+
+    def _get_submission(self, submission_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                submission = get_submission(connection, actor, submission_id)
+        except MissingSubmissionError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except InvalidSubmissionRequestError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"submission": submission_to_mapping(submission)},
+            head_only=head_only,
+        )
+
     def _post_class_release(self, class_id):
         actor = self._authenticate()
         if actor is None:
@@ -1279,6 +1382,63 @@ class Handler(BaseHTTPRequestHandler):
             return
         except UnknownPlaygroundCommitError:
             self._api_error(404, "not_found")
+            return
+        except IdempotencyConflict:
+            self._api_error(409, "idempotency_conflict")
+            return
+        except IdempotencyRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+        except RepositoryError:
+            self._api_error(400, "invalid_request")
+            return
+
+        self._respond_json(status, body)
+
+    def _post_release_submission(self, release_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        request_key = self.headers.get("Idempotency-Key")
+        if request_key is None or not request_key.strip():
+            self._api_error(400, "invalid_request")
+            return
+        if len(request_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+            self._api_error(400, "invalid_request")
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            with self._database() as connection:
+                status, body = create_submission(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    release_id,
+                    payload["workCommitId"],
+                    request_key,
+                )
+        except KeyError:
+            self._api_error(400, "invalid_request")
+            return
+        except InvalidSubmissionRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except UnknownReleaseError:
+            self._api_error(404, "not_found")
+            return
+        except SubmissionNotAllowedError:
+            self._api_error(409, "submission_closed")
+            return
+        except UnknownWorkCommitError:
+            self._api_error(409, "playground_version_mismatch")
             return
         except IdempotencyConflict:
             self._api_error(409, "idempotency_conflict")
