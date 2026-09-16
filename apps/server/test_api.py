@@ -21,6 +21,8 @@ from unittest import mock
 import accounts
 import bundles
 import generated
+import pagination
+import playgrounds
 import repository
 import server
 import works
@@ -418,10 +420,9 @@ class AccountApiTest(unittest.TestCase):
 
     def test_admin_route_methods_and_paths(self):
         for method, path, allow in (
-            ("GET", "/api/v1/admin/users", "POST"),
-            ("PUT", "/api/v1/admin/users", "POST"),
-            ("DELETE", "/api/v1/admin/users", "POST"),
-            ("PATCH", "/api/v1/admin/users", "POST"),
+            ("PUT", "/api/v1/admin/users", "GET, HEAD, POST"),
+            ("DELETE", "/api/v1/admin/users", "GET, HEAD, POST"),
+            ("PATCH", "/api/v1/admin/users", "GET, HEAD, POST"),
             ("POST", "/api/v1/admin/users/some-id/role", "PATCH"),
             ("GET", "/api/v1/admin/users/some-id/role", "PATCH"),
             ("DELETE", "/api/v1/admin/users/some-id/role", "PATCH"),
@@ -3580,6 +3581,251 @@ class RuntimeDistributionApiTest(unittest.TestCase):
             bootstrap["catalog"],
             [{"playgroundId": playground_id, "commitId": commit_id}],
         )
+
+
+class AdminDiscoveryApiTest(unittest.TestCase):
+    """HTTP contract for the bounded Admin discovery routes."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        base = Path(self.temporary_directory.name)
+        self.database_path = base / "app.db"
+        self.repository_path = base / "picopg.git"
+        self.artifacts_path = base / "artifacts"
+        self.generated_path = base / "generated"
+        self.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=self.database_path,
+            repository_path=self.repository_path,
+            artifacts_path=self.artifacts_path,
+            generated_path=self.generated_path,
+            audit_output=io.StringIO(),
+        )
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                self.admin = accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    "admin-seed",
+                    "secret",
+                    "admin",
+                )
+                self.student = accounts.create_user(
+                    connection, self.admin, "student-seed", "secret", "student"
+                )
+                self.teacher = accounts.create_user(
+                    connection, self.admin, "teacher-seed", "secret", "teacher"
+                )
+                for playground_id in ("pg-alpha", "pg-beta", "pg-gamma"):
+                    playgrounds.create_playground(
+                        connection, self.admin, playground_id
+                    )
+        finally:
+            connection.close()
+
+        self.admin_token = self.login("admin-seed")
+        self.student_token = self.login("student-seed")
+        self.teacher_token = self.login("teacher-seed")
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def request(self, method, path, token=None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+        return status, response_headers, body
+
+    def login(self, username):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(
+            {"username": username, "password": "secret"}
+        ).encode("utf-8")
+        connection.request(
+            "POST",
+            "/api/v1/login",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 200)
+        return body["sessionToken"]
+
+    def page(self, path, token=None):
+        status, headers, body = self.request("GET", path, token)
+        self.assertEqual(status, 200, body)
+        return headers, json.loads(body)
+
+    def test_users_are_ordered_and_bounded(self):
+        headers, first = self.page("/api/v1/admin/users?limit=2", self.admin_token)
+        self.assertEqual(len(first["users"]), 2)
+        self.assertIsNotNone(first["nextCursor"])
+        for item in first["users"]:
+            self.assertEqual(set(item), {"userId", "role", "createdAt"})
+        self.assertTrue(first["users"][0]["userId"] < first["users"][1]["userId"])
+
+        seen = [item["userId"] for item in first["users"]]
+        cursor = first["nextCursor"]
+        while cursor is not None:
+            _, page = self.page(
+                f"/api/v1/admin/users?limit=2&cursor={cursor}",
+                self.admin_token,
+            )
+            seen.extend(item["userId"] for item in page["users"])
+            cursor = page["nextCursor"]
+        self.assertEqual(seen, sorted(seen))
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertGreaterEqual(len(seen), 3)
+
+        # HEAD matches GET status without a body.
+        status, get_headers, get_body = self.request(
+            "GET", "/api/v1/admin/users", self.admin_token
+        )
+        status_head, head_headers, head_body = self.request(
+            "HEAD", "/api/v1/admin/users", self.admin_token
+        )
+        self.assertEqual((status, status_head), (200, 200))
+        self.assertEqual(head_body, b"")
+        self.assertEqual(
+            head_headers["content-length"], get_headers["content-length"]
+        )
+        self.assertNotIn("password", get_body.decode("utf-8"))
+
+    def test_playgrounds_representation(self):
+        # Publish one playground and archive another to exercise all fields.
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                bundle = bundles.validate_bundle(
+                    [
+                        bundles.BundleEntry(
+                            "picopg.json",
+                            b'{"schemaVersion":1,"runtime":"python"}',
+                        ),
+                        bundles.BundleEntry("course/a.py", b"print(1)"),
+                    ]
+                )
+                published = playgrounds.publish_playground(
+                    connection,
+                    self.admin,
+                    "pg-alpha",
+                    self.server.repository,
+                    bundle,
+                    repository.CommitMetadata(
+                        name="Test Author",
+                        email="author@example.test",
+                        timestamp="2026-01-01T00:00:00+00:00",
+                        message="publish",
+                    ),
+                )
+                playgrounds.update_playground(
+                    connection,
+                    self.admin,
+                    "pg-beta",
+                    {"archived": True},
+                )
+        finally:
+            connection.close()
+
+        _, page = self.page("/api/v1/admin/playgrounds", self.admin_token)
+        by_id = {item["playgroundId"]: item for item in page["playgrounds"]}
+        self.assertEqual(
+            [item["playgroundId"] for item in page["playgrounds"]],
+            sorted(by_id),
+        )
+        for item in page["playgrounds"]:
+            self.assertEqual(
+                set(item), {"playgroundId", "archived", "headCommitId"}
+            )
+        self.assertEqual(by_id["pg-alpha"]["headCommitId"], published.commit_id)
+        self.assertIs(by_id["pg-alpha"]["archived"], False)
+        self.assertIs(by_id["pg-beta"]["archived"], True)
+        self.assertIsNone(by_id["pg-beta"]["headCommitId"])
+        self.assertIsNone(by_id["pg-gamma"]["headCommitId"])
+
+    def test_authorization_roles(self):
+        for path in ("/api/v1/admin/users", "/api/v1/admin/playgrounds"):
+            with self.subTest(path=path):
+                status, _, _ = self.request("GET", path)
+                self.assertEqual(status, 401)
+                for token in (self.student_token, self.teacher_token):
+                    status, _, _ = self.request("GET", path, token)
+                    self.assertEqual(status, 403)
+                status, _, _ = self.request("GET", path, self.admin_token)
+                self.assertEqual(status, 200)
+
+    def test_query_validation(self):
+        for path in (
+            "/api/v1/admin/users?limit=0",
+            "/api/v1/admin/users?limit=101",
+            "/api/v1/admin/users?limit=",
+            "/api/v1/admin/users?limit=1&limit=2",
+            "/api/v1/admin/users?unknown=1",
+            "/api/v1/admin/playgrounds?limit=0",
+            "/api/v1/admin/playgrounds?cursor=not-a-cursor",
+        ):
+            with self.subTest(path=path):
+                status, _, body = self.request("GET", path, self.admin_token)
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(body)["code"], "invalid_request")
+
+        # A cursor minted for the other route is rejected.
+        cursor = pagination.encode_cursor(
+            pagination.ADMIN_PLAYGROUNDS_ROUTE, "pg-alpha"
+        )
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/admin/users?cursor={cursor}",
+            self.admin_token,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["code"], "invalid_request")
+
+    def test_invalid_durable_playground_id_fails_closed(self):
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                connection.execute(
+                    "INSERT INTO playgrounds"
+                    " (id, creator_id, policy, created_at, archived_at)"
+                    " VALUES (?, ?, 'release_only', ?, NULL)",
+                    ("../bad", self.admin.id, "2026-01-01T00:00:00Z"),
+                )
+        finally:
+            connection.close()
+        status, _, body = self.request(
+            "GET", "/api/v1/admin/playgrounds", self.admin_token
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["code"], "internal_error")
 
 
 class WorkSyncApiTest(unittest.TestCase):

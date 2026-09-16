@@ -256,6 +256,44 @@ class PlaygroundDomainTest(unittest.TestCase):
         self.assertEqual(row["policy"], "release_only")
         self.assertIsNone(row["archived_at"])
 
+    def test_list_playgrounds_is_bounded_ordered_and_admin_only(self):
+        for playground_id in ("pg-a", "pg-b", "pg-c"):
+            playgrounds.create_playground(
+                self.connection, self.admin_actor, playground_id
+            )
+        first = playgrounds.list_playgrounds(
+            self.connection, self.admin_actor, limit=2
+        )
+        self.assertEqual([item.id for item in first.items], ["pg-a", "pg-b"])
+        self.assertEqual(first.next_key, "pg-b")
+        rest = playgrounds.list_playgrounds(
+            self.connection,
+            self.admin_actor,
+            limit=2,
+            after=first.next_key,
+        )
+        self.assertEqual([item.id for item in rest.items], ["pg-c"])
+        self.assertIsNone(rest.next_key)
+
+        student = self.create_user("student")
+        with self.assertRaises(accounts.ForbiddenActionError):
+            playgrounds.list_playgrounds(
+                self.connection, student, limit=2
+            )
+
+    def test_list_playgrounds_fails_closed_on_invalid_stored_id(self):
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO playgrounds"
+                " (id, creator_id, policy, created_at, archived_at)"
+                " VALUES (?, ?, 'release_only', ?, NULL)",
+                ("../bad", self.admin_actor.id, "2026-01-01T00:00:00Z"),
+            )
+        with self.assertRaises(playgrounds.StoredPlaygroundError):
+            playgrounds.list_playgrounds(
+                self.connection, self.admin_actor, limit=10
+            )
+
 
 class PlaygroundPublishingTest(unittest.TestCase):
     """Authorization-order and end-to-end publishing tests."""

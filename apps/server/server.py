@@ -14,6 +14,7 @@ import artifacts
 import authorization
 import generated
 import manifests
+import pagination
 import submissions
 import work_content
 import works
@@ -22,9 +23,11 @@ from accounts import (
     InvalidRoleError,
     MissingUserError,
     RoleConflictError,
+    StoredUserError,
     UsernameTakenError,
     change_user_role,
     create_user,
+    list_users,
     register_student,
 )
 from bundles import (
@@ -66,7 +69,9 @@ from playgrounds import (
     InvalidRequestError,
     MissingPlaygroundError,
     PlaygroundConflictError,
+    StoredPlaygroundError,
     create_playground,
+    list_playgrounds,
     publish_playground,
     update_playground,
 )
@@ -135,6 +140,7 @@ ROUTE_METHODS = {
 ADMIN_USERS_PATH = "/api/v1/admin/users"
 ADMIN_USER_ROLE_SUFFIX = "/role"
 ADMIN_CLASSES_PATH = "/api/v1/admin/classes"
+ADMIN_PLAYGROUNDS_PATH = "/api/v1/admin/playgrounds"
 CLASS_OWNER_SUFFIX = "/owner"
 CLASS_MEMBERS_SEGMENT = "/members/"
 CLASSES_PATH = "/api/v1/classes"
@@ -546,11 +552,13 @@ def _allowed_methods(path):
     if _match_artifact_version(path) is not None:
         return ALLOWED_METHODS
     if path == ADMIN_USERS_PATH:
-        return ("POST",)
+        return ("GET", "HEAD", "POST")
     if _match_admin_user_role(path) is not None:
         return ("PATCH",)
     if path == ADMIN_CLASSES_PATH:
         return ("POST",)
+    if path == ADMIN_PLAYGROUNDS_PATH:
+        return ALLOWED_METHODS
     if _match_class_owner(path) is not None:
         return ("PATCH",)
     if _match_class_member(path) is not None:
@@ -817,6 +825,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_artifact(
                 _match_artifact_version(path), head_only=head_only
             )
+        elif path == ADMIN_USERS_PATH:
+            self._get_admin_users(head_only=head_only)
+        elif path == ADMIN_PLAYGROUNDS_PATH:
+            self._get_admin_playgrounds(head_only=head_only)
         elif path == "/api/v1/me":
             self._get_me(head_only=head_only)
         elif path == CLASSES_PATH:
@@ -1589,6 +1601,96 @@ class Handler(BaseHTTPRequestHandler):
             f"{playground_id}/{commit_id}",
         )
         self._respond_json(404, {"code": "not_found"}, head_only=head_only)
+
+    def _get_admin_users(self, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        try:
+            limit, after = pagination.parse_pagination(
+                urlsplit(self.path).query, pagination.ADMIN_USERS_ROUTE
+            )
+        except pagination.PaginationError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        try:
+            with self._database() as connection:
+                page = list_users(connection, actor, limit=limit, after=after)
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+        except StoredUserError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+        self._respond_json(
+            200,
+            {
+                "users": [
+                    {
+                        "userId": item.id,
+                        "role": item.role,
+                        "createdAt": item.created_at,
+                    }
+                    for item in page.items
+                ],
+                "nextCursor": (
+                    pagination.encode_cursor(
+                        pagination.ADMIN_USERS_ROUTE, page.next_key
+                    )
+                    if page.next_key is not None
+                    else None
+                ),
+            },
+            head_only=head_only,
+        )
+
+    def _get_admin_playgrounds(self, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        try:
+            limit, after = pagination.parse_pagination(
+                urlsplit(self.path).query,
+                pagination.ADMIN_PLAYGROUNDS_ROUTE,
+            )
+        except pagination.PaginationError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        try:
+            with self._database() as connection:
+                page = list_playgrounds(
+                    connection, actor, limit=limit, after=after
+                )
+                items = [
+                    {
+                        "playgroundId": item.id,
+                        "archived": item.archived,
+                        "headCommitId": manifests.current_playground_commit(
+                            self.server.repository, item.id
+                        ),
+                    }
+                    for item in page.items
+                ]
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+        except (StoredPlaygroundError, RepositoryError):
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+        self._respond_json(
+            200,
+            {
+                "playgrounds": items,
+                "nextCursor": (
+                    pagination.encode_cursor(
+                        pagination.ADMIN_PLAYGROUNDS_ROUTE, page.next_key
+                    )
+                    if page.next_key is not None
+                    else None
+                ),
+            },
+            head_only=head_only,
+        )
 
     def _post_admin_user(self):
         actor = self._authenticate()

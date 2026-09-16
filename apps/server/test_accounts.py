@@ -15,6 +15,7 @@ from accounts import (
     User,
     change_user_role,
     create_user,
+    list_users,
     register_student,
 )
 from database import open_database
@@ -334,6 +335,30 @@ class AccountTest(unittest.TestCase):
 
         self.assertNotIn(student["password_hash"], str(raised.exception))
         self.assertNotIn("first password", str(raised.exception))
+
+    def test_list_users_is_bounded_ordered_and_admin_only(self):
+        admin = self.insert_admin()
+        for index in range(5):
+            self.insert_user(f"user-{index}", "student")
+
+        first = list_users(self.connection, admin, limit=2)
+        self.assertEqual(len(first.items), 2)
+        self.assertIsNotNone(first.next_key)
+        for item in first.items:
+            self.assertFalse(hasattr(item, "password_hash"))
+
+        second = list_users(
+            self.connection, admin, limit=2, after=first.next_key
+        )
+        ids = [item.id for item in first.items] + [
+            item.id for item in second.items
+        ]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(ids), len(set(ids)))
+
+        student = self.insert_user("student-actor", "student")
+        with self.assertRaises(ForbiddenActionError):
+            list_users(self.connection, student, limit=2)
 
 
 if __name__ == "__main__":

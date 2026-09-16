@@ -28,6 +28,10 @@ class PlaygroundConflictError(Exception):
     """A playground identifier is already in use."""
 
 
+class StoredPlaygroundError(Exception):
+    """A durable Playground row cannot be represented by the admin API."""
+
+
 @dataclass(frozen=True)
 class Playground:
     id: str
@@ -35,6 +39,23 @@ class Playground:
     policy: str
     created_at: str
     archived_at: str | None
+
+
+@dataclass(frozen=True)
+class AdminPlayground:
+    """One bounded playground record for admin discovery."""
+
+    id: str
+    archived: bool
+    created_at: str
+
+
+@dataclass(frozen=True)
+class PlaygroundPage:
+    """One keyset page of playgrounds plus the exclusive next key."""
+
+    items: tuple
+    next_key: str | None
 
 
 def _now():
@@ -78,10 +99,54 @@ def _playground_from_row(row):
     )
 
 
+def list_playgrounds(connection, actor, *, limit, after=None):
+    """Return one Admin-only keyset page of playgrounds ordered by id.
+
+    The query uses ``LIMIT limit + 1`` at the authoritative boundary.  Only
+    the opaque id and archived flag are returned; a durable row whose id does
+    not satisfy the Playground identifier rules fails closed instead of being
+    silently skipped.
+    """
+
+    _require_admin(actor)
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+    parameters = []
+    where = ""
+    if after is not None:
+        where = "WHERE id > ?"
+        parameters.append(after)
+    parameters.append(limit + 1)
+    rows = connection.execute(
+        "SELECT id, archived_at, created_at FROM playgrounds "
+        f"{where} ORDER BY id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+    page_rows = rows[:limit]
+    next_key = page_rows[-1]["id"] if len(rows) > limit else None
+    items = []
+    for row in page_rows:
+        if not _repository.valid_playground_id(row["id"]):
+            raise StoredPlaygroundError(
+                "stored playground identifier is invalid"
+            )
+        items.append(
+            AdminPlayground(
+                id=row["id"],
+                archived=row["archived_at"] is not None,
+                created_at=row["created_at"],
+            )
+        )
+    return PlaygroundPage(items=tuple(items), next_key=next_key)
+
+
 def create_playground(connection, actor, playground_id):
     """Create release-only playground metadata for an Admin actor."""
     _require_admin(actor)
     playground_id = _require_opaque_id(playground_id)
+
     with connection:
         row = connection.execute(
             "SELECT 1 FROM playgrounds WHERE id = ?",

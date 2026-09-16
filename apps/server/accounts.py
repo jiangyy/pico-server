@@ -31,12 +31,33 @@ class RoleConflictError(Exception):
     """Raised when a role change conflicts with existing relationships."""
 
 
+class StoredUserError(Exception):
+    """A durable user row cannot be represented by the admin API."""
+
+
 @dataclass(frozen=True)
 class User:
     id: str
     username: str
     role: str
     created_at: str
+
+
+@dataclass(frozen=True)
+class AdminUser:
+    """One bounded user record for admin discovery (no credentials)."""
+
+    id: str
+    role: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class UserPage:
+    """One keyset page of users plus the exclusive next key."""
+
+    items: tuple
+    next_key: str | None
 
 
 def _require_admin(actor):
@@ -103,6 +124,47 @@ def create_user(connection, actor, username, password, role):
     username = _validate_credentials(username, password)
     user = _new_user(username, role)
     return _insert_user(connection, user, password)
+
+
+def list_users(connection, actor, *, limit, after=None):
+    """Return one Admin-only keyset page of users ordered by id.
+
+    The query uses ``LIMIT limit + 1`` at the authoritative boundary, so a
+    page never loads the whole table.  Only the public identifier, role, and
+    creation time are returned; password material and session state are never
+    read.
+    """
+
+    _require_admin(actor)
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+    parameters = []
+    where = ""
+    if after is not None:
+        where = "WHERE id > ?"
+        parameters.append(after)
+    parameters.append(limit + 1)
+    rows = connection.execute(
+        "SELECT id, role, created_at FROM users "
+        f"{where} ORDER BY id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+    page_rows = rows[:limit]
+    next_key = page_rows[-1]["id"] if len(rows) > limit else None
+    items = []
+    for row in page_rows:
+        if type(row["id"]) is not str or not row["id"]:
+            raise StoredUserError("stored user identifier is invalid")
+        items.append(
+            AdminUser(
+                id=row["id"],
+                role=row["role"],
+                created_at=row["created_at"],
+            )
+        )
+    return UserPage(items=tuple(items), next_key=next_key)
 
 
 def change_user_role(connection, actor, user_id, new_role):
