@@ -35,6 +35,7 @@ from pathlib import Path
 
 import artifacts
 import manifests
+import permissions
 import playgrounds
 
 
@@ -121,7 +122,7 @@ def atomic_write(path, data):
     """
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    permissions.ensure_private_directory(path.parent)
 
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
@@ -365,7 +366,7 @@ def _publish_generation(generated_path, payloads):
     identifier = generation_id(bootstrap, artifact_index)
 
     generations = generated_path / GENERATIONS_DIRNAME
-    generations.mkdir(parents=True, exist_ok=True)
+    permissions.ensure_private_directory(generations)
     generations_root = os.path.realpath(generations)
 
     final = generations / identifier

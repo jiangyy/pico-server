@@ -9,6 +9,15 @@ ExecStart=/usr/bin/python3 %h/picopg/apps/server/server.py
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/picopg/data
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=default.target

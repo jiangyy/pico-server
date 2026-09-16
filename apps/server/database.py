@@ -4,6 +4,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+import permissions
+
 
 SCHEMA_VERSION = 10
 
@@ -162,13 +164,14 @@ def _pragma_identifier(value):
 def open_database(path):
     """Open and initialize a SQLite database at ``path``."""
     database_path = Path(path)
-    database_path.parent.mkdir(parents=True, exist_ok=True)
+    permissions.ensure_private_directory(database_path.parent)
 
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
 
     try:
+        permissions.ensure_private_file(database_path)
         _initialize_schema(connection)
     except Exception:
         connection.close()

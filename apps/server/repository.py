@@ -14,6 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from bundles import BundleEntry, BundleValidationError, validate_bundle
+import permissions
 
 
 DEFAULT_REPOSITORY_PATH = Path("data/picopg.git")
@@ -66,11 +67,19 @@ def open_repository(path=DEFAULT_REPOSITORY_PATH):
             raise RepositoryError("repository path is not a directory")
         if not _is_bare_repository(path):
             raise RepositoryError("path is not a bare Git repository")
+        try:
+            permissions.ensure_private_directory(path)
+        except permissions.PermissionPolicyError as error:
+            raise RepositoryError("repository permissions are invalid") from error
         return Repository(path)
 
     _initialize_bare_repository(path)
     if not _is_bare_repository(path):
         raise RepositoryError("repository was not initialized as bare")
+    try:
+        permissions.ensure_private_directory(path)
+    except permissions.PermissionPolicyError as error:
+        raise RepositoryError("repository permissions are invalid") from error
     return Repository(path)
 
 

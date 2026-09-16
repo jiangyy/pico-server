@@ -15,6 +15,7 @@ import authorization
 import generated
 import manifests
 import pagination
+import permissions
 import submissions
 import work_content
 import works
@@ -3294,6 +3295,9 @@ def make_server(
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
+
+    if artifacts_path.exists():
+        permissions.ensure_private_directory(artifacts_path)
 
     server = AuditHTTPServer((host, port), Handler)
     server.database_path = database_path
