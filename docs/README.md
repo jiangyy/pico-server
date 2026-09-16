@@ -8,6 +8,7 @@ PicoPG 是 local-first 的 Python 学习系统：`learn-python` 发布课程，C
 2. [flows.md](flows.md)：端到端状态迁移
 3. [api-conventions.md](api-conventions.md)：HTTP 约定
 4. [server.md](server.md)、[client.md](client.md)、[account.md](account.md)：组件边界
+5. [client-display.md](client-display.md)：客户端展示契约的 Server 待办清单
 
 冲突时，以 `core.md`、相关组件契约、实现注释的顺序为准。
 
