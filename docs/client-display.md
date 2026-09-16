@@ -38,7 +38,7 @@
 ## 2. `toy/**` bundle 前缀与玩具声明
 
 - `bundles.ALLOWED_PREFIXES` 增加 `"toy/"`（`.picopg/`、`work/` 仍禁止）。
-- `picopg.json` 可选字段校验（形状错 → `400 invalid_request` + `details.reason`）：
+- `picopg.json` 可选字段校验（形状错 → `400 invalid_bundle` + `details.reason`，与现有 bundle 校验的错误码一致）：
   - `toy`：对象；`toy.interactive`：bool（必填）；
   - `toy.entry`：string，`toy/` 下、`.html` 结尾、必须在本次 bundle 内；
   - `toy.thumbnail`：可选 string，`toy/` 下、必须在 bundle 内、扩展名 `svg/png/webp/jpg`。
@@ -96,6 +96,8 @@ Authorization: Bearer <admin>
 - 建议顺序：§4（Admin 表）→ §1（少 N 次请求）→ §5（点评作者）→ §2（玩具）→ §3/§6（决策项）。
 - Web 端 `toy.entry` 必须部署在**独立 origin**（如 `courses.picopg.cn`）：同源 iframe 里的课程页
   能读写宿主 localStorage，这是部署要求，不是 server 代码改动。
+- Web 课程 origin 还必须提供 `../pyodide/`（课程页用 `libs/**`、`../pyodide/` 引用运行时），
+  桌面端由随包 runtime 覆盖 `pyodide/**`。这条要和 `toy.entry` 的部署一起定。
 
 ## 8. 验收
 
