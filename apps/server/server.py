@@ -85,6 +85,8 @@ from sessions import (
 HOST = "127.0.0.1"
 PORT = 8001
 DATABASE_PATH = Path("data/app.db")
+ARTIFACTS_DIRECTORY_NAME = "artifacts"
+GENERATED_DIRECTORY_NAME = "generated"
 MAX_JSON_BODY_BYTES = 16 * 1024
 
 ALLOWED_METHODS = ("GET", "HEAD")
@@ -1445,11 +1447,29 @@ def make_server(
     port=PORT,
     database_path=DATABASE_PATH,
     repository_path=DEFAULT_REPOSITORY_PATH,
+    artifacts_path=None,
+    generated_path=None,
 ):
-    """Return an initialized HTTP server bound to ``host:port``."""
+    """Return an initialized HTTP server bound to ``host:port``.
+
+    ``artifacts_path`` and ``generated_path`` are injected runtime directories.
+    When omitted they default to sibling directories of the database, which
+    keeps every deployment path under one data directory.  The directories are
+    created lazily by the artifact index and generated-cache code instead of at
+    startup, so a read-only or unused cache never becomes a start-up failure.
+    """
     database_path = Path(database_path)
     database = open_database(database_path)
     database.close()
+
+    if artifacts_path is None:
+        artifacts_path = database_path.parent / ARTIFACTS_DIRECTORY_NAME
+    else:
+        artifacts_path = Path(artifacts_path)
+    if generated_path is None:
+        generated_path = database_path.parent / GENERATED_DIRECTORY_NAME
+    else:
+        generated_path = Path(generated_path)
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
@@ -1458,6 +1478,8 @@ def make_server(
     server.database_path = database_path
     server.repository_path = repository_path
     server.repository = repository
+    server.artifacts_path = artifacts_path
+    server.generated_path = generated_path
     return server
 
 

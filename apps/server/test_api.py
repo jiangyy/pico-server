@@ -15,6 +15,7 @@ from unittest import mock
 
 import accounts
 import bundles
+import generated
 import repository
 from database import open_database
 from server import MAX_JSON_BODY_BYTES, make_server
@@ -3028,6 +3029,165 @@ class ContentApiTest(unittest.TestCase):
             self.assertEqual(
                 (status, body["code"]), (404, "not_found"), path
             )
+
+
+class GeneratedCacheApiTest(unittest.TestCase):
+    """HTTP invariants for the injected artifact and generated directories."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        base = Path(cls.temporary_directory.name)
+        cls.database_path = base / "app.db"
+        cls.repository_path = base / "picopg.git"
+        cls.artifacts_path = base / "artifacts"
+        cls.generated_path = base / "generated"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+            artifacts_path=cls.artifacts_path,
+            generated_path=cls.generated_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    def request(self, method, path, payload=None, token=None, raw_body=None,
+                content_type="application/json", extra_headers=None):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        decoded = json.loads(response_body) if response_body else None
+        connection.close()
+        return status, decoded
+
+    def seed_admin_token(self):
+        username = f"admin-{uuid.uuid4().hex[:8]}"
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    "admin",
+                )
+        finally:
+            connection.close()
+        status, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def build_zip(self, entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def test_rebuild_uses_injected_dirs_and_cache_is_not_authority(self):
+        self.assertEqual(self.server.artifacts_path, self.artifacts_path)
+        self.assertEqual(self.server.generated_path, self.generated_path)
+
+        token = self.seed_admin_token()
+        playground_id = f"private-{uuid.uuid4().hex[:8]}"
+        status, _ = self.request(
+            "POST", "/api/v1/playgrounds", {"id": playground_id}, token
+        )
+        self.assertEqual(status, 201)
+        status, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            token=token,
+            raw_body=self.build_zip([("picopg.json", self.MANIFEST)]),
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+        self.assertEqual(status, 201)
+        commit_id = body["commitId"]
+
+        (self.artifacts_path / "v1").mkdir(parents=True)
+        (self.artifacts_path / "v1" / "runtime.exe").write_bytes(b"runtime")
+        connection = open_database(self.database_path)
+        try:
+            generated.rebuild(
+                self.generated_path,
+                connection=connection,
+                repository=self.server.repository,
+                artifacts_path=self.artifacts_path,
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            sorted(path.name for path in self.generated_path.iterdir()),
+            sorted(generated.GENERATED_FILENAMES),
+        )
+
+        # A forged cache that advertises the private commit must not change
+        # live authorization: the anonymous catalog stays empty and the
+        # anonymous manifest read stays an indistinguishable not-found.
+        generated.atomic_write(
+            self.generated_path / generated.CATALOG_FILENAME,
+            json.dumps(
+                {
+                    "catalog": [
+                        {
+                            "playgroundId": playground_id,
+                            "commitId": commit_id,
+                        }
+                    ]
+                }
+            ).encode("utf-8"),
+        )
+
+        status, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["catalog"], [])
+
+        status, body = self.request(
+            "GET",
+            f"/api/v1/playgrounds/{playground_id}"
+            f"/commits/{commit_id}/manifest",
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
 
 
 if __name__ == "__main__":
