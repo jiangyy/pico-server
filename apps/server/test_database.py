@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from database import SCHEMA_VERSION, open_database
+from database import SCHEMA_VERSION, SchemaValidationError, open_database, validate_schema
 
 
 class DatabaseTest(unittest.TestCase):
@@ -2373,7 +2373,7 @@ class DatabaseTest(unittest.TestCase):
         connection.commit()
         connection.close()
 
-        with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+        with self.assertRaisesRegex(RuntimeError, "migration"):
             open_database(self.database_path)
 
     def test_user_role_is_constrained(self):
@@ -2450,6 +2450,145 @@ class DatabaseTest(unittest.TestCase):
 
         columns = connection.execute("PRAGMA table_info(sessions)").fetchall()
         self.assertNotIn("token", {row["name"] for row in columns})
+
+
+class SchemaValidationTest(unittest.TestCase):
+    """Task 37: a version-10 database must have the complete schema."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database_path = (
+            Path(self.temporary_directory.name) / "nested" / "app.db"
+        )
+
+    def open(self):
+        connection = open_database(self.database_path)
+        self.addCleanup(connection.close)
+        return connection
+
+    def test_incomplete_version_ten_database_is_rejected(self):
+        # The originally reviewed defect: only schema_migrations(10) exists.
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        raw = sqlite3.connect(self.database_path)
+        raw.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY CHECK (version > 0),
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (10, '2026-09-15T00:00:00Z');
+            """
+        )
+        raw.commit()
+        raw.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertIn(
+            caught.exception.category, {"migration", "table"}
+        )
+
+    def test_gapped_migration_history_is_rejected(self):
+        self.open().close()
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertEqual(caught.exception.category, "migration")
+
+    def test_missing_required_table_is_rejected(self):
+        self.open().close()
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("DROP TABLE comments")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertEqual(caught.exception.category, "table")
+
+    def test_missing_required_index_is_rejected(self):
+        self.open().close()
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("DROP INDEX sessions_user_id_idx")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertEqual(caught.exception.category, "index")
+
+    def test_missing_required_column_is_rejected(self):
+        self.open().close()
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("ALTER TABLE users DROP COLUMN created_at")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertEqual(caught.exception.category, "column")
+
+    def test_missing_foreign_key_is_rejected(self):
+        self.open().close()
+        connection = sqlite3.connect(self.database_path)
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = OFF;
+            ALTER TABLE comments RENAME TO comments_old;
+            CREATE TABLE comments (
+                id TEXT PRIMARY KEY NOT NULL,
+                submission_id TEXT NOT NULL
+                    REFERENCES submissions(id) ON DELETE RESTRICT,
+                author_user_id TEXT,
+                source TEXT NOT NULL
+                    CHECK (source IN ('teacher', 'ai', 'system')),
+                body TEXT NOT NULL CHECK (body <> ''),
+                created_at TEXT NOT NULL,
+                CHECK (source <> 'teacher' OR author_user_id IS NOT NULL)
+            );
+            INSERT INTO comments SELECT * FROM comments_old;
+            DROP TABLE comments_old;
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertEqual(caught.exception.category, "foreign_key")
+
+    def test_reappearing_dropped_table_is_rejected(self):
+        self.open().close()
+        connection = sqlite3.connect(self.database_path)
+        connection.execute(
+            "CREATE TABLE publisher_grants (user_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaValidationError) as caught:
+            open_database(self.database_path)
+        self.assertEqual(caught.exception.category, "table")
+
+    def test_validate_schema_is_read_only_and_repeatable(self):
+        connection = self.open()
+        before = connection.total_changes
+        validate_schema(connection)
+        validate_schema(connection)
+        self.assertEqual(connection.total_changes, before)
+
+        # A read-only connection can validate the same database.
+        read_only = sqlite3.connect(
+            f"file:{self.database_path}?mode=ro", uri=True
+        )
+        self.addCleanup(read_only.close)
+        validate_schema(read_only)
 
 
 if __name__ == "__main__":
