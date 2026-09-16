@@ -25,6 +25,11 @@ GIT_TIMEOUT_SECONDS = 30
 _REF_METACHARACTERS = frozenset(" ~^:?*[\\")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
+# Git object IDs are lowercase hexadecimal.  Requiring the exact full-width
+# form before a subprocess stops a symbolic name such as ``HEAD``, a short
+# prefix, or an option from being resolved as if it were an object id.
+_OBJECT_ID_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
+
 
 class RepositoryError(Exception):
     """Raised when the private repository cannot be opened or validated."""
@@ -460,3 +465,171 @@ def publish_playground(repository, playground_id, bundle, metadata):
     return PublishResult(
         playground_id=playground_id, commit_id=commit_id, no_op=False
     )
+
+
+# --- Read-only commit tree access ------------------------------------------
+#
+# Callers that distribute content need to enumerate a commit's blobs and read
+# their exact bytes.  Both helpers take an explicit full object id, never a ref
+# or a branch name, so they can never fall back to the current HEAD of a
+# branch.  Nothing is checked out, extracted, or copied to a temporary tree.
+
+
+@dataclass(frozen=True)
+class TreeEntry:
+    """One recursively listed entry of a commit's tree.
+
+    ``size`` is the blob size reported by Git and is ``None`` for entries that
+    are not blobs (for example a submodule gitlink).
+    """
+
+    path: str
+    mode: str
+    kind: str
+    object_id: str
+    size: int | None
+
+
+def resolve_commit(repository, commit_id):
+    """Return the exact commit id, or ``None`` when it does not exist.
+
+    ``commit_id`` must already be a full lowercase object id.  Symbolic names
+    and short prefixes are rejected instead of being resolved.
+    """
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    commit_id = _require_object_id(commit_id)
+    completed = _run_git(
+        ("rev-parse", "--verify", "--quiet", f"{commit_id}^{{commit}}"),
+        cwd=repository.path,
+    )
+    if completed.returncode != 0:
+        return None
+    resolved = completed.stdout.strip().decode("ascii", "replace")
+    if resolved != commit_id:
+        return None
+    return resolved
+
+
+def list_commit_tree(repository, commit_id):
+    """Recursively list one exact commit's tree without any checkout.
+
+    Returns :class:`TreeEntry` values in Git's own tree order.  Callers that
+    need path order sort the result themselves.  A missing commit or a tree-ish
+    that is not a commit raises :class:`RepositoryError`.
+    """
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    commit_id = _require_object_id(commit_id)
+    if resolve_commit(repository, commit_id) is None:
+        raise RepositoryError("commit does not exist")
+    completed = _run_git(
+        ("ls-tree", "-r", "-l", "-z", commit_id), cwd=repository.path
+    )
+    if completed.returncode != 0:
+        raise RepositoryError("could not list commit tree")
+    return _parse_tree_listing(completed.stdout)
+
+
+def read_blobs(repository, object_ids):
+    """Read blob contents by exact object id in one bounded batch.
+
+    Returns a mapping from the requested object id to its exact bytes.
+    Duplicate ids are read once.  A non-blob or missing object raises
+    :class:`RepositoryError` instead of returning partial content.
+    """
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    requested = []
+    seen = set()
+    for object_id in object_ids:
+        object_id = _require_object_id(object_id)
+        if object_id not in seen:
+            seen.add(object_id)
+            requested.append(object_id)
+    if not requested:
+        return {}
+    payload = ("\n".join(requested) + "\n").encode("ascii")
+    completed = _run_git(
+        ("cat-file", "--batch"), cwd=repository.path, stdin=payload
+    )
+    if completed.returncode != 0:
+        raise RepositoryError("could not read commit blobs")
+    return _parse_batch_output(completed.stdout, requested)
+
+
+def _require_object_id(value):
+    if type(value) is not str or _OBJECT_ID_PATTERN.match(value) is None:
+        raise RepositoryError("object id must be a full Git object id")
+    return value
+
+
+def _parse_tree_listing(payload):
+    if type(payload) is not bytes:
+        raise RepositoryError("tree listing must be bytes")
+    entries = []
+    for record in payload.split(b"\x00"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        if not separator:
+            raise RepositoryError("malformed tree entry")
+        fields = metadata.split()
+        if len(fields) != 4:
+            raise RepositoryError("malformed tree entry")
+        try:
+            mode = fields[0].decode("ascii")
+            kind = fields[1].decode("ascii")
+            object_id = fields[2].decode("ascii")
+            size_field = fields[3].decode("ascii")
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RepositoryError("malformed tree entry") from error
+        if _OBJECT_ID_PATTERN.match(object_id) is None:
+            raise RepositoryError("malformed tree entry")
+        if size_field == "-":
+            size = None
+        else:
+            try:
+                size = int(size_field)
+            except ValueError as error:
+                raise RepositoryError("malformed tree entry") from error
+            if size < 0:
+                raise RepositoryError("malformed tree entry")
+        entries.append(
+            TreeEntry(
+                path=path,
+                mode=mode,
+                kind=kind,
+                object_id=object_id,
+                size=size,
+            )
+        )
+    return entries
+
+
+def _parse_batch_output(payload, requested):
+    blobs = {}
+    position = 0
+    for object_id in requested:
+        newline = payload.find(b"\n", position)
+        if newline < 0:
+            raise RepositoryError("malformed batch response")
+        header = payload[position:newline].split()
+        position = newline + 1
+        if len(header) < 3:
+            raise RepositoryError("blob is missing from repository")
+        try:
+            reported_id = header[0].decode("ascii")
+            kind = header[1].decode("ascii")
+            size = int(header[2])
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RepositoryError("malformed batch response") from error
+        if reported_id != object_id or kind != "blob" or size < 0:
+            raise RepositoryError("malformed batch response")
+        end = position + size
+        if end > len(payload) or payload[end:end + 1] != b"\n":
+            raise RepositoryError("malformed batch response")
+        blobs[object_id] = bytes(payload[position:end])
+        position = end + 1
+    return blobs

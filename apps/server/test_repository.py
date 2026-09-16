@@ -597,5 +597,198 @@ class PlaygroundPublishingTest(unittest.TestCase):
         self.assertEqual(author, "Test Author <author@example.test>")
 
 
+class CommitTreeReadTest(unittest.TestCase):
+    """Read-only commit tree and blob access without any checkout."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "picopg.git"
+        self.repository = open_repository(self.path)
+
+    def make_bundle(self, entries):
+        return bundles.validate_bundle(
+            [bundles.BundleEntry(path, data) for path, data in entries]
+        )
+
+    def default_entries(self, course_data=b"print(1)"):
+        return [
+            ("picopg.json", b'{"schemaVersion":1,"runtime":"python"}'),
+            ("course/module/app.py", course_data),
+            ("starter/setup.py", b"setup"),
+        ]
+
+    def metadata(self):
+        return CommitMetadata(
+            name="Test Author",
+            email="author@example.test",
+            timestamp="2026-01-01T00:00:00+00:00",
+            message="publish playground",
+        )
+
+    def git(self, *arguments, input=None, check=True):
+        return subprocess.run(
+            ["git", "-C", str(self.path), *arguments],
+            input=input,
+            capture_output=True,
+            check=check,
+        )
+
+    def commit_tree(self, tree_id, message=b"crafted\n"):
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "GIT_AUTHOR_NAME": "Decoy",
+                "GIT_AUTHOR_EMAIL": "decoy@example.test",
+                "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+                "GIT_COMMITTER_NAME": "Decoy",
+                "GIT_COMMITTER_EMAIL": "decoy@example.test",
+                "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+            }
+        )
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), "commit-tree", tree_id],
+            input=message,
+            capture_output=True,
+            check=True,
+            env=environment,
+        )
+        return completed.stdout.strip().decode("ascii")
+
+    def publish(self, course_data=b"print(1)"):
+        return repository.publish_playground(
+            self.repository,
+            "pg-read",
+            self.make_bundle(self.default_entries(course_data)),
+            self.metadata(),
+        )
+
+    def test_list_commit_tree_returns_recursive_blob_entries(self):
+        result = self.publish()
+        entries = repository.list_commit_tree(
+            self.repository, result.commit_id
+        )
+        by_path = {entry.path: entry for entry in entries}
+        self.assertEqual(
+            set(by_path),
+            {"picopg.json", "course/module/app.py", "starter/setup.py"},
+        )
+        for path, entry in by_path.items():
+            with self.subTest(path=path):
+                self.assertEqual(entry.kind, "blob")
+                self.assertEqual(entry.mode, "100644")
+                self.assertIsNotNone(entry.size)
+                self.assertEqual(
+                    entry.object_id,
+                    self.git(
+                        "rev-parse", f"{result.commit_id}:{path}"
+                    ).stdout.strip().decode("ascii"),
+                )
+
+    def test_list_commit_tree_rejects_symbolic_and_short_ids(self):
+        result = self.publish()
+        for commit_id in (
+            "HEAD",
+            result.commit_id[:12],
+            result.commit_id.upper(),
+            "refs/heads/playgrounds/pg-read",
+            None,
+            7,
+        ):
+            with self.subTest(commit_id=commit_id):
+                with self.assertRaises(RepositoryError):
+                    repository.list_commit_tree(self.repository, commit_id)
+
+    def test_list_commit_tree_rejects_missing_commit(self):
+        self.publish()
+        with self.assertRaises(RepositoryError):
+            repository.list_commit_tree(self.repository, "a" * 40)
+
+    def test_resolve_commit_requires_an_exact_existing_commit(self):
+        result = self.publish()
+        self.assertEqual(
+            repository.resolve_commit(self.repository, result.commit_id),
+            result.commit_id,
+        )
+        self.assertIsNone(
+            repository.resolve_commit(self.repository, "a" * 40)
+        )
+        tree_id = (
+            self.git("rev-parse", f"{result.commit_id}^{{tree}}")
+            .stdout.strip()
+            .decode("ascii")
+        )
+        self.assertIsNone(
+            repository.resolve_commit(self.repository, tree_id)
+        )
+        with self.assertRaises(RepositoryError):
+            repository.resolve_commit(self.repository, "HEAD")
+
+    def test_read_blobs_returns_exact_bytes(self):
+        binary = bytes(range(256))
+        entries = [
+            ("picopg.json", b'{"schemaVersion":1,"runtime":"python"}'),
+            ("course/data.bin", binary),
+            ("course/empty.txt", b""),
+        ]
+        result = repository.publish_playground(
+            self.repository,
+            "pg-read",
+            self.make_bundle(entries),
+            self.metadata(),
+        )
+        listed = repository.list_commit_tree(
+            self.repository, result.commit_id
+        )
+        blob_ids = [entry.object_id for entry in listed]
+        blobs = repository.read_blobs(self.repository, blob_ids)
+        expected = dict(entries)
+
+        for entry in listed:
+            with self.subTest(path=entry.path):
+                self.assertEqual(blobs[entry.object_id], expected[entry.path])
+
+    def test_read_blobs_rejects_unknown_non_blob_and_malformed_ids(self):
+        result = self.publish()
+        tree_id = (
+            self.git("rev-parse", f"{result.commit_id}^{{tree}}")
+            .stdout.strip()
+            .decode("ascii")
+        )
+        for object_id in (
+            "a" * 40,
+            result.commit_id,
+            tree_id,
+            "HEAD",
+            None,
+        ):
+            with self.subTest(object_id=object_id):
+                with self.assertRaises(RepositoryError):
+                    repository.read_blobs(self.repository, [object_id])
+
+        self.assertEqual(repository.read_blobs(self.repository, []), {})
+
+    def test_non_blob_tree_entries_have_no_size(self):
+        published = self.publish()
+        manifest_blob = self.git(
+            "hash-object", "-w", "--stdin", input=b"manifest"
+        ).stdout.strip().decode("ascii")
+        payload = (
+            f"100644 blob {manifest_blob}\tpicopg.json\n"
+            f"160000 commit {published.commit_id}\tsub\n"
+        ).encode("utf-8")
+        tree_id = (
+            self.git("mktree", input=payload)
+            .stdout.strip()
+            .decode("ascii")
+        )
+        commit_id = self.commit_tree(tree_id)
+        entries = repository.list_commit_tree(self.repository, commit_id)
+        by_path = {entry.path: entry for entry in entries}
+        self.assertEqual(by_path["sub"].kind, "commit")
+        self.assertIsNone(by_path["sub"].size)
+        self.assertEqual(by_path["picopg.json"].size, len(b"manifest"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
