@@ -96,12 +96,14 @@ from sessions import (
 from submissions import (
     InvalidSubmissionRequestError,
     MissingSubmissionError,
+    SubmissionIntegrityError,
     SubmissionNotAllowedError,
     UnknownReleaseError,
     UnknownWorkCommitError,
     create_submission,
     get_submission,
     list_submissions,
+    review_submission,
     submission_to_mapping,
 )
 
@@ -464,6 +466,54 @@ def _match_submission_comments(path):
     return submission_id
 
 
+def _submission_work_route_parts(path):
+    """Split ``.../submissions/<submission>/work/<tail>``.
+
+    Returns ``(submission_id, tail)`` or ``None`` for any other shape, so a
+    missing or extra segment never matches.
+    """
+
+    prefix = SUBMISSIONS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    parts = path[len(prefix):].split("/", 2)
+    if len(parts) != 3:
+        return None
+    submission_id, segment, tail = parts
+    if segment != "work" or not submission_id:
+        return None
+    return submission_id, tail
+
+
+def _match_submission_work_manifest(path):
+    """Return the opaque submission ID for a Work review manifest path."""
+
+    parts = _submission_work_route_parts(path)
+    if parts is None:
+        return None
+    submission_id, tail = parts
+    if tail != MANIFEST_SEGMENT:
+        return None
+    return submission_id
+
+
+def _match_submission_work_files(path):
+    """Return ``(submission_id, encoded_path)`` for a Work review file."""
+
+    parts = _submission_work_route_parts(path)
+    if parts is None:
+        return None
+    submission_id, tail = parts
+    prefix = FILES_SEGMENT + "/"
+    if not tail.startswith(prefix):
+        return None
+    encoded_path = tail[len(prefix):]
+    if not encoded_path:
+        return None
+    return submission_id, encoded_path
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -519,6 +569,10 @@ def _allowed_methods(path):
         return ("GET", "HEAD", "POST")
     if _match_submission_comments(path) is not None:
         return ("GET", "HEAD", "POST")
+    if _match_submission_work_manifest(path) is not None:
+        return ALLOWED_METHODS
+    if _match_submission_work_files(path) is not None:
+        return ALLOWED_METHODS
     if _match_submission(path) is not None:
         return ALLOWED_METHODS
     if _match_release(path) is not None:
@@ -758,6 +812,14 @@ class Handler(BaseHTTPRequestHandler):
         elif _match_submission_comments(path) is not None:
             self._get_submission_comments(
                 _match_submission_comments(path), head_only=head_only
+            )
+        elif _match_submission_work_manifest(path) is not None:
+            self._get_submission_work_manifest(
+                _match_submission_work_manifest(path), head_only=head_only
+            )
+        elif _match_submission_work_files(path) is not None:
+            self._get_submission_work_file(
+                *_match_submission_work_files(path), head_only=head_only
             )
         elif _match_submission(path) is not None:
             self._get_submission(
@@ -1925,6 +1987,137 @@ class Handler(BaseHTTPRequestHandler):
             {"comments": [comment_to_mapping(item) for item in records]},
             head_only=head_only,
         )
+
+    def _get_submission_work_manifest(self, submission_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        if self._reject_query_or_body(head_only=head_only):
+            return
+
+        try:
+            with self._database() as connection:
+                review = review_submission(
+                    connection, actor, self.server.repository, submission_id
+                )
+                manifest = work_content.get_work_manifest(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    review.student_id,
+                    review.playground_id,
+                    review.work_commit_id,
+                )
+        except (MissingSubmissionError, InvalidSubmissionRequestError):
+            self._deny_submission_work(submission_id, head_only=head_only)
+            return
+        except (
+            SubmissionIntegrityError,
+            authorization.ContentAccessDeniedError,
+            work_content.WorkContentError,
+            RepositoryError,
+        ):
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+
+        self._audit_override = ("submission.work.read", submission_id)
+        self._respond_json(
+            200,
+            {
+                "manifest": {
+                    "submissionId": review.submission_id,
+                    "playgroundId": manifest.playground_id,
+                    "workCommitId": manifest.work_commit_id,
+                    "playgroundCommitId": manifest.playground_commit_id,
+                    "files": [
+                        {
+                            "path": item.path,
+                            "size": item.size,
+                            "sha256": item.sha256,
+                        }
+                        for item in manifest.files
+                    ],
+                }
+            },
+            head_only=head_only,
+        )
+
+    def _get_submission_work_file(
+        self, submission_id, encoded_path, head_only=False
+    ):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        if self._reject_query_or_body(head_only=head_only):
+            return
+
+        path = _decode_content_path(encoded_path)
+        if path is None:
+            self._deny_submission_work(submission_id, head_only=head_only)
+            return
+
+        try:
+            with self._database() as connection:
+                review = review_submission(
+                    connection, actor, self.server.repository, submission_id
+                )
+                content = work_content.read_work_file(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    review.student_id,
+                    review.playground_id,
+                    review.work_commit_id,
+                    path,
+                )
+        except (MissingSubmissionError, InvalidSubmissionRequestError):
+            self._deny_submission_work(submission_id, head_only=head_only)
+            return
+        except work_content.WorkContentError as error:
+            if error.reason in (
+                work_content.REASON_PATH_NOT_FOUND,
+                work_content.REASON_PATH_NOT_ALLOWED,
+            ):
+                self._deny_submission_work(
+                    submission_id, head_only=head_only
+                )
+            else:
+                self._api_error(500, "internal_error", head_only=head_only)
+            return
+        except (
+            SubmissionIntegrityError,
+            authorization.ContentAccessDeniedError,
+            RepositoryError,
+        ):
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+
+        self._audit_override = ("submission.work.read", submission_id)
+        self._respond_file(content.data, content.sha256, head_only=head_only)
+
+    def _reject_query_or_body(self, head_only=False):
+        if urlsplit(self.path).query:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return True
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            return False
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return True
+        if length > 0:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return True
+        return False
+
+    def _deny_submission_work(self, submission_id, head_only=False):
+        """Answer a missing or denied Submission review with one hidden 404."""
+
+        self._audit_code = "not_found_or_denied"
+        self._audit_override = ("submission.work.read", submission_id)
+        self._respond_json(404, {"code": "not_found"}, head_only=head_only)
 
     def _post_submission_comment(self, submission_id):
         actor = self._authenticate()

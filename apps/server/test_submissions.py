@@ -15,6 +15,7 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 # Allow ``import submissions`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -695,6 +696,49 @@ class SubmissionReadTest(SubmissionTestBase):
                     submissions.get_submission(
                         self.connection, actor, self.first_submission["id"]
                     )
+
+    def test_review_submission_authorizes_student_and_owner_teacher(self):
+        submission_id = self.first_submission["id"]
+        for actor in (self.student, self.teacher):
+            with self.subTest(role=actor.role):
+                review = submissions.review_submission(
+                    self.connection, actor, self.repository, submission_id
+                )
+                self.assertEqual(review.submission_id, submission_id)
+                self.assertEqual(review.student_id, self.student.id)
+                self.assertEqual(
+                    review.work_commit_id,
+                    self.first_submission["workCommitId"],
+                )
+                self.assertEqual(review.playground_id, self.playground_id)
+                self.assertEqual(
+                    review.playground_commit_id, self.first.commit_id
+                )
+
+        # Admin is denied source review, and so is anyone not on the exact
+        # Submission.
+        for actor in (self.admin, self.other_student, self.other_teacher):
+            with self.subTest(role=actor.role):
+                with self.assertRaises(submissions.MissingSubmissionError):
+                    submissions.review_submission(
+                        self.connection,
+                        actor,
+                        self.repository,
+                        submission_id,
+                    )
+
+    def test_review_submission_fails_closed_on_inconsistent_work(self):
+        submission_id = self.first_submission["id"]
+        with mock.patch.object(
+            submissions, "_work_commit_in_history", return_value=False
+        ):
+            with self.assertRaises(submissions.SubmissionIntegrityError):
+                submissions.review_submission(
+                    self.connection,
+                    self.student,
+                    self.repository,
+                    submission_id,
+                )
 
 
 class SubmissionLookupTest(SubmissionTestBase):

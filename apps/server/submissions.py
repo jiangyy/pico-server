@@ -58,6 +58,10 @@ class MissingSubmissionError(SubmissionError):
     """No readable Submission exists for the requested identifier."""
 
 
+class SubmissionIntegrityError(SubmissionError):
+    """Durable Submission metadata is inconsistent with the repository."""
+
+
 @dataclass(frozen=True)
 class Submission:
     """Immutable metadata for one Student/Release/Work-commit record."""
@@ -454,6 +458,83 @@ def _row_is_visible(connection, actor, row):
     if actor.role == "student":
         return row["student_id"] == actor.id
     raise accounts.ForbiddenActionError("unknown role")
+
+
+@dataclass(frozen=True)
+class SubmissionReview:
+    """The exact immutable facts needed to review one Submission's Work."""
+
+    submission_id: str
+    student_id: str
+    work_commit_id: str
+    playground_id: str
+    playground_commit_id: str
+
+
+def review_submission(connection, actor, repository, submission_id):
+    """Authorize one exact Submission for Work source review.
+
+    Only the Student recorded on this exact Submission and the current owner
+    Teacher of the Class reached through its immutable Release may review.
+    Admin is deliberately denied source access.  Every missing, unknown, or
+    unauthorized target raises :class:`MissingSubmissionError`, so the caller
+    returns one hidden response.
+
+    The stored Work commit is revalidated against the exact Work ref and the
+    Release's pinned Playground commit; a durable inconsistency raises
+    :class:`SubmissionIntegrityError` instead of serving partial content.
+    """
+
+    _require_actor(actor)
+    _require_repository(repository)
+    submission_id = _require_identifier(submission_id, "submissionId")
+
+    row = connection.execute(
+        """
+        SELECT submissions.id,
+               submissions.student_id,
+               submissions.work_commit_id,
+               releases.playground_id,
+               releases.playground_commit_id,
+               classes.teacher_id
+        FROM submissions
+        JOIN releases ON releases.id = submissions.release_id
+        JOIN classes ON classes.id = releases.class_id
+        WHERE submissions.id = ?
+        """,
+        (submission_id,),
+    ).fetchone()
+    if row is None:
+        raise MissingSubmissionError(submission_id)
+
+    if actor.role == "student":
+        if row["student_id"] != actor.id:
+            raise MissingSubmissionError(submission_id)
+    elif actor.role == "teacher":
+        if row["teacher_id"] != actor.id:
+            raise MissingSubmissionError(submission_id)
+    else:
+        raise MissingSubmissionError(submission_id)
+
+    playground_id = row["playground_id"]
+    work_commit_id = row["work_commit_id"]
+    if not _work_commit_in_history(
+        repository, playground_id, row["student_id"], work_commit_id
+    ):
+        raise SubmissionIntegrityError("submitted Work commit is not reachable")
+    if (
+        _work_pinned_playground_commit(repository, work_commit_id)
+        != row["playground_commit_id"]
+    ):
+        raise SubmissionIntegrityError("submitted Work pin is inconsistent")
+
+    return SubmissionReview(
+        submission_id=submission_id,
+        student_id=row["student_id"],
+        work_commit_id=work_commit_id,
+        playground_id=playground_id,
+        playground_commit_id=row["playground_commit_id"],
+    )
 
 
 def get_submission(connection, actor, submission_id):

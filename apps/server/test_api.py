@@ -5454,6 +5454,203 @@ class SubmissionApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIsNone(listed)
 
+    # ----- Submission Work review ----------------------------------------
+
+    def raw_submission_request(self, method, path, token=None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+        return status, response_headers, body
+
+    @staticmethod
+    def submission_work_manifest_path(submission_id):
+        return f"/api/v1/submissions/{submission_id}/work/manifest"
+
+    @staticmethod
+    def submission_work_file_path(submission_id, encoded_path):
+        return (
+            f"/api/v1/submissions/{submission_id}/work/files/{encoded_path}"
+        )
+
+    def test_submission_work_review_snapshot(self):
+        ctx = self.course()
+        submission = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]
+        submission_id = submission["id"]
+        manifest_path = self.submission_work_manifest_path(submission_id)
+        file_path = self.submission_work_file_path(submission_id, "main.py")
+
+        # The Student and the owning Teacher read the same immutable snapshot.
+        for token in (ctx["student_token"], ctx["teacher_token"]):
+            status, _, body = self.request("GET", manifest_path, token=token)
+            self.assertEqual(status, 200)
+            manifest = body["manifest"]
+            self.assertEqual(manifest["submissionId"], submission_id)
+            self.assertEqual(manifest["workCommitId"], ctx["work_commit_id"])
+            self.assertEqual(manifest["playgroundId"], ctx["playground_id"])
+            self.assertEqual(
+                [item["path"] for item in manifest["files"]],
+                ["main.py"],
+            )
+            status, _, data = self.raw_submission_request(
+                "GET", file_path, token=token
+            )
+            self.assertEqual((status, data), (200, b"print('work')"))
+
+        # A newer Student save never alters the submission snapshot.
+        self.sync(
+            ctx["student_token"],
+            ctx["playground_id"],
+            ctx["commit_id"],
+            {"work/main.py": b"print('newer')"},
+            base=ctx["work_commit_id"],
+        )
+        status, _, body = self.request(
+            "GET", manifest_path, token=ctx["teacher_token"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["manifest"]["workCommitId"], ctx["work_commit_id"]
+        )
+        status, _, data = self.raw_submission_request(
+            "GET", file_path, token=ctx["teacher_token"]
+        )
+        self.assertEqual((status, data), (200, b"print('work')"))
+
+        # HEAD parity for the manifest and the file.
+        status, headers, body = self.request(
+            "HEAD", manifest_path, token=ctx["teacher_token"]
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(body)
+        status, _, data = self.raw_submission_request(
+            "HEAD", file_path, token=ctx["teacher_token"]
+        )
+        self.assertEqual((status, data), (200, b""))
+
+    def test_submission_work_review_hidden_denials(self):
+        ctx = self.course()
+        submission_id = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]["id"]
+        manifest_path = self.submission_work_manifest_path(submission_id)
+
+        # Anonymous and invalid sessions stay 401.
+        for bad_token in (None, "not-a-session"):
+            status, _, _ = self.request(
+                "GET", manifest_path, token=bad_token
+            )
+            self.assertEqual(status, 401)
+
+        # Another Student, an unrelated Teacher, and an Admin all get the
+        # same hidden 404 as a missing Submission.
+        for role in ("student", "teacher", "admin"):
+            user = self.seed_user(role)
+            token = self.login_token(user.username)
+            for path in (
+                manifest_path,
+                self.submission_work_file_path(submission_id, "main.py"),
+                self.submission_work_manifest_path("missing-submission"),
+            ):
+                status, _, body = self.request("GET", path, token=token)
+                self.assertEqual(status, 404, (role, path))
+                self.assertEqual(body["code"], "not_found")
+
+    def test_submission_work_review_ownership_transfer(self):
+        ctx = self.course()
+        submission_id = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]["id"]
+        manifest_path = self.submission_work_manifest_path(submission_id)
+
+        replacement = self.seed_user("teacher")
+        replacement_token = self.login_token(replacement.username)
+        status, _, _ = self.request(
+            "PATCH",
+            f"/api/v1/admin/classes/{ctx['class']['id']}/owner",
+            {"teacherId": replacement.id},
+            token=ctx["admin_token"],
+        )
+        self.assertEqual(status, 200)
+
+        status, _, body = self.request(
+            "GET", manifest_path, token=ctx["teacher_token"]
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.request(
+            "GET", manifest_path, token=replacement_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["manifest"]["submissionId"], submission_id)
+
+        # The submitting Student keeps access.
+        status, _, _ = self.request(
+            "GET", manifest_path, token=ctx["student_token"]
+        )
+        self.assertEqual(status, 200)
+
+    def test_submission_work_review_rejects_query_and_bad_paths(self):
+        ctx = self.course()
+        submission_id = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )[2]["submission"]["id"]
+
+        status, _, body = self.request(
+            "GET",
+            self.submission_work_manifest_path(submission_id) + "?x=1",
+            token=ctx["student_token"],
+        )
+        self.assertEqual((status, body["code"]), (400, "invalid_request"))
+
+        for encoded in (
+            "..%2fsecret.py",
+            "..%5csecret.py",
+            "missing.py",
+            "course%2fmodule%2fapp.py",
+            ".picopg%2fwork.json",
+            "%252e%252e",
+        ):
+            with self.subTest(encoded=encoded):
+                status, _, body = self.request(
+                    "GET",
+                    self.submission_work_file_path(submission_id, encoded),
+                    token=ctx["student_token"],
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(body["code"], "not_found")
+
+        for malformed in ("..", "bad%2fid", "missing-id"):
+            with self.subTest(malformed=malformed):
+                status, _, body = self.request(
+                    "GET",
+                    self.submission_work_manifest_path(malformed),
+                    token=ctx["student_token"],
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(body["code"], "not_found")
+
 
 class CommentApiTest(unittest.TestCase):
     """HTTP contract for the immutable Comment API."""
