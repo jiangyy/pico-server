@@ -2,12 +2,14 @@
 
 import hashlib
 import json
+import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import audit
 import authorization
 import manifests
 import submissions
@@ -147,12 +149,6 @@ MAX_IDEMPOTENCY_KEY_LENGTH = 255
 # but did not carry a valid session, so the caller can stop without confusing
 # the failure with an anonymous request.
 _AUTH_FAILED = object()
-
-# The denials a content read route reports as an indistinguishable not-found.
-_CONTENT_READ_ERRORS = (
-    authorization.ContentAccessDeniedError,
-    manifests.ManifestError,
-)
 
 
 def _match_admin_user_role(path):
@@ -426,6 +422,69 @@ def _allowed_methods(path):
     return None
 
 
+def _audit_action(method, path):
+    """Return the ``(action, target)`` audited for a mutating request.
+
+    Only authenticated mutations are named here; unauthenticated account
+    creation and login return ``(None, None)``, as do all reads.  A read is
+    still audited when it ends in an authorization failure.  The target is
+    the opaque domain ID the mutation acts on, never a raw path or query.
+    """
+
+    if method == "POST":
+        if path == ADMIN_USERS_PATH:
+            return "admin.user.create", None
+        if path == ADMIN_CLASSES_PATH:
+            return "class.create", None
+        if path == PLAYGROUNDS_PATH:
+            return "playground.create", None
+        if path == "/api/v1/logout":
+            return "account.logout", None
+        playground_id = _match_playground_commit(path)
+        if playground_id is not None:
+            return "playground.publish", playground_id
+        playground_id = _match_work_sync(path)
+        if playground_id is not None:
+            return "work.sync", playground_id
+        playground_id = _match_work_restore(path)
+        if playground_id is not None:
+            return "work.restore", playground_id
+        class_id = _match_class_releases(path)
+        if class_id is not None:
+            return "release.create", class_id
+        release_id = _match_release_submissions(path)
+        if release_id is not None:
+            return "submission.create", release_id
+        submission_id = _match_submission_comments(path)
+        if submission_id is not None:
+            return "comment.create", submission_id
+        return None, None
+
+    if method == "PATCH":
+        user_id = _match_admin_user_role(path)
+        if user_id is not None:
+            return "admin.user.role.update", user_id
+        class_id = _match_class_owner(path)
+        if class_id is not None:
+            return "class.owner.update", class_id
+        playground_id = _match_playground(path)
+        if playground_id is not None:
+            return "playground.update", playground_id
+        return None, None
+
+    if method in ("PUT", "DELETE"):
+        member = _match_class_member(path)
+        if member is not None:
+            class_id, student_id = member
+            action = (
+                "class.member.add"
+                if method == "PUT"
+                else "class.member.remove"
+            )
+            return action, f"{class_id}/{student_id}"
+    return None, None
+
+
 def _bundle_request(playground_id, bundle):
     """Return the canonical, content-addressed logical publish request.
 
@@ -479,16 +538,71 @@ class Handler(BaseHTTPRequestHandler):
     """Route public pages and the first account API."""
 
     def do_GET(self):
-        self._route_get()
+        self._dispatch(self._route_get)
 
     def do_HEAD(self):
-        self._route_get(head_only=True)
+        self._dispatch(self._route_get, head_only=True)
 
     def do_POST(self):
-        self._route_post()
+        self._dispatch(self._route_post)
 
     def do_PATCH(self):
-        self._route_patch()
+        self._dispatch(self._route_patch)
+
+    def _dispatch(self, route, **kwargs):
+        """Run one request and emit its audit event after the response."""
+
+        log = getattr(self.server, "audit", None)
+        if log is None:
+            route(**kwargs)
+            return
+
+        self._request_id = log.request_id(
+            self.headers.get("X-Request-Id"), secret=self._bearer_token()
+        )
+        self._audit_actor_id = None
+        self._audit_status = None
+        self._audit_code = None
+        self._audit_override = None
+        self._audit_recorded = False
+        started_at = log.now()
+        context = getattr(self.server, "_audit_context", None)
+        if context is not None:
+            # ``handle_error`` runs on this same request thread, so it can
+            # recover the in-flight request identity if the route aborts.
+            context.handler = self
+        try:
+            route(**kwargs)
+        finally:
+            self._emit_audit(log, started_at)
+
+    def _emit_audit(self, log, started_at):
+        status = self._audit_status
+        if status is None:
+            return
+
+        if self._audit_override is not None:
+            action, target = self._audit_override
+        else:
+            path = urlsplit(self.path).path
+            action, target = _audit_action(self.command, path)
+            if action is None:
+                # Unauthenticated login failures carry no actor or target
+                # worth auditing; every other authorization failure is a
+                # bounded event.
+                if status not in (401, 403) or path == "/api/v1/login":
+                    return
+                action = "request.denied"
+        self._audit_recorded = True
+        log.record(
+            request_id=self._request_id,
+            actor_id=self._audit_actor_id,
+            action=action,
+            target=target,
+            status=status,
+            code=self._audit_code,
+            started_at=started_at,
+        )
 
     def _route_get(self, head_only=False):
         path = urlsplit(self.path).path
@@ -775,8 +889,21 @@ class Handler(BaseHTTPRequestHandler):
                     playground_id,
                     commit_id,
                 )
-        except _CONTENT_READ_ERRORS:
-            self._api_error(404, "not_found", head_only=head_only)
+        except authorization.ContentAccessDeniedError:
+            self._deny_content_read(
+                playground_id,
+                commit_id,
+                code="content_denied",
+                head_only=head_only,
+            )
+            return
+        except manifests.ManifestError:
+            self._deny_content_read(
+                playground_id,
+                commit_id,
+                code="not_found",
+                head_only=head_only,
+            )
             return
         except RepositoryError:
             self._api_error(404, "not_found", head_only=head_only)
@@ -810,8 +937,21 @@ class Handler(BaseHTTPRequestHandler):
                     commit_id,
                     path,
                 )
-        except _CONTENT_READ_ERRORS:
-            self._api_error(404, "not_found", head_only=head_only)
+        except authorization.ContentAccessDeniedError:
+            self._deny_content_read(
+                playground_id,
+                commit_id,
+                code="content_denied",
+                head_only=head_only,
+            )
+            return
+        except manifests.ManifestError:
+            self._deny_content_read(
+                playground_id,
+                commit_id,
+                code="not_found",
+                head_only=head_only,
+            )
             return
         except RepositoryError:
             self._api_error(404, "not_found", head_only=head_only)
@@ -1182,6 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
             current_head = works.current_work_head(
                 self.server.repository, playground_id, actor.id
             )
+            self._audit_code = "work_head_changed"
             self._respond_json(
                 409,
                 {
@@ -1245,6 +1386,7 @@ class Handler(BaseHTTPRequestHandler):
             current_head = works.current_work_head(
                 self.server.repository, playground_id, actor.id
             )
+            self._audit_code = "work_head_changed"
             self._respond_json(
                 409,
                 {
@@ -1609,10 +1751,12 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             with self._database() as connection:
-                return authenticate_session(connection, token)
+                actor = authenticate_session(connection, token)
         except InvalidSessionError:
             self._api_error(401, "invalid_session", head_only=head_only)
             return None
+        self._audit_actor_id = actor.id
+        return actor
 
     def _optional_actor(self, head_only=False):
         """Resolve an optional session for a public-capable read route.
@@ -1633,10 +1777,12 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             with self._database() as connection:
-                return authenticate_session(connection, token)
+                actor = authenticate_session(connection, token)
         except InvalidSessionError:
             self._api_error(401, "invalid_session", head_only=head_only)
             return _AUTH_FAILED
+        self._audit_actor_id = actor.id
+        return actor
 
     def _post_logout(self):
         token = self._bearer_token()
@@ -1645,6 +1791,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         with self._database() as connection:
+            try:
+                actor = authenticate_session(connection, token)
+            except InvalidSessionError:
+                actor = None
+            if actor is not None:
+                self._audit_actor_id = actor.id
             revoke_session(connection, token)
         self._respond(204, "")
 
@@ -1749,6 +1901,7 @@ class Handler(BaseHTTPRequestHandler):
     def _api_error(
         self, status, code, head_only=False, extra_headers=(), details=None
     ):
+        self._audit_code = code
         payload = {"code": code}
         if details is not None:
             payload["details"] = details
@@ -1758,6 +1911,26 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
             extra_headers=extra_headers,
         )
+
+    def _deny_content_read(
+        self, playground_id, commit_id, code, head_only=False
+    ):
+        """Answer an unreadable or missing content read and audit opaquely.
+
+        The client sees the same indistinguishable ``404 not_found`` whether
+        the read was denied or the target does not exist.  ``code``
+        distinguishes the two for the audit stream only.  The audit event
+        records only the opaque playground/commit target and the result code;
+        the request path, filename, contents, body, and credential are never
+        recorded.
+        """
+
+        self._audit_code = code
+        self._audit_override = (
+            "content.read",
+            f"{playground_id}/{commit_id}",
+        )
+        self._respond_json(404, {"code": "not_found"}, head_only=head_only)
 
     def _respond_json(self, status, payload, head_only=False, extra_headers=()):
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -1769,10 +1942,16 @@ class Handler(BaseHTTPRequestHandler):
             content_type="application/json; charset=utf-8",
         )
 
+    def _send_request_id(self):
+        request_id = getattr(self, "_request_id", None)
+        if request_id is not None:
+            self.send_header("X-Request-Id", request_id)
+
     def _respond_file(self, data, sha256, head_only=False):
         """Answer a content download with exact bytes and a SHA-256 ETag."""
 
         self.send_response(200)
+        self._send_request_id()
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("ETag", f'"{sha256}"')
@@ -1781,6 +1960,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if not head_only:
             self.wfile.write(data)
+        self._audit_status = 200
 
     def _respond(
         self,
@@ -1792,6 +1972,7 @@ class Handler(BaseHTTPRequestHandler):
     ):
         body = text.encode("utf-8")
         self.send_response(status)
+        self._send_request_id()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -1801,15 +1982,75 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
+        # Only a completed response is audited as a success.  A failed write
+        # leaves the status unset so the error path emits the single event.
+        self._audit_status = status
 
     # Route-aware method boundary for unsupported verbs.
     def do_PUT(self):
-        self._route_put()
+        self._dispatch(self._route_put)
 
     def do_DELETE(self):
-        self._route_delete()
+        self._dispatch(self._route_delete)
 
-    do_OPTIONS = _method_not_allowed
+    def do_OPTIONS(self):
+        self._dispatch(self._method_not_allowed)
+
+    def log_message(self, format, *args):
+        """Suppress the default access log line.
+
+        ``BaseHTTPRequestHandler`` writes the raw request target (including
+        any query string) to stderr for every request.  That duplicates data
+        the bounded audit path already reports, so it is replaced entirely.
+        """
+        return
+
+
+class AuditHTTPServer(ThreadingHTTPServer):
+    """Serve requests without leaking tracebacks to the audit sink.
+
+    ``socketserver.BaseServer.handle_error`` prints a full traceback to
+    ``sys.stderr``, which is also the default audit output.  That would put
+    file paths and source lines into the audit stream, which the audit
+    contract forbids.  Unhandled route errors are reported as one bounded,
+    traceback-free audit event instead, and a failure while reporting them
+    must not change the behavior of the server.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-thread handle on the in-flight request so ``handle_error`` can
+        # reuse its identity instead of generating a fresh request id.
+        self._audit_context = threading.local()
+
+    def handle_error(self, request, client_address):
+        log = getattr(self, "audit", None)
+        if log is None:
+            return
+
+        context = getattr(self, "_audit_context", None)
+        handler = getattr(context, "handler", None) if context else None
+        if handler is not None and getattr(handler, "_audit_recorded", False):
+            # The request already produced its single event; never add a
+            # second line for an abort after a completed response.
+            return
+
+        request_id = getattr(handler, "_request_id", None)
+        actor_id = getattr(handler, "_audit_actor_id", None)
+        if request_id is None:
+            request_id = log.request_id()
+        try:
+            log.record(
+                request_id=request_id,
+                actor_id=actor_id,
+                action="request.error",
+                target=None,
+                status=500,
+                code="internal_error",
+                started_at=None,
+            )
+        except Exception:
+            pass
 
 
 def make_server(
@@ -1819,6 +2060,9 @@ def make_server(
     repository_path=DEFAULT_REPOSITORY_PATH,
     artifacts_path=None,
     generated_path=None,
+    audit_output=None,
+    audit_clock=None,
+    audit_request_ids=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
@@ -1844,12 +2088,17 @@ def make_server(
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = AuditHTTPServer((host, port), Handler)
     server.database_path = database_path
     server.repository_path = repository_path
     server.repository = repository
     server.artifacts_path = artifacts_path
     server.generated_path = generated_path
+    server.audit = audit.AuditLog(
+        output=audit_output,
+        clock=audit_clock,
+        request_ids=audit_request_ids,
+    )
     return server
 
 

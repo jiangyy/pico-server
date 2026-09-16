@@ -1,15 +1,18 @@
 """HTTP tests for the account API."""
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 import zipfile
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
@@ -18,6 +21,7 @@ import accounts
 import bundles
 import generated
 import repository
+import server
 import works
 from comments import MAX_COMMENT_BODY_BYTES
 from database import open_database
@@ -39,6 +43,7 @@ class AccountApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -449,6 +454,7 @@ class ClassApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -933,6 +939,7 @@ class PlaygroundApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -1637,6 +1644,7 @@ class ReleaseApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -2177,6 +2185,7 @@ class ContentApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(
@@ -2927,6 +2936,7 @@ class GeneratedCacheApiTest(unittest.TestCase):
             repository_path=cls.repository_path,
             artifacts_path=cls.artifacts_path,
             generated_path=cls.generated_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(
@@ -3084,6 +3094,7 @@ class WorkSyncApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(
@@ -3669,6 +3680,7 @@ class WorkRestoreApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(
@@ -4191,6 +4203,7 @@ class SubmissionApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(
@@ -4950,6 +4963,7 @@ class CommentApiTest(unittest.TestCase):
             port=0,
             database_path=cls.database_path,
             repository_path=cls.repository_path,
+            audit_output=io.StringIO(),
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(
@@ -5567,6 +5581,749 @@ class CommentApiTest(unittest.TestCase):
             self.assertEqual(
                 (status, body["code"]), (404, "not_found"), (method, path)
             )
+
+
+class _AuditClock:
+    """Monotonic fake clock: every call advances a fixed step."""
+
+    def __init__(self, start=None, step_ms=5):
+        self._current = start or datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._step = timedelta(milliseconds=step_ms)
+
+    def __call__(self):
+        moment = self._current
+        self._current = moment + self._step
+        return moment
+
+
+class AuditApiTest(unittest.TestCase):
+    """HTTP contract for bounded structured request auditing."""
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        base = Path(self.temporary_directory.name)
+        self.database_path = base / "app.db"
+        self.output = io.StringIO()
+        self._generated = 0
+
+        def next_request_id():
+            self._generated += 1
+            return f"generated-{self._generated}"
+
+        self.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=self.database_path,
+            repository_path=base / "picopg.git",
+            audit_output=self.output,
+            audit_clock=_AuditClock(),
+            audit_request_ids=next_request_id,
+        )
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.temporary_directory.cleanup()
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def raw_request(self, method, path):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path)
+        response = connection.getresponse()
+        response.read()
+        status = response.status
+        connection.close()
+        return status
+
+    def audit_events(self, minimum=0, timeout=2):
+        """Read parsed events, waiting for the sink to catch up if needed."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            lines = [
+                line for line in self.output.getvalue().splitlines() if line
+            ]
+            events = [json.loads(line) for line in lines]
+            if len(events) >= minimum or time.monotonic() > deadline:
+                return events
+            time.sleep(0.005)
+
+    def _seed(self, username, role):
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def seed_admin(self, username):
+        return self._seed(username, "admin")
+
+    def seed_user(self, role):
+        return self._seed(f"{role}-{uuid.uuid4().hex[:8]}", role)
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def build_zip(self, entries=None):
+        if entries is None:
+            entries = (
+                ("picopg.json", self.MANIFEST),
+                ("course/module/app.py", b"print(1)"),
+            )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def set_policy(self, token, playground_id, policy):
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": policy},
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        return body["playground"]
+
+    def publish(self, token, playground_id, entries=None):
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=self.build_zip(entries),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": self.unique("key")},
+        )
+        self.assertEqual(status, 201)
+        return body["commitId"]
+
+    def sync(self, token, playground_id, playground_commit_id, mapping, base=None):
+        return self.request(
+            "POST",
+            f"/api/v1/works/{playground_id}/sync",
+            {
+                "playgroundCommitId": playground_commit_id,
+                "baseCommitId": base,
+                "files": [
+                    {"path": path, "data": base64.b64encode(data).decode("ascii")}
+                    for path, data in mapping.items()
+                ],
+            },
+            token=token,
+        )
+
+    def manifest_path(self, playground_id, commit_id):
+        return (
+            f"/api/v1/playgrounds/{playground_id}/commits/{commit_id}/manifest"
+        )
+
+    def file_path(self, playground_id, commit_id, path):
+        return (
+            f"/api/v1/playgrounds/{playground_id}"
+            f"/commits/{commit_id}/files/{path}"
+        )
+
+    def test_successful_mutation_is_audited_with_request_id(self):
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+
+        status, headers, _ = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-audit"},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        request_id = headers["x-request-id"]
+        self.assertTrue(request_id)
+
+        # Register, login, and the direct-DB seed emit nothing, so the one
+        # mutation is the only event.
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["requestId"], request_id)
+        self.assertEqual(event["actorId"], admin.id)
+        self.assertEqual(event["action"], "playground.create")
+        self.assertIsNone(event["target"])
+        self.assertEqual(event["status"], 201)
+        self.assertIsNone(event["code"])
+        self.assertGreaterEqual(event["durationMs"], 0)
+        self.assertTrue(event["time"].endswith("Z"))
+
+    def test_publish_records_target_without_body_or_secrets(self):
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+        playground_id = "pg-audit-publish"
+        self.create_playground(token, playground_id)
+
+        secret = "SUPER-SECRET-SOURCE-FRAGMENT"
+        body = self.build_zip(
+            (
+                ("picopg.json", self.MANIFEST),
+                ("course/module/app.py", secret.encode("utf-8")),
+            )
+        )
+        status, _, _ = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=body,
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": "key-1"},
+        )
+        self.assertEqual(status, 201)
+
+        events = self.audit_events(minimum=2)
+        publish = events[-1]
+        self.assertEqual(publish["action"], "playground.publish")
+        self.assertEqual(publish["target"], playground_id)
+        self.assertEqual(publish["actorId"], admin.id)
+        self.assertEqual(publish["status"], 201)
+
+        text = self.output.getvalue()
+        for secret_text in (secret, token, "secret", "Authorization", "Idempotency-Key"):
+            self.assertNotIn(secret_text, text)
+        self.assertNotIn(secret, str(events))
+
+    def test_retry_is_audited_once_per_request(self):
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+        playground_id = "pg-audit-retry"
+        self.create_playground(token, playground_id)
+        body = self.build_zip()
+
+        def publish():
+            return self.request(
+                "POST",
+                f"/api/v1/playgrounds/{playground_id}/commits",
+                raw_body=body,
+                token=token,
+                content_type="application/zip",
+                extra_headers={"Idempotency-Key": "key-retry"},
+            )
+
+        self.assertEqual(publish()[0], 201)
+        self.assertEqual(publish()[0], 201)
+
+        events = [
+            item
+            for item in self.audit_events(minimum=3)
+            if item["action"] == "playground.publish"
+        ]
+        self.assertEqual(len(events), 2)
+        self.assertEqual([item["status"] for item in events], [201, 201])
+        self.assertNotEqual(
+            events[0]["requestId"], events[1]["requestId"]
+        )
+
+    def test_forbidden_mutation_records_actor_target_and_code(self):
+        student = self.seed_user("student")
+        token = self.login_token(student.username)
+
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/admin/users/{student.id}/role",
+            {"role": "admin"},
+            token=token,
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["action"], "admin.user.role.update")
+        self.assertEqual(event["actorId"], student.id)
+        self.assertEqual(event["target"], student.id)
+        self.assertEqual(event["status"], 403)
+        self.assertEqual(event["code"], "forbidden")
+
+    def test_invalid_session_on_mutation_is_audited(self):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-denied"},
+            token="bogus-token",
+        )
+        self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["action"], "playground.create")
+        self.assertIsNone(event["actorId"])
+        self.assertIsNone(event["target"])
+        self.assertEqual(event["status"], 401)
+        self.assertEqual(event["code"], "invalid_session")
+
+    def test_denied_read_is_audited_without_target(self):
+        status, _, body = self.request("GET", "/api/v1/me")
+        self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["action"], "request.denied")
+        self.assertIsNone(event["actorId"])
+        self.assertIsNone(event["target"])
+        self.assertEqual(event["status"], 401)
+
+    def test_authenticated_logout_records_actor(self):
+        admin = self.seed_admin("audit-logout")
+        token = self.login_token(admin.username)
+
+        status, _, body = self.request("POST", "/api/v1/logout", token=token)
+        self.assertEqual(status, 204)
+        self.assertIsNone(body)
+
+        events = self.audit_events(minimum=1)
+        logout = [
+            event
+            for event in events
+            if event["action"] == "account.logout"
+        ]
+        self.assertEqual(len(logout), 1)
+        self.assertEqual(logout[0]["actorId"], admin.id)
+        self.assertEqual(logout[0]["status"], 204)
+
+    def test_unauthenticated_logout_records_null_actor(self):
+        # No session at all: the request is rejected but still audited.
+        status, _, body = self.request("POST", "/api/v1/logout")
+        self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+        # An invalid token still succeeds (idempotent logout) and is audited.
+        invalid_status, _, _ = self.request(
+            "POST", "/api/v1/logout", token="bogus-token"
+        )
+        self.assertEqual(invalid_status, 204)
+
+        events = self.audit_events(minimum=2)
+        logout = [
+            event
+            for event in events
+            if event["action"] == "account.logout"
+        ]
+        self.assertEqual(len(logout), 2)
+        self.assertTrue(all(event["actorId"] is None for event in logout))
+        self.assertEqual([event["status"] for event in logout], [401, 204])
+
+    def test_route_exception_never_writes_traceback_to_audit(self):
+        capture = io.StringIO()
+        original_output = self.server.audit._output
+        self.server.audit._output = capture
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("injected route failure")
+
+        try:
+            with mock.patch.object(server.Handler, "_get_me", explode):
+                with contextlib.redirect_stderr(capture):
+                    try:
+                        self.request("GET", "/api/v1/me")
+                    except Exception:
+                        pass
+                    deadline = time.monotonic() + 2
+                    while (
+                        "request.error" not in capture.getvalue()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.005)
+        finally:
+            self.server.audit._output = original_output
+
+        text = capture.getvalue()
+        self.assertNotIn("Traceback (most recent call last)", text)
+        self.assertNotIn("injected route failure", text)
+        self.assertNotIn('File "', text)
+
+        # The failed request terminates and the server keeps serving.
+        self.assertEqual(self.raw_request("GET", "/healthz"), 200)
+
+    def test_reads_and_account_routes_are_not_audited(self):
+        self.raw_request("GET", "/healthz")
+        self.raw_request("GET", "/")
+        self.request(
+            "POST",
+            "/api/v1/register",
+            {"username": "public-student", "password": "secret"},
+        )
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+        self.create_playground(token, "pg-quiet")
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "playground.create")
+
+    def test_client_request_id_is_echoed_and_unsafe_ids_replaced(self):
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+
+        status, headers, _ = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-client-id"},
+            token=token,
+            extra_headers={"X-Request-Id": "client-id-123"},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(headers["x-request-id"], "client-id-123")
+
+        status, headers, _ = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-bad-id"},
+            token=token,
+            extra_headers={"X-Request-Id": "bad id"},
+        )
+        self.assertEqual(status, 201)
+        generated = headers["x-request-id"]
+        self.assertTrue(generated.startswith("generated-"))
+
+        events = self.audit_events(minimum=2)
+        self.assertEqual(
+            [item["requestId"] for item in events],
+            ["client-id-123", generated],
+        )
+        self.assertNotIn("bad id", self.output.getvalue())
+
+    def test_control_characters_in_supplied_id_are_replaced(self):
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+
+        status, headers, _ = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-control"},
+            token=token,
+            extra_headers={"X-Request-Id": "evil\x01id"},
+        )
+        self.assertEqual(status, 201)
+        generated = headers["x-request-id"]
+        self.assertNotIn("\x01", generated)
+        self.assertTrue(generated.startswith("generated-"))
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(events[0]["requestId"], generated)
+        self.assertNotIn("evil", self.output.getvalue())
+
+    def test_audit_sink_failure_does_not_change_response(self):
+        admin = self.seed_admin("audit-admin")
+        token = self.login_token(admin.username)
+
+        class BrokenSink:
+            def write(self, line):
+                raise OSError("audit sink down")
+
+            def flush(self):
+                raise OSError("audit sink down")
+
+        self.server.audit._output = BrokenSink()
+        status, headers, _ = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-boom"},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(headers["x-request-id"])
+
+        # The business write landed exactly once, so a duplicate is rejected
+        # instead of being retried because auditing failed.
+        retry_status, _, retry_body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": "pg-boom"},
+            token=token,
+        )
+        self.assertEqual((retry_status, retry_body["code"]), (409, "conflict"))
+
+    def test_denied_private_content_read_is_audited_opaquely(self):
+        admin = self.seed_admin("audit-content-admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg-private")
+        self.create_playground(token, playground_id)
+        # No policy is set, so both the manifest and its files stay private.
+        commit_id = self.publish(token, playground_id)
+
+        status, _, body = self.request(
+            "GET", self.manifest_path(playground_id, commit_id)
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        secret_name = "private-notes-secret.txt"
+        status, _, body = self.request(
+            "GET",
+            self.file_path(
+                playground_id, commit_id, f"course/{secret_name}"
+            ),
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        denied = [
+            event
+            for event in self.audit_events(minimum=4)
+            if event["code"] == "content_denied"
+        ]
+        self.assertEqual(len(denied), 2)
+        for event in denied:
+            self.assertEqual(event["action"], "content.read")
+            self.assertEqual(event["status"], 404)
+            self.assertEqual(event["target"], f"{playground_id}/{commit_id}")
+
+        text = self.output.getvalue()
+        self.assertNotIn(secret_name, text)
+        self.assertNotIn("course/", text)
+        self.assertNotIn(token, text)
+
+    def test_work_head_changed_conflict_is_audited_with_code(self):
+        admin = self.seed_admin("audit-sync-admin")
+        admin_token = self.login_token(admin.username)
+        student = self.seed_user("student")
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("pg-sync")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        commit_id = self.publish(admin_token, playground_id)
+
+        status, _, body = self.sync(
+            student_token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"print(1)"},
+        )
+        self.assertEqual(status, 201)
+
+        # Resending without the canonical base is a CAS conflict, and the
+        # response carries no audit code unless the route sets one explicitly.
+        status, _, body = self.sync(
+            student_token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"print(1)"},
+        )
+        self.assertEqual((status, body["code"]), (409, "work_head_changed"))
+
+        conflicts = [
+            event
+            for event in self.audit_events(minimum=5)
+            if event["status"] == 409
+        ]
+        self.assertEqual(len(conflicts), 1)
+        conflict = conflicts[0]
+        self.assertEqual(conflict["action"], "work.sync")
+        self.assertEqual(conflict["target"], playground_id)
+        self.assertEqual(conflict["actorId"], student.id)
+        self.assertEqual(conflict["code"], "work_head_changed")
+
+    def test_token_shaped_request_id_is_not_echoed(self):
+        admin = self.seed_admin("audit-token-id")
+        token = self.login_token(admin.username)
+
+        status, headers, _ = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": self.unique("pg-token-id")},
+            token=token,
+            extra_headers={"X-Request-Id": token},
+        )
+        self.assertEqual(status, 201)
+        echoed = headers["x-request-id"]
+        self.assertNotEqual(echoed, token)
+        self.assertTrue(echoed.startswith("generated-"))
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(events[0]["requestId"], echoed)
+        self.assertNotIn(token, self.output.getvalue())
+
+    def test_failed_response_write_is_audited_once_as_failure(self):
+        class FailingBodyWriter:
+            """Let the response headers out, then break on the body write."""
+
+            def __init__(self, stream):
+                self._stream = stream
+
+            def write(self, data):
+                if data.startswith(b"HTTP/"):
+                    return self._stream.write(data)
+                raise BrokenPipeError("client disconnected")
+
+            def flush(self):
+                return self._stream.flush()
+
+        admin = self.seed_admin("audit-write-admin")
+        token = self.login_token(admin.username)
+
+        original_setup = server.Handler.setup
+
+        def failing_setup(handler_self):
+            original_setup(handler_self)
+            handler_self.wfile = FailingBodyWriter(handler_self.wfile)
+
+        with mock.patch.object(server.Handler, "setup", failing_setup):
+            connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+            connection.request(
+                "POST",
+                "/api/v1/playgrounds",
+                body=json.dumps({"id": self.unique("pg-write")}).encode(
+                    "utf-8"
+                ),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+            response = connection.getresponse()
+            request_id = response.getheader("X-Request-Id")
+            try:
+                response.read()
+            except Exception:
+                pass
+            connection.close()
+
+        # The client received the request id, and the one audit line records
+        # the failed write rather than a false success.
+        self.assertTrue(request_id)
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["requestId"], request_id)
+        self.assertEqual(event["action"], "request.error")
+        self.assertEqual(event["status"], 500)
+        self.assertEqual(event["code"], "internal_error")
+
+    def test_error_after_completed_response_is_not_audited_twice(self):
+        admin = self.seed_admin("audit-double-admin")
+        token = self.login_token(admin.username)
+
+        def respond_then_raise(handler_self):
+            handler_self._read_json()
+            handler_self._respond_json(201, {"playground": {"id": "pg-x"}})
+            raise RuntimeError("injected failure after response")
+
+        with mock.patch.object(
+            server.Handler, "_post_playground", respond_then_raise
+        ):
+            status, _, _ = self.request(
+                "POST",
+                "/api/v1/playgrounds",
+                {"id": self.unique("pg-double")},
+                token=token,
+            )
+        self.assertEqual(status, 201)
+
+        events = self.audit_events(minimum=1)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "playground.create")
+        self.assertEqual(events[0]["status"], 201)
+
+    def test_authorized_missing_file_read_is_audited_not_found(self):
+        admin = self.seed_admin("audit-missing-admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg-missing-file")
+        self.create_playground(token, playground_id)
+        self.set_policy(token, playground_id, "public")
+        commit_id = self.publish(token, playground_id)
+
+        secret_name = "absent-file-secret.txt"
+        status, _, body = self.request(
+            "GET",
+            self.file_path(
+                playground_id, commit_id, f"course/{secret_name}"
+            ),
+            token=token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        content_reads = [
+            event
+            for event in self.audit_events(minimum=4)
+            if event["action"] == "content.read"
+        ]
+        self.assertEqual(len(content_reads), 1)
+        event = content_reads[0]
+        self.assertEqual(event["code"], "not_found")
+        self.assertEqual(event["status"], 404)
+        self.assertEqual(event["target"], f"{playground_id}/{commit_id}")
+
+        text = self.output.getvalue()
+        self.assertNotIn(secret_name, text)
+        self.assertNotIn("course/", text)
+        self.assertNotIn(token, text)
 
 
 if __name__ == "__main__":
