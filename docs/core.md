@@ -4,7 +4,7 @@
 
 | 对象 | 存储 | 含义 |
 | --- | --- | --- |
-| `Playground` | Git | 发布者创建的不可变课程版本 |
+| `Playground` | Git | Admin 创建并上传的不可变课程版本 |
 | `Work` | Git | 学生对一个 Playground 的线性编辑历史 |
 | `Class` | 数据库 | 一位教师拥有的教学范围 |
 | `ClassMembership` | 数据库 | 学生当前所属的一个 Class |
@@ -42,7 +42,7 @@ v0.1 不升级 Work 的 Playground 版本，也不产生 merge commit。
 
 1. API 中的 ID（包括 commit ID）都是不透明字符串。
 2. Release 与 Submission 固定不可变 commit；更正会创建新记录。
-3. 学生只能写自己的 `work/**`；发布者只能写 Playground tree；`.picopg/**` 只由 Server 写。
+3. 学生只能写自己的 `work/**`；只有 Admin 能写 Playground tree；`.picopg/**` 只由 Server 写。
 4. Sync 仅在 `baseCommitId` 等于 Work HEAD 时成功；冲突不丢 Draft、不自动合并。
 5. commit ID 不代表授权；`release_only` 内容始终检查身份与当前 ClassMembership。
 6. 教师只读自己 Class 的 Release 下的 Submission；Admin 默认不读学生 Work。
