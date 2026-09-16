@@ -41,6 +41,7 @@ from classes import (
     create_class,
     get_class,
     list_classes,
+    list_memberships,
     remove_membership,
 )
 from comments import (
@@ -203,6 +204,19 @@ def _match_class(path):
 
     class_id = path[len(prefix):]
     if not class_id or "/" in class_id:
+        return None
+    return class_id
+
+
+def _match_class_members(path):
+    """Return the opaque class ID in a members read path, else None."""
+    prefix = CLASSES_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    remainder = path[len(prefix):]
+    class_id, separator, suffix = remainder.partition("/")
+    if not class_id or separator != "/" or suffix != "members":
         return None
     return class_id
 
@@ -390,6 +404,8 @@ def _allowed_methods(path):
         return ("PUT", "DELETE")
     if path == CLASSES_PATH:
         return ALLOWED_METHODS
+    if _match_class_members(path) is not None:
+        return ALLOWED_METHODS
     if _match_class(path) is not None:
         return ALLOWED_METHODS
     if path == PLAYGROUNDS_PATH:
@@ -409,6 +425,8 @@ def _allowed_methods(path):
     if _match_class_releases(path) is not None:
         return ("POST",)
     if path == CATALOG_PATH:
+        return ALLOWED_METHODS
+    if path == SUBMISSIONS_PATH:
         return ALLOWED_METHODS
     if path == RELEASES_PATH:
         return ALLOWED_METHODS
@@ -618,6 +636,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_classes(head_only=head_only)
         elif _match_class(path) is not None:
             self._get_class(_match_class(path), head_only=head_only)
+        elif _match_class_members(path) is not None:
+            self._get_class_members(
+                _match_class_members(path), head_only=head_only
+            )
         elif path == CATALOG_PATH:
             self._get_catalog(head_only=head_only)
         elif _match_manifest(path) is not None:
@@ -632,6 +654,8 @@ class Handler(BaseHTTPRequestHandler):
             self._get_release_submissions(
                 _match_release_submissions(path), head_only=head_only
             )
+        elif path == SUBMISSIONS_PATH:
+            self._get_submissions(head_only=head_only)
         elif _match_submission_comments(path) is not None:
             self._get_submission_comments(
                 _match_submission_comments(path), head_only=head_only
@@ -814,6 +838,27 @@ class Handler(BaseHTTPRequestHandler):
         self._respond_json(
             200,
             {"class": self._class_payload(class_record)},
+            head_only=head_only,
+        )
+
+    def _get_class_members(self, class_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                members = list_memberships(connection, actor, class_id)
+        except MissingClassError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"members": [self._membership_payload(item) for item in members]},
             head_only=head_only,
         )
 
@@ -1473,6 +1518,28 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
+    def _get_submissions(self, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        try:
+            with self._database() as connection:
+                records = list_submissions(connection, actor)
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {
+                "submissions": [
+                    submission_to_mapping(item) for item in records
+                ]
+            },
+            head_only=head_only,
+        )
+
     def _get_release_submissions(self, release_id, head_only=False):
         actor = self._authenticate(head_only=head_only)
         if actor is None:
@@ -1868,6 +1935,7 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "studentId": membership.student_id,
             "classId": membership.class_id,
+            "username": membership.username,
             "joinedAt": membership.joined_at,
         }
 

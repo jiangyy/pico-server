@@ -26,6 +26,7 @@ from classes import (
     create_class,
     get_class,
     list_classes,
+    list_memberships,
     remove_membership,
 )
 from database import open_database
@@ -151,6 +152,7 @@ class ClassTest(unittest.TestCase):
             student_id="student-1",
             class_id=class_record.id,
             joined_at=FIXED_NOW_TEXT,
+            username="student-1",
         )
         with self.assertRaises(FrozenInstanceError):
             membership.class_id = "other"
@@ -343,6 +345,56 @@ class ClassTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["class_id"], class_id)
         self.assertEqual(rows[0]["joined_at"], FIXED_NOW_TEXT)
+
+    def test_assign_student_membership_carries_username(self):
+        admin = self.insert_admin()
+        teacher = self.insert_teacher()
+        student = self.insert_student("alice")
+        class_id = self.insert_class(teacher.id)
+
+        membership = assign_student(
+            self.connection, admin, student.id, class_id, now=FIXED_NOW
+        )
+        self.assertEqual(membership.username, "alice")
+
+        again = assign_student(
+            self.connection, admin, student.id, class_id, now=FIXED_NOW
+        )
+        self.assertEqual(again.username, "alice")
+
+    def test_list_memberships_shows_username_to_owner_and_admin(self):
+        admin = self.insert_admin()
+        teacher = self.insert_teacher()
+        student = self.insert_student("alice")
+        class_id = self.insert_class(teacher.id)
+        assign_student(
+            self.connection, admin, student.id, class_id, now=FIXED_NOW
+        )
+
+        for actor in (admin, teacher):
+            with self.subTest(role=actor.role):
+                members = list_memberships(self.connection, actor, class_id)
+                self.assertEqual(len(members), 1)
+                self.assertEqual(members[0].student_id, student.id)
+                self.assertEqual(members[0].class_id, class_id)
+                self.assertEqual(members[0].username, "alice")
+
+    def test_list_memberships_denies_non_owner_and_student(self):
+        admin = self.insert_admin()
+        teacher = self.insert_teacher()
+        other_teacher = self.insert_teacher("other")
+        student = self.insert_student("alice")
+        class_id = self.insert_class(teacher.id)
+        assign_student(
+            self.connection, admin, student.id, class_id, now=FIXED_NOW
+        )
+
+        with self.assertRaises(ForbiddenActionError):
+            list_memberships(self.connection, other_teacher, class_id)
+        with self.assertRaises(ForbiddenActionError):
+            list_memberships(self.connection, student, class_id)
+        with self.assertRaises(MissingClassError):
+            list_memberships(self.connection, admin, "missing-class")
 
     def test_assign_student_same_class_is_idempotent(self):
         admin = self.insert_admin()

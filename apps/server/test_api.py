@@ -577,7 +577,10 @@ class ClassApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         membership = body["membership"]
-        self.assertEqual(set(membership), {"studentId", "classId", "joinedAt"})
+        self.assertEqual(
+            set(membership),
+            {"studentId", "classId", "username", "joinedAt"},
+        )
         self.assertEqual(membership["studentId"], student.id)
         self.assertEqual(membership["classId"], class_one["id"])
         self.assertTrue(membership["joinedAt"])
@@ -926,6 +929,63 @@ class ClassApiTest(unittest.TestCase):
         for method, path in not_found:
             status, _, body = self.request(method, path)
             self.assertEqual((status, body["code"]), (404, "not_found"), (method, path))
+
+
+    def test_class_members_list_requires_owner_and_shows_username(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        other_teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        other_teacher_token = self.login_token(other_teacher.username)
+        student_token = self.login_token(student.username)
+
+        klass = self.create_class(admin_token, teacher.id, "Algebra")
+        status, _, _ = self.request(
+            "PUT",
+            f"/api/v1/admin/classes/{klass['id']}/members/{student.id}",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+
+        # Admin and the owning Teacher see the member's account name.
+        for token in (admin_token, teacher_token):
+            status, _, body = self.request(
+                "GET",
+                f"/api/v1/classes/{klass['id']}/members",
+                token=token,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(len(body["members"]), 1)
+            member = body["members"][0]
+            self.assertEqual(
+                set(member),
+                {"studentId", "classId", "username", "joinedAt"},
+            )
+            self.assertEqual(member["studentId"], student.id)
+            self.assertEqual(member["classId"], klass["id"])
+            self.assertEqual(member["username"], student.username)
+            self.assertTrue(member["joinedAt"])
+
+        # A different Teacher and a Student are denied.
+        for token in (other_teacher_token, student_token):
+            status, _, body = self.request(
+                "GET",
+                f"/api/v1/classes/{klass['id']}/members",
+                token=token,
+            )
+            self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+        # An unknown Class is hidden, and an anonymous read is a 401.
+        status, _, body = self.request(
+            "GET", "/api/v1/classes/nope/members", token=admin_token
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.request(
+            "GET", f"/api/v1/classes/{klass['id']}/members"
+        )
+        self.assertEqual((status, body["code"]), (401, "invalid_session"))
 
 
 class PlaygroundApiTest(unittest.TestCase):
@@ -4519,7 +4579,14 @@ class SubmissionApiTest(unittest.TestCase):
         record = body["submission"]
         self.assertEqual(
             set(record),
-            {"id", "releaseId", "studentId", "workCommitId", "createdAt"},
+            {
+                "id",
+                "releaseId",
+                "studentId",
+                "username",
+                "workCommitId",
+                "createdAt",
+            },
         )
         self.assertEqual(record["releaseId"], ctx["release"]["id"])
         self.assertEqual(record["studentId"], ctx["student"].id)
@@ -4959,6 +5026,11 @@ class SubmissionApiTest(unittest.TestCase):
             ),
             (
                 "POST",
+                "/api/v1/submissions",
+                "GET, HEAD",
+            ),
+            (
+                "POST",
                 f"/api/v1/submissions/{submission_id}",
                 "GET, HEAD",
             ),
@@ -4985,8 +5057,6 @@ class SubmissionApiTest(unittest.TestCase):
             self.assertEqual(body["code"], "method_not_allowed")
 
         not_found = (
-            ("GET", "/api/v1/submissions"),
-            ("POST", "/api/v1/submissions"),
             ("GET", "/api/v1/submissions/"),
             ("GET", "/api/v1/submissions/a/b"),
             ("GET", f"/api/v1/releases/{release_id}/submissions/extra"),
@@ -4997,6 +5067,59 @@ class SubmissionApiTest(unittest.TestCase):
             self.assertEqual(
                 (status, body["code"]), (404, "not_found"), (method, path)
             )
+
+        # The own-Submissions collection exists, so an anonymous read is an
+        # authentication failure rather than an unknown route.
+        status, _, body = self.request("GET", "/api/v1/submissions")
+        self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+
+    def test_get_own_submissions_collection(self):
+        ctx = self.course()
+        status, _, body = self.submit(
+            ctx["student_token"],
+            ctx["release"]["id"],
+            ctx["work_commit_id"],
+            self.unique("submit"),
+        )
+        self.assertEqual(status, 201)
+        record = body["submission"]
+        self.assertEqual(record["username"], ctx["student"].username)
+
+        status, _, listed = self.request(
+            "GET", "/api/v1/submissions", token=ctx["student_token"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["submissions"], [record])
+
+        # The owning Teacher sees the same record through the collection.
+        status, _, listed = self.request(
+            "GET", "/api/v1/submissions", token=ctx["teacher_token"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in listed["submissions"]], [record["id"]]
+        )
+        self.assertEqual(
+            listed["submissions"][0]["username"],
+            ctx["student"].username,
+        )
+
+        # A different Student sees only their own (empty) collection.
+        other = self.seed_user("student")
+        other_token = self.login_token(other.username)
+        status, _, listed = self.request(
+            "GET", "/api/v1/submissions", token=other_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["submissions"], [])
+
+        # HEAD returns the same status with an empty body.
+        status, _, listed = self.request(
+            "HEAD", "/api/v1/submissions", token=ctx["student_token"]
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(listed)
 
 
 class CommentApiTest(unittest.TestCase):

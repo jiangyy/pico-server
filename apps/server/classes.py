@@ -41,6 +41,7 @@ class Membership:
     student_id: str
     class_id: str
     joined_at: str
+    username: str
 
 
 def _require_admin(actor):
@@ -112,6 +113,7 @@ def _membership_from_row(row):
         student_id=row["student_id"],
         class_id=row["class_id"],
         joined_at=row["joined_at"],
+        username=row["username"],
     )
 
 
@@ -170,7 +172,7 @@ def change_class_owner(connection, actor, class_id, teacher_id):
 def assign_student(connection, actor, student_id, class_id, now=None):
     """Assign a Student to a Class, transferring any current membership."""
     _require_admin(actor)
-    _require_student(connection, student_id)
+    student_row = _require_student(connection, student_id)
     joined_at = _format_time(_utc_now(now))
 
     with connection:
@@ -187,9 +189,11 @@ def assign_student(connection, actor, student_id, class_id, now=None):
             SELECT class_memberships.student_id,
                    class_memberships.class_id,
                    class_memberships.joined_at,
+                   users.username AS username,
                    classes.archived_at AS current_archived_at
             FROM class_memberships
             JOIN classes ON classes.id = class_memberships.class_id
+            JOIN users ON users.id = class_memberships.student_id
             WHERE class_memberships.student_id = ?
             """,
             (student_id,),
@@ -221,6 +225,7 @@ def assign_student(connection, actor, student_id, class_id, now=None):
         student_id=student_id,
         class_id=class_id,
         joined_at=joined_at,
+        username=student_row["username"],
     )
 
 
@@ -289,6 +294,39 @@ def get_class(connection, actor, class_id):
     row = _require_class(connection, class_id)
     _authorize_class_read(connection, actor, row)
     return _class_from_row(row)
+
+
+def list_memberships(connection, actor, class_id):
+    """Return one Class's members to its owning Teacher or an Admin.
+
+    Students are deliberately denied so classmate identifiers and account
+    names are never exposed to peers.  Results are ordered by ``student_id``
+    and carry each Student's ``username`` so a Teacher can identify a roster
+    without a separate account lookup.
+    """
+    _require_user_actor(actor)
+    row = _require_class(connection, class_id)
+    if actor.role == "admin":
+        pass
+    elif actor.role == "teacher" and row["teacher_id"] == actor.id:
+        pass
+    else:
+        raise ForbiddenActionError("class members are not readable")
+
+    rows = connection.execute(
+        """
+        SELECT class_memberships.student_id,
+               class_memberships.class_id,
+               class_memberships.joined_at,
+               users.username AS username
+        FROM class_memberships
+        JOIN users ON users.id = class_memberships.student_id
+        WHERE class_memberships.class_id = ?
+        ORDER BY class_memberships.student_id
+        """,
+        (class_id,),
+    ).fetchall()
+    return [_membership_from_row(row) for row in rows]
 
 
 def list_classes(connection, actor):

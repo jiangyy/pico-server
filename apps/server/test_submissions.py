@@ -468,6 +468,7 @@ class SubmissionCreationTest(SubmissionTestBase):
             id="s",
             release_id="r",
             student_id="u",
+            student_username="student",
             work_commit_id="a" * 40,
             created_at="2026-01-01T00:00:00.000000Z",
         )
@@ -628,6 +629,23 @@ class SubmissionReadTest(SubmissionTestBase):
         self.assertEqual(
             {item.id for item in listed},
             {self.first_submission["id"], self.second_submission["id"]},
+        )
+
+    def test_reads_carry_the_student_username(self):
+        submission_id = self.first_submission["id"]
+        for actor in (self.student, self.teacher, self.admin):
+            with self.subTest(role=actor.role):
+                record = submissions.get_submission(
+                    self.connection, actor, submission_id
+                )
+                self.assertEqual(record.student_username, self.student.username)
+
+        listed = submissions.list_submissions(self.connection, self.student)
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].student_username, self.student.username)
+        self.assertEqual(
+            submissions.submission_to_mapping(listed[0])["username"],
+            self.student.username,
         )
 
     def test_get_submission_visibility(self):

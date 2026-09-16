@@ -65,16 +65,23 @@ class Submission:
     id: str
     release_id: str
     student_id: str
+    student_username: str
     work_commit_id: str
     created_at: str
 
 
 def submission_to_mapping(submission):
-    """Return the canonical camelCase mapping for a Submission."""
+    """Return the canonical camelCase mapping for a Submission.
+
+    ``username`` exposes the submitting Student's account name so a Teacher
+    reading a Submission list can identify the Student without a second
+    account lookup.  It is never Work source content.
+    """
     return {
         "id": submission.id,
         "releaseId": submission.release_id,
         "studentId": submission.student_id,
+        "username": submission.student_username,
         "workCommitId": submission.work_commit_id,
         "createdAt": submission.created_at,
     }
@@ -209,6 +216,7 @@ def _submission_from_row(row):
         id=row["id"],
         release_id=row["release_id"],
         student_id=row["student_id"],
+        student_username=row["username"],
         work_commit_id=row["work_commit_id"],
         created_at=row["created_at"],
     )
@@ -293,11 +301,14 @@ def _authorize_work_commit(repository, release, student_id, work_commit_id):
         )
 
 
-def _insert_submission(connection, release_id, student_id, work_commit_id):
+def _insert_submission(
+    connection, release_id, student_id, student_username, work_commit_id
+):
     submission = Submission(
         id=uuid.uuid4().hex,
         release_id=release_id,
         student_id=student_id,
+        student_username=student_username,
         work_commit_id=work_commit_id,
         created_at=_now(),
     )
@@ -361,7 +372,11 @@ def create_submission(
             repository, release, actor.id, work_commit_id
         )
         submission = _insert_submission(
-            business_connection, release_id, actor.id, work_commit_id
+            business_connection,
+            release_id,
+            actor.id,
+            actor.username,
+            work_commit_id,
         )
         return 201, {"submission": submission_to_mapping(submission)}
 
@@ -385,12 +400,19 @@ def list_submissions(connection, actor):
 
     if actor.role == "admin":
         rows = connection.execute(
-            "SELECT * FROM submissions ORDER BY created_at, id"
+            """
+            SELECT submissions.*, users.username AS username
+            FROM submissions
+            JOIN users ON users.id = submissions.student_id
+            ORDER BY submissions.created_at, submissions.id
+            """
         ).fetchall()
     elif actor.role == "teacher":
         rows = connection.execute(
             """
-            SELECT submissions.* FROM submissions
+            SELECT submissions.*, users.username AS username
+            FROM submissions
+            JOIN users ON users.id = submissions.student_id
             JOIN releases ON releases.id = submissions.release_id
             JOIN classes ON classes.id = releases.class_id
             WHERE classes.teacher_id = ?
@@ -401,9 +423,11 @@ def list_submissions(connection, actor):
     elif actor.role == "student":
         rows = connection.execute(
             """
-            SELECT * FROM submissions
-            WHERE student_id = ?
-            ORDER BY created_at, id
+            SELECT submissions.*, users.username AS username
+            FROM submissions
+            JOIN users ON users.id = submissions.student_id
+            WHERE submissions.student_id = ?
+            ORDER BY submissions.created_at, submissions.id
             """,
             (actor.id,),
         ).fetchall()
@@ -439,7 +463,13 @@ def get_submission(connection, actor, submission_id):
     submission_id = _require_identifier(submission_id, "submissionId")
 
     row = connection.execute(
-        "SELECT * FROM submissions WHERE id = ?", (submission_id,)
+        """
+        SELECT submissions.*, users.username AS username
+        FROM submissions
+        JOIN users ON users.id = submissions.student_id
+        WHERE submissions.id = ?
+        """,
+        (submission_id,),
     ).fetchone()
     if row is None or not _row_is_visible(connection, actor, row):
         raise MissingSubmissionError(submission_id)
