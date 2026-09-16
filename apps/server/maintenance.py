@@ -37,6 +37,8 @@ import tempfile
 from pathlib import Path
 
 import repository as repository_module
+import works
+import database
 
 
 __all__ = [
@@ -490,6 +492,15 @@ def _validate_database(connection):
             REASON_DATABASE_INVALID, "database foreign keys are invalid"
         )
 
+    # A backup that would not start Server v0.1 is not a valid backup: a
+    # forged migration history or a missing business table must fail here.
+    try:
+        database.validate_schema(connection)
+    except database.SchemaValidationError as error:
+        raise MaintenanceError(
+            REASON_DATABASE_INVALID, "database schema is invalid"
+        ) from error
+
 
 def _validate_repository(path):
     if path.is_symlink() or not path.is_dir():
@@ -529,45 +540,99 @@ def _validate_repository(path):
     return repository
 
 
-def _table_exists(connection, name):
-    row = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (name,),
-    ).fetchone()
-    return row is not None
+def _require_commit(repository, commit_id):
+    """Return the resolved commit id, or raise a stable maintenance error."""
+
+    try:
+        resolved = repository_module.resolve_commit(repository, commit_id)
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(
+            REASON_COMMIT_MISSING,
+            "a database commit reference is not a Git object id",
+        ) from error
+    if resolved is None:
+        raise MaintenanceError(
+            REASON_COMMIT_MISSING,
+            "a database commit reference does not exist in the repository",
+        )
+    return resolved
+
+
+def _require_ancestor(repository, commit_id, ref):
+    """Require ``commit_id`` to be reachable from ``ref``."""
+
+    _require_commit(repository, commit_id)
+    try:
+        completed = repository_module._run_git(
+            ("merge-base", "--is-ancestor", commit_id, ref),
+            cwd=repository.path,
+        )
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "could not check commit ancestry"
+        ) from error
+    if completed.returncode != 0:
+        raise MaintenanceError(
+            REASON_COMMIT_MISSING,
+            "a database commit is not part of its required history",
+        )
+
+
+def _work_metadata_pin(repository, work_commit_id):
+    """Return the Playground commit pinned by a Work commit's metadata."""
+
+    try:
+        return works._read_base_work_playground_commit_id(
+            repository, work_commit_id
+        )
+    except works.WorkError as error:
+        raise MaintenanceError(
+            REASON_COMMIT_MISSING, "Work metadata is missing or invalid"
+        ) from error
 
 
 def _validate_commit_references(connection, repository):
-    """Ensure every commit id stored by the database resolves in Git."""
+    """Validate database-to-Git relationships, not object existence alone."""
 
-    references = []
-    if _table_exists(connection, "releases"):
-        references.extend(
-            row[0]
-            for row in connection.execute(
-                "SELECT DISTINCT playground_commit_id FROM releases"
-            ).fetchall()
-        )
-    if _table_exists(connection, "submissions"):
-        references.extend(
-            row[0]
-            for row in connection.execute(
-                "SELECT DISTINCT work_commit_id FROM submissions"
-            ).fetchall()
-        )
-
-    for commit_id in references:
+    releases = connection.execute(
+        "SELECT id, playground_id, playground_commit_id FROM releases"
+    ).fetchall()
+    release_by_id = {}
+    for row in releases:
+        release_id, playground_id, playground_commit_id = row[0], row[1], row[2]
+        release_by_id[release_id] = (playground_id, playground_commit_id)
         try:
-            resolved = repository_module.resolve_commit(repository, commit_id)
+            ref = repository.playground_ref(playground_id)
         except repository_module.RepositoryError as error:
             raise MaintenanceError(
                 REASON_COMMIT_MISSING,
-                "a database commit reference is not a Git object id",
+                "a Release names an invalid Playground identifier",
             ) from error
-        if resolved is None:
+        _require_ancestor(repository, playground_commit_id, ref)
+
+    submissions = connection.execute(
+        "SELECT id, release_id, student_id, work_commit_id FROM submissions"
+    ).fetchall()
+    for row in submissions:
+        release_id, student_id, work_commit_id = row[1], row[2], row[3]
+        if release_id not in release_by_id:
             raise MaintenanceError(
                 REASON_COMMIT_MISSING,
-                "a database commit reference does not exist in the repository",
+                "a Submission references a missing Release",
+            )
+        playground_id, playground_commit_id = release_by_id[release_id]
+        try:
+            ref = repository.work_ref(playground_id, student_id)
+        except repository_module.RepositoryError as error:
+            raise MaintenanceError(
+                REASON_COMMIT_MISSING,
+                "a Submission names an invalid Work identifier",
+            ) from error
+        _require_ancestor(repository, work_commit_id, ref)
+        if _work_metadata_pin(repository, work_commit_id) != playground_commit_id:
+            raise MaintenanceError(
+                REASON_COMMIT_MISSING,
+                "a Submission Work commit pins a different Playground commit",
             )
 
 
@@ -640,6 +705,11 @@ def create_backup(data_dir, destination, *, service_stopped=False):
     if artifacts.is_symlink():
         raise MaintenanceError(
             REASON_PATH_ESCAPE, "the artifacts directory is a symbolic link"
+        )
+    if os.path.lexists(artifacts) and not artifacts.is_dir():
+        raise MaintenanceError(
+            REASON_DATA_DIR_INVALID,
+            "the artifacts path is not a directory",
         )
     if artifacts.is_dir() and not _contained(
         resolved_data_root, artifacts
@@ -728,6 +798,15 @@ def validate_backup(path):
     entries = _parse_manifest(mapping)
     _verify_files(backup, entries)
 
+    artifacts = backup / ARTIFACTS_DIRNAME
+    if os.path.lexists(artifacts) and (
+        artifacts.is_symlink() or not artifacts.is_dir()
+    ):
+        raise MaintenanceError(
+            REASON_DATA_DIR_INVALID,
+            "the artifacts path is not a directory",
+        )
+
     connection = _open_read_only(backup / DATABASE_FILENAME)
     try:
         _validate_database(connection)
@@ -744,8 +823,10 @@ def restore_backup(backup_path, data_dir, *, service_stopped=False):
 
     The target must not exist, or must be an existing empty directory.  A
     non-empty target is refused so a live data directory is never deleted or
-    replaced.  Every restored file is hashed again while it is written, so a
-    backup that changes between validation and restore is still rejected.
+    replaced.  The recovery set is rebuilt and validated in a fresh temporary
+    sibling directory and only then atomically renamed into place, so a
+    failure at any point leaves the target absent or still empty and no
+    partially populated directory behind.
     """
 
     _require_service_stopped(service_stopped)
@@ -771,7 +852,8 @@ def restore_backup(backup_path, data_dir, *, service_stopped=False):
             REASON_RESTORE_TARGET_INVALID,
             "the restore target must not be a symbolic link",
         )
-    if data_dir.exists():
+    target_exists = os.path.lexists(data_dir)
+    if target_exists:
         if not data_dir.is_dir():
             raise MaintenanceError(
                 REASON_RESTORE_TARGET_INVALID,
@@ -782,25 +864,49 @@ def restore_backup(backup_path, data_dir, *, service_stopped=False):
                 REASON_RESTORE_TARGET_INVALID,
                 "refusing to restore over a non-empty data directory",
             )
-    else:
-        data_dir.mkdir(parents=True)
-        data_root = os.path.realpath(data_dir)
 
-    for entry in entries:
-        source = backup / entry["path"]
-        target = data_dir / entry["path"]
-        if source.is_symlink() or not source.is_file():
-            raise MaintenanceError(
-                REASON_FILE_MISSING, "a manifest file is missing"
-            )
-        if not _contained(backup_root, source) or not _contained(
-            data_root, target
-        ):
-            raise MaintenanceError(
-                REASON_PATH_ESCAPE, "a restore path escapes its root"
-            )
-        _copy_verified_file(source, target, entry)
-    _fsync_tree(data_dir)
+    parent = data_dir.parent
+    if parent.is_symlink() or not parent.is_dir():
+        parent.mkdir(parents=True, exist_ok=True)
+    parent_root = os.path.realpath(parent)
+
+    prefix = f".{data_dir.name}."
+    temporary = Path(
+        tempfile.mkdtemp(dir=parent, prefix=prefix, suffix=".tmp")
+    )
+    try:
+        # The manifest is copied so the rebuilt set can be validated as a
+        # complete backup before it is published.
+        _copy_file(
+            backup / MANIFEST_FILENAME,
+            temporary / MANIFEST_FILENAME,
+        )
+        temporary_root = os.path.realpath(temporary)
+        for entry in entries:
+            source = backup / entry["path"]
+            target = temporary / entry["path"]
+            if source.is_symlink() or not source.is_file():
+                raise MaintenanceError(
+                    REASON_FILE_MISSING, "a manifest file is missing"
+                )
+            if not _contained(backup_root, source) or not _contained(
+                temporary_root, target
+            ):
+                raise MaintenanceError(
+                    REASON_PATH_ESCAPE, "a restore path escapes its root"
+                )
+            _copy_verified_file(source, target, entry)
+        _fsync_tree(temporary)
+
+        # Validate the completed recovery set before it becomes visible.
+        validate_backup(temporary)
+
+        # Final commit point: rename over a missing or still-empty target.
+        os.rename(temporary, data_dir)
+        _fsync_directory(parent)
+    except BaseException:
+        _discard_temporary(temporary, parent_root, prefix)
+        raise
     return data_dir
 
 

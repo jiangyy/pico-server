@@ -9,6 +9,8 @@ or overwritten recovery set.
 
 import json
 import os
+import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -494,6 +496,213 @@ class MaintenanceTest(unittest.TestCase):
             caught.exception.reason, maintenance.REASON_RESTORE_TARGET_INVALID
         )
         self.assertFalse(target.exists())
+
+    # ----- strengthened validation -------------------------------------
+
+    def test_incomplete_schema_backup_is_rejected(self):
+        self.make_backup()
+        defective = self.base / "defective.db"
+        raw = sqlite3.connect(defective)
+        raw.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY CHECK (version > 0),
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (10, '2026-01-01T00:00:00Z');
+            """
+        )
+        raw.commit()
+        raw.close()
+        shutil.copyfile(defective, self.backup_path / "app.db")
+        self.rewrite_manifest(self.backup_path)
+
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_backup(self.backup_path)
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_DATABASE_INVALID
+        )
+
+    def test_release_outside_playground_history_is_rejected(self):
+        other_id = "pg-other"
+        playgrounds.create_playground(self.connection, self.admin, other_id)
+        other = playgrounds.publish_playground(
+            self.connection,
+            self.admin,
+            other_id,
+            self.repository,
+            bundles.validate_bundle(
+                [
+                    bundles.BundleEntry("picopg.json", MANIFEST_BYTES),
+                    bundles.BundleEntry("course/other.py", b"print('other')\n"),
+                ]
+            ),
+            repository.CommitMetadata(
+                name="Test Author",
+                email="author@example.test",
+                timestamp="2026-01-01T00:00:00+00:00",
+                message="publish",
+            ),
+        )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE releases SET playground_commit_id = ? WHERE id = ?",
+                (other.commit_id, self.release_id),
+            )
+        self.make_backup()
+
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_backup(self.backup_path)
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_COMMIT_MISSING
+        )
+
+    def test_submission_from_another_work_history_is_rejected(self):
+        other_student = accounts.create_user(
+            self.connection, self.admin, "student2", "secret", "student"
+        )
+        classes.assign_student(
+            self.connection, self.admin, other_student.id, self.klass.id
+        )
+        other_work = works.create_work_commit(
+            self.connection,
+            other_student,
+            self.repository,
+            self.playground_id,
+            self.playground_commit_id,
+            works.validate_work_files(
+                [works.WorkEntry("work/other.py", b"print('other')\n")]
+            ),
+        )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE submissions SET work_commit_id = ?",
+                (other_work.commit_id,),
+            )
+        self.make_backup()
+
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_backup(self.backup_path)
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_COMMIT_MISSING
+        )
+
+    def test_mismatched_work_metadata_pin_is_rejected(self):
+        self.make_backup()
+        with mock.patch.object(
+            maintenance, "_work_metadata_pin", return_value="0" * 40
+        ):
+            with self.assertRaises(maintenance.MaintenanceError) as caught:
+                maintenance.validate_backup(self.backup_path)
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_COMMIT_MISSING
+        )
+
+    def test_artifacts_path_that_is_a_file_is_rejected(self):
+        self.make_backup()
+        shutil.rmtree(self.backup_path / maintenance.ARTIFACTS_DIRNAME)
+        (self.backup_path / maintenance.ARTIFACTS_DIRNAME).write_bytes(
+            b"not a directory"
+        )
+        self.rewrite_manifest(self.backup_path)
+
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_backup(self.backup_path)
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_DATA_DIR_INVALID
+        )
+
+    def test_restore_failure_leaves_target_absent_and_no_temp(self):
+        self.make_backup()
+        target = self.base / "restore"
+        original = maintenance._copy_verified_file
+        calls = {"count": 0}
+
+        def failing(source, destination, entry):
+            calls["count"] += 1
+            if calls["count"] == 3:
+                raise OSError("simulated restore failure")
+            return original(source, destination, entry)
+
+        with mock.patch.object(
+            maintenance, "_copy_verified_file", side_effect=failing
+        ):
+            with self.assertRaises(OSError):
+                maintenance.restore_backup(
+                    self.backup_path, target, service_stopped=True
+                )
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            [
+                path
+                for path in self.base.iterdir()
+                if path.name.startswith(".restore.")
+            ],
+            [],
+        )
+
+    def test_restore_failure_preserves_existing_empty_target(self):
+        self.make_backup()
+        target = self.base / "restore"
+        target.mkdir()
+
+        with mock.patch.object(
+            maintenance,
+            "_copy_verified_file",
+            side_effect=OSError("simulated restore failure"),
+        ):
+            with self.assertRaises(OSError):
+                maintenance.restore_backup(
+                    self.backup_path, target, service_stopped=True
+                )
+        self.assertTrue(target.is_dir())
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(
+            [
+                path
+                for path in self.base.iterdir()
+                if path.name.startswith(".restore.")
+            ],
+            [],
+        )
+
+    def test_restore_pre_commit_validation_failure_preserves_target(self):
+        self.make_backup()
+        target = self.base / "restore"
+        target.mkdir()
+        original = maintenance.validate_backup
+        calls = {"count": 0}
+
+        def flaky(path):
+            calls["count"] += 1
+            if calls["count"] >= 2:
+                raise maintenance.MaintenanceError(
+                    maintenance.REASON_MANIFEST_INVALID,
+                    "injected pre-commit validation failure",
+                )
+            return original(path)
+
+        with mock.patch.object(
+            maintenance, "validate_backup", side_effect=flaky
+        ):
+            with self.assertRaises(maintenance.MaintenanceError) as caught:
+                maintenance.restore_backup(
+                    self.backup_path, target, service_stopped=True
+                )
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_MANIFEST_INVALID
+        )
+        self.assertTrue(target.is_dir())
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(
+            [
+                path
+                for path in self.base.iterdir()
+                if path.name.startswith(".restore.")
+            ],
+            [],
+        )
 
     # ----- helpers ------------------------------------------------------
 
