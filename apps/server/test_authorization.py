@@ -75,22 +75,21 @@ class AuthorizationTestBase(unittest.TestCase):
         )
 
     def create_playground(self, creator, playground_id):
-        if creator.role != "admin":
-            playgrounds.grant_publisher(
-                self.connection, self.admin_actor, creator.id
-            )
+        """Create Playground metadata; management is Admin-only."""
         return playgrounds.create_playground(
-            self.connection, creator, playground_id
+            self.connection, self.admin_actor, playground_id
         )
 
     def make_public(self, creator, playground_id):
         return playgrounds.update_playground(
-            self.connection, creator, playground_id, {"policy": "public"}
+            self.connection, self.admin_actor, playground_id,
+            {"policy": "public"},
         )
 
     def archive(self, creator, playground_id):
         return playgrounds.update_playground(
-            self.connection, creator, playground_id, {"archived": True}
+            self.connection, self.admin_actor, playground_id,
+            {"archived": True},
         )
 
     def make_bundle(self, course_data=b"print(1)"):
@@ -114,9 +113,10 @@ class AuthorizationTestBase(unittest.TestCase):
         )
 
     def publish(self, actor, playground_id, course_data=b"print(1)"):
+        """Publish as Admin; Playground publishing is Admin-only."""
         return playgrounds.publish_playground(
             self.connection,
-            actor,
+            self.admin_actor,
             playground_id,
             self.repository,
             self.make_bundle(course_data),
@@ -470,19 +470,12 @@ class PlaygroundCommitReadTest(AuthorizationTestBase):
         self.assert_denied(student, playground_id, commit_id)
 
     def test_teacher_owning_class_with_release_is_allowed(self):
-        publisher = self.create_user("teacher")
-        self.create_playground(publisher, "pg-shared")
-        commit_id = self.publish(publisher, "pg-shared").commit_id
+        self.create_playground(None, "pg-shared")
+        commit_id = self.publish(None, "pg-shared").commit_id
 
         teacher = self.create_user("teacher")
         klass = self.make_class(teacher, "Class shared")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, teacher.id
-        )
         self.release_for(teacher, klass.id, "pg-shared", commit_id)
-        playgrounds.revoke_publisher(
-            self.connection, self.admin_actor, teacher.id
-        )
 
         self.assert_allowed(teacher, "pg-shared", commit_id)
 
@@ -496,42 +489,18 @@ class PlaygroundCommitReadTest(AuthorizationTestBase):
         self.assert_denied(unrelated, playground_id, commit_id)
 
     def test_teacher_release_for_other_commit_is_denied(self):
-        publisher = self.create_user("teacher")
-        self.create_playground(publisher, "pg-shared")
-        first_commit = self.publish(publisher, "pg-shared").commit_id
+        self.create_playground(None, "pg-shared")
+        first_commit = self.publish(None, "pg-shared").commit_id
         second_commit = self.publish(
-            publisher, "pg-shared", b"print(2)"
+            None, "pg-shared", b"print(2)"
         ).commit_id
 
         teacher = self.create_user("teacher")
         klass = self.make_class(teacher, "Class shared")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, teacher.id
-        )
         self.release_for(teacher, klass.id, "pg-shared", first_commit)
-        playgrounds.revoke_publisher(
-            self.connection, self.admin_actor, teacher.id
-        )
 
         self.assert_allowed(teacher, "pg-shared", first_commit)
         self.assert_denied(teacher, "pg-shared", second_commit)
-
-    def test_creator_is_allowed_after_publisher_grant_is_revoked(self):
-        teacher, _, playground_id, commit_id = self.teacher_class_playground()
-        playgrounds.revoke_publisher(
-            self.connection, self.admin_actor, teacher.id
-        )
-
-        self.assert_allowed(teacher, playground_id, commit_id)
-
-    def test_granted_publisher_is_allowed(self):
-        teacher, _, playground_id, commit_id = self.teacher_class_playground()
-        publisher = self.create_user("teacher")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, publisher.id
-        )
-
-        self.assert_allowed(publisher, playground_id, commit_id)
 
     def test_admin_is_allowed(self):
         _, _, playground_id, commit_id = self.teacher_class_playground()
@@ -729,9 +698,6 @@ class WorkReadTest(AuthorizationTestBase):
     def test_submission_under_another_class_is_denied(self):
         other_teacher = self.create_user("teacher")
         other_class = self.make_class(other_teacher, "Other class")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, other_teacher.id
-        )
         other_release = self.release_for(
             other_teacher,
             other_class.id,

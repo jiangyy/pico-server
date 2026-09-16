@@ -83,17 +83,14 @@ class WorkTestBase(unittest.TestCase):
         )
 
     def create_playground(self, creator, playground_id):
-        if creator.role != "admin":
-            playgrounds.grant_publisher(
-                self.connection, self.admin, creator.id
-            )
+        """Create Playground metadata; management is Admin-only."""
         return playgrounds.create_playground(
-            self.connection, creator, playground_id
+            self.connection, self.admin, playground_id
         )
 
     def make_public(self, playground_id):
         return playgrounds.update_playground(
-            self.connection, self.teacher, playground_id, {"policy": "public"}
+            self.connection, self.admin, playground_id, {"policy": "public"}
         )
 
     def make_bundle(self, course_data=b"print(1)"):
@@ -114,9 +111,10 @@ class WorkTestBase(unittest.TestCase):
         )
 
     def publish(self, actor, playground_id, course_data=b"print(1)"):
+        """Publish as Admin; Playground publishing is Admin-only."""
         return playgrounds.publish_playground(
             self.connection,
-            actor,
+            self.admin,
             playground_id,
             self.repository,
             self.make_bundle(course_data),

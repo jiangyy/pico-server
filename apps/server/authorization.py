@@ -315,10 +315,6 @@ def _authorize_playground_commit_read(
 
     if actor.role == "admin":
         return
-    if actor.id == row["creator_id"]:
-        return
-    if _is_granted_publisher(connection, actor.id):
-        return
 
     if (
         row["archived_at"] is None

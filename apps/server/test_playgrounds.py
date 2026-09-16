@@ -1,4 +1,4 @@
-"""Domain tests for playground metadata and publisher authorization."""
+"""Domain tests for playground metadata and Admin-only management."""
 
 import dataclasses
 import subprocess
@@ -116,30 +116,20 @@ class PlaygroundDomainTest(unittest.TestCase):
         with self.assertRaises(playgrounds.InvalidRequestError):
             playgrounds.revoke_publisher(self.connection, self.admin_actor, None)
 
-    def test_create_requires_admin_or_grant(self):
+    def test_create_requires_admin(self):
         actor = self.create_user("teacher")
 
         with self.assertRaises(accounts.ForbiddenActionError):
             playgrounds.create_playground(self.connection, actor, "pg-denied")
         self.assertIsNone(self.playground_policy("pg-denied"))
 
-        playgrounds.grant_publisher(self.connection, self.admin_actor, actor.id)
         playground = playgrounds.create_playground(
-            self.connection, actor, "pg-allowed"
+            self.connection, self.admin_actor, "pg-allowed"
         )
-        self.assertEqual(playground.creator_id, actor.id)
+        self.assertEqual(playground.creator_id, self.admin_actor.id)
         self.assertEqual(playground.policy, "release_only")
         self.assertIsNone(playground.archived_at)
         self.assertTrue(playground.created_at)
-
-    def test_revoked_user_cannot_create(self):
-        actor = self.create_user("teacher")
-        playgrounds.grant_publisher(self.connection, self.admin_actor, actor.id)
-        playgrounds.revoke_publisher(self.connection, self.admin_actor, actor.id)
-
-        with self.assertRaises(accounts.ForbiddenActionError):
-            playgrounds.create_playground(self.connection, actor, "pg-revoked")
-        self.assertIsNone(self.playground_policy("pg-revoked"))
 
     def test_admin_can_create_and_conflicts_are_rejected(self):
         playground = playgrounds.create_playground(
@@ -160,60 +150,38 @@ class PlaygroundDomainTest(unittest.TestCase):
                     self.connection, self.admin_actor, playground_id
                 )
 
-    def test_policy_change_by_admin_and_creator(self):
-        creator = self.create_user("teacher")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, creator.id
+    def test_policy_change_requires_admin(self):
+        playgrounds.create_playground(
+            self.connection, self.admin_actor, "pg-policy"
         )
-        playgrounds.create_playground(self.connection, creator, "pg-policy")
-
-        changed = playgrounds.update_playground(
-            self.connection, creator, "pg-policy", {"policy": "public"}
-        )
-        self.assertEqual(changed.policy, "public")
-
-        changed = playgrounds.update_playground(
-            self.connection, self.admin_actor, "pg-policy",
-            {"policy": "release_only"},
-        )
-        self.assertEqual(changed.policy, "release_only")
-
-    def test_policy_change_rejects_unrelated_actor(self):
-        creator = self.create_user("teacher")
-        other = self.create_user("teacher")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, creator.id
-        )
-        playgrounds.grant_publisher(self.connection, self.admin_actor, other.id)
-        playgrounds.create_playground(self.connection, creator, "pg-policy")
+        teacher = self.create_user("teacher")
 
         with self.assertRaises(accounts.ForbiddenActionError):
             playgrounds.update_playground(
-                self.connection, other, "pg-policy", {"policy": "public"}
+                self.connection, teacher, "pg-policy", {"policy": "public"}
             )
         self.assertEqual(self.playground_policy("pg-policy"), "release_only")
 
-    def test_archive_and_unarchive(self):
-        creator = self.create_user("teacher")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, creator.id
+        changed = playgrounds.update_playground(
+            self.connection, self.admin_actor, "pg-policy",
+            {"policy": "public"},
         )
-        playgrounds.create_playground(self.connection, creator, "pg-archive")
+        self.assertEqual(changed.policy, "public")
+
+    def test_archive_and_unarchive(self):
+        playgrounds.create_playground(
+            self.connection, self.admin_actor, "pg-archive"
+        )
 
         archived = playgrounds.update_playground(
-            self.connection, creator, "pg-archive", {"archived": True}
+            self.connection, self.admin_actor, "pg-archive", {"archived": True}
         )
         self.assertIsNotNone(archived.archived_at)
 
         retried = playgrounds.update_playground(
-            self.connection, creator, "pg-archive", {"archived": True}
+            self.connection, self.admin_actor, "pg-archive", {"archived": True}
         )
         self.assertEqual(retried.archived_at, archived.archived_at)
-
-        with self.assertRaises(accounts.ForbiddenActionError):
-            playgrounds.update_playground(
-                self.connection, creator, "pg-archive", {"archived": False}
-            )
 
         restored = playgrounds.update_playground(
             self.connection, self.admin_actor, "pg-archive", {"archived": False}
@@ -225,18 +193,15 @@ class PlaygroundDomainTest(unittest.TestCase):
         )
         self.assertIsNone(replay.archived_at)
 
-    def test_archive_requires_creator_or_admin(self):
-        creator = self.create_user("teacher")
-        other = self.create_user("teacher")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, creator.id
+    def test_archive_requires_admin(self):
+        teacher = self.create_user("teacher")
+        playgrounds.create_playground(
+            self.connection, self.admin_actor, "pg-archive"
         )
-        playgrounds.grant_publisher(self.connection, self.admin_actor, other.id)
-        playgrounds.create_playground(self.connection, creator, "pg-archive")
 
         with self.assertRaises(accounts.ForbiddenActionError):
             playgrounds.update_playground(
-                self.connection, other, "pg-archive", {"archived": True}
+                self.connection, teacher, "pg-archive", {"archived": True}
             )
         self.assertIsNone(
             self.connection.execute(
@@ -387,28 +352,20 @@ class PlaygroundPublishingTest(unittest.TestCase):
             ]
         )
 
-    def grant_and_create(self, actor, playground_id):
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, actor.id
-        )
+    def create(self, playground_id):
         return playgrounds.create_playground(
-            self.connection, actor, playground_id
+            self.connection, self.admin_actor, playground_id
         )
 
-    def test_publish_requires_admin_or_creator_before_git(self):
-        creator = self.create_user("teacher")
-        self.grant_and_create(creator, "pg-owner")
-        other_publisher = self.create_user("teacher")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, other_publisher.id
-        )
+    def test_publish_requires_admin_before_git(self):
+        self.create("pg-owner")
 
         bundle = self.make_bundle()
         metadata = self.metadata()
         with mock.patch.object(
             playgrounds._repository, "publish_playground"
         ) as spy:
-            for actor in (other_publisher, None, "not-a-user", 7):
+            for actor in (self.create_user("teacher"), None, "not-a-user", 7):
                 with self.subTest(actor=actor):
                     with self.assertRaises(accounts.ForbiddenActionError):
                         playgrounds.publish_playground(
@@ -421,17 +378,6 @@ class PlaygroundPublishingTest(unittest.TestCase):
                         )
             spy.assert_not_called()
 
-            playgrounds.publish_playground(
-                self.connection,
-                creator,
-                "pg-owner",
-                self.repository,
-                bundle,
-                metadata,
-            )
-            self.assertEqual(spy.call_count, 1)
-
-            spy.reset_mock()
             playgrounds.publish_playground(
                 self.connection,
                 self.admin_actor,
@@ -484,14 +430,13 @@ class PlaygroundPublishingTest(unittest.TestCase):
                 )
             spy.assert_not_called()
 
-    def test_creator_and_admin_publish_real_commits(self):
-        creator = self.create_user("teacher")
-        self.grant_and_create(creator, "pg-real")
+    def test_admin_publishes_real_commits(self):
+        self.create("pg-real")
         metadata = self.metadata()
 
         first = playgrounds.publish_playground(
             self.connection,
-            creator,
+            self.admin_actor,
             "pg-real",
             self.repository,
             self.make_bundle(b"print(1)"),
@@ -521,28 +466,6 @@ class PlaygroundPublishingTest(unittest.TestCase):
             check=True,
         )
         self.assertEqual(completed.stdout.strip().decode(), first.commit_id)
-
-    def test_revoked_creator_remains_creator(self):
-        creator = self.create_user("teacher")
-        self.grant_and_create(creator, "pg-revoked")
-        playgrounds.revoke_publisher(
-            self.connection, self.admin_actor, creator.id
-        )
-        remaining = self.connection.execute(
-            "SELECT user_id FROM publisher_grants WHERE user_id = ?",
-            (creator.id,),
-        ).fetchall()
-        self.assertEqual(remaining, [])
-
-        result = playgrounds.publish_playground(
-            self.connection,
-            creator,
-            "pg-revoked",
-            self.repository,
-            self.make_bundle(),
-            self.metadata(),
-        )
-        self.assertFalse(result.no_op)
 
     def test_unsafe_playground_id_is_rejected(self):
         playgrounds.create_playground(

@@ -140,13 +140,10 @@ def revoke_publisher(connection, actor, user_id):
 
 
 def create_playground(connection, actor, playground_id):
-    """Create release-only playground metadata for an authorized actor."""
-    _require_actor(actor)
+    """Create release-only playground metadata for an Admin actor."""
+    _require_admin(actor)
     playground_id = _require_opaque_id(playground_id)
     with connection:
-        if actor.role != "admin" and not _require_granted(connection, actor.id):
-            raise ForbiddenActionError("publisher permission required")
-
         row = connection.execute(
             "SELECT 1 FROM playgrounds WHERE id = ?",
             (playground_id,),
@@ -197,26 +194,20 @@ def update_playground(connection, actor, playground_id, mutation):
         if row is None:
             raise MissingPlaygroundError("playground does not exist")
 
-        is_admin = actor.role == "admin"
-        is_creator = actor.id == row["creator_id"]
+        _require_admin(actor)
 
         if policy is not None:
-            if not is_admin and not is_creator:
-                raise ForbiddenActionError("not allowed to change playground")
             connection.execute(
                 "UPDATE playgrounds SET policy = ? WHERE id = ?",
                 (policy, playground_id),
             )
         elif archived:
-            if not is_admin and not is_creator:
-                raise ForbiddenActionError("not allowed to archive playground")
             if row["archived_at"] is None:
                 connection.execute(
                     "UPDATE playgrounds SET archived_at = ? WHERE id = ?",
                     (_now(), playground_id),
                 )
         else:
-            _require_admin(actor)
             if row["archived_at"] is not None:
                 connection.execute(
                     "UPDATE playgrounds SET archived_at = NULL WHERE id = ?",
@@ -233,14 +224,12 @@ def publish_playground(
 ):
     """Publish a validated bundle to a Playground's Git history.
 
-    Authorization (admin or the existing creator) and unarchived metadata are
-    resolved before any Git subprocess is started.  A granted publisher that
-    is not the creator has no publishing rights here, while a creator whose
-    grant was revoked remains the creator.  The Git work itself lives in
+    Admin authorization and unarchived metadata are resolved before any Git
+    subprocess is started.  The Git work itself lives in
     :func:`repository.publish_playground`.
     """
 
-    _require_actor(actor)
+    _require_admin(actor)
     playground_id = _require_opaque_id(playground_id)
 
     row = _playground_row(connection, playground_id)
@@ -248,11 +237,6 @@ def publish_playground(
         raise MissingPlaygroundError("playground does not exist")
     if row["archived_at"] is not None:
         raise ForbiddenActionError("playground is archived")
-
-    is_admin = actor.role == "admin"
-    is_creator = actor.id == row["creator_id"]
-    if not is_admin and not is_creator:
-        raise ForbiddenActionError("not allowed to publish playground")
 
     return _repository.publish_playground(
         repository, playground_id, bundle, metadata

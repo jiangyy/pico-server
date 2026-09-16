@@ -179,16 +179,15 @@ def _is_granted_publisher(connection, user_id):
 
 
 def _authorize_playground(connection, actor, playground_id):
+    """Reject a missing or archived Playground.
+
+    The caller has already proven that the actor is a Teacher who owns the
+    target Class; any such Teacher may release any existing, unarchived
+    Playground.  The ``actor`` parameter is kept for call-site symmetry.
+    """
     row = _require_playground(connection, playground_id)
     if row["archived_at"] is not None:
         raise accounts.ForbiddenActionError("playground is archived")
-    if actor.role == "admin":
-        return
-    if actor.id == row["creator_id"]:
-        return
-    if _is_granted_publisher(connection, actor.id):
-        return
-    raise accounts.ForbiddenActionError("not authorized for playground")
 
 
 def _require_playground_commit(repository, playground_id, commit_id):

@@ -1392,21 +1392,12 @@ class PlaygroundApiTest(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertTrue(response["commitId"])
 
-    def test_publisher_grant_lifecycle_and_creation_authorization(self):
+    def test_publisher_grant_lifecycle(self):
         admin = self.seed_user("admin")
         teacher = self.seed_user("teacher")
         student = self.seed_user("student")
         admin_token = self.login_token(admin.username)
         teacher_token = self.login_token(teacher.username)
-
-        # An ungranted user cannot create playground metadata.
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/playgrounds",
-            {"id": self.unique("pg")},
-            token=teacher_token,
-        )
-        self.assertEqual((status, body["code"]), (403, "forbidden"))
 
         # A non-Admin cannot grant or revoke publisher permission.
         for method in ("PUT", "DELETE"):
@@ -1432,23 +1423,20 @@ class PlaygroundApiTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["granted_by"], admin.id)
 
-        # The granted user can create metadata, which defaults to release_only.
-        playground = self.create_playground(teacher_token, self.unique("pg"))
-        self.assertEqual(playground["creatorId"], teacher.id)
-        self.assertEqual(playground["policy"], "release_only")
-
-        # Revoke is idempotent and immediately takes effect.
+        # Revoke is idempotent and removes the stored grant.
         self.revoke_publisher(admin_token, teacher.id)
         self.revoke_publisher(admin_token, teacher.id)
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/playgrounds",
-            {"id": self.unique("pg")},
-            token=teacher_token,
-        )
-        self.assertEqual((status, body["code"]), (403, "forbidden"))
+        connection = open_database(self.database_path)
+        try:
+            remaining = connection.execute(
+                "SELECT user_id FROM publisher_grants WHERE user_id = ?",
+                (teacher.id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(remaining, [])
 
-        # Admin needs no grant.
+        # Admin creates metadata without needing a grant.
         admin_playground = self.create_playground(admin_token, self.unique("pg"))
         self.assertEqual(admin_playground["creatorId"], admin.id)
 
@@ -1471,14 +1459,12 @@ class PlaygroundApiTest(unittest.TestCase):
         other_token = self.login_token(other.username)
         student_token = self.login_token(student.username)
 
-        self.grant_publisher(admin_token, owner.id)
-        self.grant_publisher(admin_token, other.id)
         playground_id = self.create_playground(
-            owner_token, self.unique("pg")
+            admin_token, self.unique("pg")
         )["id"]
 
-        # Unrelated actors cannot change policy or archive state.
-        for token in (other_token, student_token):
+        # Only Admin may change policy or archive state.
+        for token in (owner_token, other_token, student_token):
             for payload in ({"policy": "public"}, {"archived": True}):
                 status, _, body = self.request(
                     "PATCH",
@@ -1488,12 +1474,11 @@ class PlaygroundApiTest(unittest.TestCase):
                 )
                 self.assertEqual((status, body["code"]), (403, "forbidden"))
 
-        # The creator and Admin can change policy.
         status, _, body = self.request(
             "PATCH",
             f"/api/v1/playgrounds/{playground_id}",
             {"policy": "public"},
-            token=owner_token,
+            token=admin_token,
         )
         self.assertEqual(status, 200)
         self.assertEqual(body["playground"]["policy"], "public")
@@ -1507,12 +1492,12 @@ class PlaygroundApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["playground"]["policy"], "release_only")
 
-        # The creator archives; retrying keeps the first archivedAt.
+        # Admin archives; retrying keeps the first archivedAt.
         status, _, body = self.request(
             "PATCH",
             f"/api/v1/playgrounds/{playground_id}",
             {"archived": True},
-            token=owner_token,
+            token=admin_token,
         )
         self.assertEqual(status, 200)
         archived_at = body["playground"]["archivedAt"]
@@ -1522,19 +1507,10 @@ class PlaygroundApiTest(unittest.TestCase):
             "PATCH",
             f"/api/v1/playgrounds/{playground_id}",
             {"archived": True},
-            token=owner_token,
+            token=admin_token,
         )
         self.assertEqual(status, 200)
         self.assertEqual(body["playground"]["archivedAt"], archived_at)
-
-        # Only Admin may unarchive.
-        status, _, body = self.request(
-            "PATCH",
-            f"/api/v1/playgrounds/{playground_id}",
-            {"archived": False},
-            token=owner_token,
-        )
-        self.assertEqual((status, body["code"]), (403, "forbidden"))
 
         status, _, body = self.request(
             "PATCH",
@@ -1608,10 +1584,7 @@ class PlaygroundApiTest(unittest.TestCase):
 
     def test_playground_mutation_validation(self):
         admin = self.seed_user("admin")
-        teacher = self.seed_user("teacher")
         admin_token = self.login_token(admin.username)
-        teacher_token = self.login_token(teacher.username)
-        self.grant_publisher(admin_token, teacher.id)
 
         for payload in ({}, {"id": ""}, {"id": 7}, {"id": None}):
             status, _, body = self.request(
@@ -1622,7 +1595,7 @@ class PlaygroundApiTest(unittest.TestCase):
             )
 
         playground_id = self.create_playground(
-            teacher_token, self.unique("pg")
+            admin_token, self.unique("pg")
         )["id"]
         status, _, body = self.request(
             "POST",
@@ -1901,11 +1874,10 @@ class ReleaseApiTest(unittest.TestCase):
         teacher = self.seed_user("teacher")
         admin_token = self.login_token(admin.username)
         teacher_token = self.login_token(teacher.username)
-        self.grant_publisher(admin_token, teacher.id)
         playground_id = self.unique("pg")
-        self.create_playground(teacher_token, playground_id)
+        self.create_playground(admin_token, playground_id)
         _, _, published = self.publish(
-            teacher_token, playground_id, self.unique("key")
+            admin_token, playground_id, self.unique("key")
         )
         klass = self.create_class(admin_token, teacher.id)
         return admin_token, teacher_token, klass, playground_id, published[
@@ -2600,17 +2572,16 @@ class ContentApiTest(unittest.TestCase):
         admin_token = self.login_token(admin.username)
         teacher_token = self.login_token(teacher.username)
         student_token = self.login_token(student.username)
-        self.grant_publisher(admin_token, teacher.id)
 
         public_id = self.unique("pg")
         released_id = self.unique("pg")
-        self.create_playground(teacher_token, public_id)
-        self.create_playground(teacher_token, released_id)
+        self.create_playground(admin_token, public_id)
+        self.create_playground(admin_token, released_id)
         self.set_policy(admin_token, public_id, "public")
-        public_commit = self.publish(teacher_token, public_id)[2][
+        public_commit = self.publish(admin_token, public_id)[2][
             "commitId"
         ]
-        released_commit = self.publish(teacher_token, released_id)[2][
+        released_commit = self.publish(admin_token, released_id)[2][
             "commitId"
         ]
 
@@ -2665,12 +2636,11 @@ class ContentApiTest(unittest.TestCase):
         admin_token = self.login_token(admin.username)
         teacher_token = self.login_token(teacher.username)
         student_token = self.login_token(student.username)
-        self.grant_publisher(admin_token, teacher.id)
 
         archived_id = self.unique("pg")
-        self.create_playground(teacher_token, archived_id)
+        self.create_playground(admin_token, archived_id)
         self.set_policy(admin_token, archived_id, "public")
-        archived_commit = self.publish(teacher_token, archived_id)[2][
+        archived_commit = self.publish(admin_token, archived_id)[2][
             "commitId"
         ]
         self.request(
@@ -2681,8 +2651,8 @@ class ContentApiTest(unittest.TestCase):
         )
 
         future_id = self.unique("pg")
-        self.create_playground(teacher_token, future_id)
-        future_commit = self.publish(teacher_token, future_id)[2]["commitId"]
+        self.create_playground(admin_token, future_id)
+        future_commit = self.publish(admin_token, future_id)[2]["commitId"]
         klass = self.create_class(admin_token, teacher.id)
         self.assign_student(admin_token, klass["id"], student.id)
         self.release(
@@ -2728,8 +2698,8 @@ class ContentApiTest(unittest.TestCase):
         other_teacher = self.seed_user("teacher")
         other_class = self.create_class(admin_token, other_teacher.id)
         open_id = self.unique("pg")
-        self.create_playground(teacher_token, open_id)
-        open_commit = self.publish(teacher_token, open_id)[2]["commitId"]
+        self.create_playground(admin_token, open_id)
+        open_commit = self.publish(admin_token, open_id)[2]["commitId"]
         self.release(
             teacher_token,
             klass["id"],
@@ -2772,15 +2742,14 @@ class ContentApiTest(unittest.TestCase):
         other_token = self.login_token(other_teacher.username)
         student_token = self.login_token(student.username)
         outsider_token = self.login_token(outsider.username)
-        self.grant_publisher(admin_token, teacher.id)
 
         playground_id = self.unique("pg")
-        self.create_playground(teacher_token, playground_id)
-        first_commit = self.publish(teacher_token, playground_id)[2][
+        self.create_playground(admin_token, playground_id)
+        first_commit = self.publish(admin_token, playground_id)[2][
             "commitId"
         ]
         second_commit = self.publish(
-            teacher_token,
+            admin_token,
             playground_id,
             entries=(
                 ("picopg.json", self.MANIFEST),
@@ -2850,11 +2819,10 @@ class ContentApiTest(unittest.TestCase):
         admin_token = self.login_token(admin.username)
         teacher_token = self.login_token(teacher.username)
         student_token = self.login_token(student.username)
-        self.grant_publisher(admin_token, teacher.id)
 
         playground_id = self.unique("pg")
-        self.create_playground(teacher_token, playground_id)
-        commit_id = self.publish(teacher_token, playground_id)[2]["commitId"]
+        self.create_playground(admin_token, playground_id)
+        commit_id = self.publish(admin_token, playground_id)[2]["commitId"]
         klass = self.create_class(admin_token, teacher.id)
         self.assign_student(admin_token, klass["id"], student.id)
         self.release(
@@ -2882,11 +2850,10 @@ class ContentApiTest(unittest.TestCase):
         teacher = self.seed_user("teacher")
         admin_token = self.login_token(admin.username)
         teacher_token = self.login_token(teacher.username)
-        self.grant_publisher(admin_token, teacher.id)
 
         private_id = self.unique("pg")
-        self.create_playground(teacher_token, private_id)
-        commit_id = self.publish(teacher_token, private_id)[2]["commitId"]
+        self.create_playground(admin_token, private_id)
+        commit_id = self.publish(admin_token, private_id)[2]["commitId"]
 
         denied = self.request(
             "GET", self.manifest_path(private_id, commit_id)

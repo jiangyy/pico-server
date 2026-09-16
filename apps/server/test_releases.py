@@ -68,12 +68,9 @@ class ReleaseTestBase(unittest.TestCase):
         )
 
     def create_playground(self, creator, playground_id):
-        if creator.role != "admin":
-            playgrounds.grant_publisher(
-                self.connection, self.admin_actor, creator.id
-            )
+        """Create Playground metadata; management is Admin-only."""
         return playgrounds.create_playground(
-            self.connection, creator, playground_id
+            self.connection, self.admin_actor, playground_id
         )
 
     def make_bundle(self, course_data=b"print(1)"):
@@ -97,9 +94,10 @@ class ReleaseTestBase(unittest.TestCase):
         )
 
     def publish(self, actor, playground_id, course_data=b"print(1)"):
+        """Publish as Admin; Playground publishing is Admin-only."""
         return playgrounds.publish_playground(
             self.connection,
-            actor,
+            self.admin_actor,
             playground_id,
             self.repository,
             self.make_bundle(course_data),
@@ -266,46 +264,34 @@ class ReleaseCreationTest(ReleaseTestBase):
                 "key-missing",
             )
 
-    def test_playground_authorization_is_enforced(self):
-        creator = self.create_user("teacher")
-        self.create_playground(creator, "pg-auth")
-        commit_id = self.publish(creator, "pg-auth").commit_id
+    def test_any_teacher_may_release_any_unarchived_playground(self):
+        self.create_playground(None, "pg-auth")
+        commit_id = self.publish(None, "pg-auth").commit_id
 
-        other = self.create_user("teacher")
-        other_class = self.make_class(other, "Class other")
+        teacher = self.create_user("teacher")
+        klass = self.make_class(teacher, "Class other")
 
-        with self.assertRaises(accounts.ForbiddenActionError):
-            self.create_release(
-                other, other_class.id, "pg-auth", commit_id, "key-noauth"
-            )
-
-        # A currently granted publisher is authorized.
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, other.id
-        )
         status, body = self.create_release(
-            other, other_class.id, "pg-auth", commit_id, "key-granted"
+            teacher, klass.id, "pg-auth", commit_id, "key-release"
         )
         self.assertEqual(status, 201)
         self.assertEqual(body["release"]["playgroundCommitId"], commit_id)
 
-        # The creator stays authorized even after a grant is revoked.
-        playgrounds.revoke_publisher(
-            self.connection, self.admin_actor, creator.id
-        )
+        # A second, unrelated Teacher may release the same Playground.
+        second = self.create_user("teacher")
+        second_class = self.make_class(second, "Class second")
         status, _ = self.create_release(
-            creator, self.make_class(creator, "Class creator").id,
-            "pg-auth", commit_id, "key-creator",
+            second, second_class.id, "pg-auth", commit_id, "key-second"
         )
         self.assertEqual(status, 201)
 
-        # Archived playgrounds are not releasable.
+        # Archived playgrounds are not releasable, even to an owned Class.
         playgrounds.update_playground(
             self.connection, self.admin_actor, "pg-auth", {"archived": True}
         )
         with self.assertRaises(accounts.ForbiddenActionError):
             self.create_release(
-                other, other_class.id, "pg-auth", commit_id, "key-archived"
+                teacher, klass.id, "pg-auth", commit_id, "key-archived"
             )
 
     def test_missing_playground_is_reported(self):

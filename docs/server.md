@@ -22,7 +22,7 @@ Work sync 仅接受有界的 `work/**` 快照。Server 自行组装完整 tree�
 
 ## 读取授权
 
-内容 commit 只有在下列情况之一可读：公开且未归档；学生的当前 Class 拥有指向它的开放 Release，或学生自己的 Work 引用它；教师拥有引用它的 Release 所属 Class；调用者是授权的发布者或 Admin。知道 commit ID 不构成授权。
+内容 commit 只有在下列情况之一可读：公开且未归档；学生的当前 Class 拥有指向它的开放 Release，或学生自己的 Work 引用它；教师拥有引用它的 Release 所属 Class；调用者是 Admin。知道 commit ID 不构成授权。
 
 教师只能读取自己 Class 的 Release 下的 Submission。Admin 管理账号、Class 与策略，但默认没有学生源码读取权。
 
