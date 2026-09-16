@@ -1,0 +1,319 @@
+"""Pure validation for an already-decoded Playground publishing bundle.
+
+This module intentionally knows nothing about ZIP/TAR archives, HTTP, the
+filesystem, the database, or Git.  It takes an in-memory iterable of
+:class:`BundleEntry` values and, only if the whole bundle passes, returns an
+immutable mapping from normalized path to bytes.
+
+Validation errors carry a stable machine-readable ``reason`` code.  Error
+messages never contain entry content.
+"""
+
+from __future__ import annotations
+
+import json
+import unicodedata
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Iterable, Mapping
+
+__all__ = [
+    "BundleEntry",
+    "BundleValidationError",
+    "validate_bundle",
+    "SUPPORTED_SCHEMA_VERSIONS",
+    "SUPPORTED_RUNTIMES",
+    "MAX_ENTRY_COUNT",
+    "MAX_FILE_BYTES",
+    "MAX_TOTAL_BYTES",
+    "MANIFEST_PATH",
+    "REASON_CODES",
+    # reason codes
+    "REASON_BUNDLE_NOT_ITERABLE",
+    "REASON_INVALID_ENTRY",
+    "REASON_PATH_NOT_STR",
+    "REASON_PATH_NUL",
+    "REASON_PATH_BACKSLASH",
+    "REASON_PATH_ABSOLUTE",
+    "REASON_PATH_EMPTY_SEGMENT",
+    "REASON_PATH_DOT_SEGMENT",
+    "REASON_PATH_FORBIDDEN",
+    "REASON_PATH_NOT_ALLOWED",
+    "REASON_ENTRY_KIND_NOT_FILE",
+    "REASON_ENTRY_DATA_NOT_BYTES",
+    "REASON_DUPLICATE_PATH",
+    "REASON_TOO_MANY_ENTRIES",
+    "REASON_FILE_TOO_LARGE",
+    "REASON_BUNDLE_TOO_LARGE",
+    "REASON_MISSING_MANIFEST",
+    "REASON_MANIFEST_NOT_UTF8",
+    "REASON_MANIFEST_NOT_JSON",
+    "REASON_MANIFEST_NOT_OBJECT",
+    "REASON_MANIFEST_MISSING_SCHEMA_VERSION",
+    "REASON_MANIFEST_INVALID_SCHEMA_VERSION",
+    "REASON_MANIFEST_MISSING_RUNTIME",
+    "REASON_MANIFEST_INVALID_RUNTIME",
+]
+
+# --- Declared compatibility contract -------------------------------------
+#
+# The supported manifest values are deliberately narrow.  These constants are
+# the single source of truth for this project's own bundle format.
+SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
+SUPPORTED_RUNTIMES: frozenset[str] = frozenset({"python"})
+
+# --- Named limits ---------------------------------------------------------
+MAX_ENTRY_COUNT: int = 1024
+MAX_FILE_BYTES: int = 1024 * 1024
+MAX_TOTAL_BYTES: int = 8 * 1024 * 1024
+
+MANIFEST_PATH: str = "picopg.json"
+ALLOWED_PREFIXES: tuple[str, ...] = ("course/", "starter/")
+FORBIDDEN_ROOT_PREFIXES: tuple[str, ...] = (".picopg/", "work/")
+
+# --- Stable reason codes --------------------------------------------------
+REASON_BUNDLE_NOT_ITERABLE = "bundle_not_iterable"
+REASON_INVALID_ENTRY = "invalid_entry"
+REASON_PATH_NOT_STR = "path_not_str"
+REASON_PATH_NUL = "path_nul"
+REASON_PATH_BACKSLASH = "path_backslash"
+REASON_PATH_ABSOLUTE = "path_absolute"
+REASON_PATH_EMPTY_SEGMENT = "path_empty_segment"
+REASON_PATH_DOT_SEGMENT = "path_dot_segment"
+REASON_PATH_FORBIDDEN = "path_forbidden"
+REASON_PATH_NOT_ALLOWED = "path_not_allowed"
+REASON_ENTRY_KIND_NOT_FILE = "entry_kind_not_file"
+REASON_ENTRY_DATA_NOT_BYTES = "entry_data_not_bytes"
+REASON_DUPLICATE_PATH = "duplicate_path"
+REASON_TOO_MANY_ENTRIES = "too_many_entries"
+REASON_FILE_TOO_LARGE = "file_too_large"
+REASON_BUNDLE_TOO_LARGE = "bundle_too_large"
+REASON_MISSING_MANIFEST = "missing_manifest"
+REASON_MANIFEST_NOT_UTF8 = "manifest_not_utf8"
+REASON_MANIFEST_NOT_JSON = "manifest_not_json"
+REASON_MANIFEST_NOT_OBJECT = "manifest_not_object"
+REASON_MANIFEST_MISSING_SCHEMA_VERSION = "manifest_missing_schema_version"
+REASON_MANIFEST_INVALID_SCHEMA_VERSION = "manifest_invalid_schema_version"
+REASON_MANIFEST_MISSING_RUNTIME = "manifest_missing_runtime"
+REASON_MANIFEST_INVALID_RUNTIME = "manifest_invalid_runtime"
+
+REASON_CODES: frozenset[str] = frozenset(
+    {
+        REASON_BUNDLE_NOT_ITERABLE,
+        REASON_INVALID_ENTRY,
+        REASON_PATH_NOT_STR,
+        REASON_PATH_NUL,
+        REASON_PATH_BACKSLASH,
+        REASON_PATH_ABSOLUTE,
+        REASON_PATH_EMPTY_SEGMENT,
+        REASON_PATH_DOT_SEGMENT,
+        REASON_PATH_FORBIDDEN,
+        REASON_PATH_NOT_ALLOWED,
+        REASON_ENTRY_KIND_NOT_FILE,
+        REASON_ENTRY_DATA_NOT_BYTES,
+        REASON_DUPLICATE_PATH,
+        REASON_TOO_MANY_ENTRIES,
+        REASON_FILE_TOO_LARGE,
+        REASON_BUNDLE_TOO_LARGE,
+        REASON_MISSING_MANIFEST,
+        REASON_MANIFEST_NOT_UTF8,
+        REASON_MANIFEST_NOT_JSON,
+        REASON_MANIFEST_NOT_OBJECT,
+        REASON_MANIFEST_MISSING_SCHEMA_VERSION,
+        REASON_MANIFEST_INVALID_SCHEMA_VERSION,
+        REASON_MANIFEST_MISSING_RUNTIME,
+        REASON_MANIFEST_INVALID_RUNTIME,
+    }
+)
+
+
+@dataclass(frozen=True)
+class BundleEntry:
+    """A small immutable already-decoded bundle member."""
+
+    path: str
+    data: bytes
+    kind: str = "file"
+
+
+class BundleValidationError(ValueError):
+    """Raised when a decoded bundle violates a validation rule.
+
+    ``reason`` is a stable code from :data:`REASON_CODES`.  The message is the
+    reason code itself, so entry content can never leak through it.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _normalize_path(path: object) -> str:
+    """Validate and return the single normalized form of a bundle path."""
+
+    # Exact type only: a str subclass could override __contains__ / startswith /
+    # split / __eq__ and bypass every later check.
+    if type(path) is not str:
+        raise BundleValidationError(REASON_PATH_NOT_STR)
+    if "\x00" in path:
+        raise BundleValidationError(REASON_PATH_NUL)
+    if "\\" in path:
+        raise BundleValidationError(REASON_PATH_BACKSLASH)
+
+    # Normalize Unicode exactly once; all later comparisons use this form.
+    normalized = unicodedata.normalize("NFC", path)
+
+    if normalized.startswith("/"):
+        raise BundleValidationError(REASON_PATH_ABSOLUTE)
+
+    segments = normalized.split("/")
+    if any(segment == "" for segment in segments):
+        raise BundleValidationError(REASON_PATH_EMPTY_SEGMENT)
+    if any(segment in (".", "..") for segment in segments):
+        raise BundleValidationError(REASON_PATH_DOT_SEGMENT)
+
+    if normalized == MANIFEST_PATH:
+        return normalized
+
+    for prefix in FORBIDDEN_ROOT_PREFIXES:
+        if normalized == prefix[:-1] or normalized.startswith(prefix):
+            raise BundleValidationError(REASON_PATH_FORBIDDEN)
+
+    for prefix in ALLOWED_PREFIXES:
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            return normalized
+
+    raise BundleValidationError(REASON_PATH_NOT_ALLOWED)
+
+
+def _reject_json_constant(value: str) -> None:
+    # json.loads otherwise accepts NaN / Infinity, which are not valid JSON.
+    raise ValueError("unsupported JSON constant: " + value)
+
+
+# Explicit failure sentinels.  Helper functions catch their exception entirely
+# and return one of these, so the original exception (which may retain the
+# offending bytes/text/message) is no longer active when BundleValidationError
+# is raised: both __cause__ and __context__ stay None.
+_DECODE_FAILED = object()
+_PARSE_FAILED = object()
+_NOT_ITERABLE = object()
+
+
+def _decode_utf8(data: bytes) -> object:
+    """Return decoded text, or ``_DECODE_FAILED`` with the error dropped."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return _DECODE_FAILED
+
+
+def _parse_json(text: str) -> object:
+    """Return parsed JSON, or ``_PARSE_FAILED`` with the error dropped."""
+    try:
+        return json.loads(text, parse_constant=_reject_json_constant)
+    except ValueError:
+        return _PARSE_FAILED
+
+
+def _iter_bundle(bundle: object) -> object:
+    """Return an iterator, or ``_NOT_ITERABLE`` with the error dropped."""
+    try:
+        return iter(bundle)  # type: ignore[call-overload]
+    except TypeError:
+        return _NOT_ITERABLE
+
+
+def _validate_manifest(data: bytes) -> None:
+    """Validate the decoded manifest bytes without exposing their content."""
+
+    text = _decode_utf8(data)
+    if text is _DECODE_FAILED:
+        # Raised outside any except scope: cause and context stay None.
+        raise BundleValidationError(REASON_MANIFEST_NOT_UTF8)
+
+    manifest = _parse_json(text)  # type: ignore[arg-type]
+    if manifest is _PARSE_FAILED:
+        # Raised outside any except scope: cause and context stay None.
+        raise BundleValidationError(REASON_MANIFEST_NOT_JSON)
+
+    if not isinstance(manifest, dict):
+        raise BundleValidationError(REASON_MANIFEST_NOT_OBJECT)
+
+    if "schemaVersion" not in manifest:
+        raise BundleValidationError(REASON_MANIFEST_MISSING_SCHEMA_VERSION)
+    schema_version = manifest["schemaVersion"]
+    # ``type(...) is int`` deliberately rejects bool (a subclass of int),
+    # float, str, None, list and dict in one check.
+    if type(schema_version) is not int:
+        raise BundleValidationError(REASON_MANIFEST_INVALID_SCHEMA_VERSION)
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise BundleValidationError(REASON_MANIFEST_INVALID_SCHEMA_VERSION)
+
+    if "runtime" not in manifest:
+        raise BundleValidationError(REASON_MANIFEST_MISSING_RUNTIME)
+    runtime = manifest["runtime"]
+    if type(runtime) is not str:
+        raise BundleValidationError(REASON_MANIFEST_INVALID_RUNTIME)
+    if runtime not in SUPPORTED_RUNTIMES:
+        raise BundleValidationError(REASON_MANIFEST_INVALID_RUNTIME)
+
+
+def validate_bundle(bundle: Iterable[BundleEntry]) -> Mapping[str, bytes]:
+    """Validate a decoded bundle and return a normalized immutable mapping.
+
+    The bundle is consumed exactly once.  Nothing is returned unless the whole
+    bundle passes.  No filesystem, database, Git, HTTP or archive behavior is
+    involved.
+    """
+
+    iterator = _iter_bundle(bundle)
+    if iterator is _NOT_ITERABLE:
+        # Raised outside any except scope: cause and context stay None.
+        raise BundleValidationError(REASON_BUNDLE_NOT_ITERABLE)
+
+    normalized: dict[str, bytes] = {}
+    total_bytes = 0
+    entry_count = 0
+
+    for entry in iterator:  # type: ignore[union-attr]
+        # Exact type only: a BundleEntry subclass could lie about its fields.
+        if type(entry) is not BundleEntry:
+            raise BundleValidationError(REASON_INVALID_ENTRY)
+
+        entry_count += 1
+        if entry_count > MAX_ENTRY_COUNT:
+            raise BundleValidationError(REASON_TOO_MANY_ENTRIES)
+
+        # Read fields only after the exact-entry check.
+        path = entry.path
+        kind = entry.kind
+        data = entry.data
+
+        normalized_path = _normalize_path(path)
+
+        if type(kind) is not str or kind != "file":
+            raise BundleValidationError(REASON_ENTRY_KIND_NOT_FILE)
+
+        if type(data) is not bytes:
+            raise BundleValidationError(REASON_ENTRY_DATA_NOT_BYTES)
+
+        size = len(data)
+        if size > MAX_FILE_BYTES:
+            raise BundleValidationError(REASON_FILE_TOO_LARGE)
+
+        total_bytes += size
+        if total_bytes > MAX_TOTAL_BYTES:
+            raise BundleValidationError(REASON_BUNDLE_TOO_LARGE)
+
+        if normalized_path in normalized:
+            raise BundleValidationError(REASON_DUPLICATE_PATH)
+        normalized[normalized_path] = data
+
+    if MANIFEST_PATH not in normalized:
+        raise BundleValidationError(REASON_MISSING_MANIFEST)
+
+    _validate_manifest(normalized[MANIFEST_PATH])
+
+    # Sorted for a deterministic view that does not depend on input order.
+    return MappingProxyType(dict(sorted(normalized.items())))
