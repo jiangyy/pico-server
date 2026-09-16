@@ -527,6 +527,74 @@ class ManifestGenerationTest(ManifestTestBase):
             caught.exception.reason, manifests.REASON_DUPLICATE_PATH
         )
 
+    def test_legacy_reserved_paths_are_rejected(self):
+        for path in (
+            "course/CON.py",
+            "course/.git/config",
+            "course/a:b.py",
+            "course/trailing.",
+        ):
+            with self.subTest(path=path):
+                commit = self.craft_commit(
+                    {"picopg.json": MANIFEST_BYTES, path: b"x"}
+                )
+                self.set_ref(self.playground_id, commit)
+                with self.assertRaises(manifests.ManifestError) as caught:
+                    self.generate(self.playground_id, commit)
+                self.assertEqual(
+                    caught.exception.reason,
+                    manifests.REASON_PATH_NOT_ALLOWED,
+                )
+
+    def test_legacy_casefold_collision_is_rejected(self):
+        commit = self.craft_commit(
+            {
+                "picopg.json": MANIFEST_BYTES,
+                "course/File.py": b"1",
+                "course/file.py": b"2",
+            }
+        )
+        self.set_ref(self.playground_id, commit)
+        with self.assertRaises(manifests.ManifestError) as caught:
+            self.generate(self.playground_id, commit)
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_PATH_CASE_COLLISION
+        )
+
+    def test_legacy_non_portable_read_is_rejected(self):
+        # ``read_commit_file`` resolves paths through ``normalize_content_path``,
+        # so a non-portable request is rejected before any tree or blob read.
+        for path in ("course/CON.py", "course/.git/config", "course/a:b.py"):
+            with self.subTest(path=path):
+                with self.assertRaises(manifests.ManifestError) as caught:
+                    manifests.normalize_content_path(path)
+                self.assertEqual(
+                    caught.exception.reason,
+                    manifests.REASON_PATH_NOT_ALLOWED,
+                )
+
+    def test_legacy_non_portable_read_ignores_tree_content(self):
+        commit = self.craft_commit(
+            {
+                "picopg.json": MANIFEST_BYTES,
+                "course/CON.py": b"secret",
+            }
+        )
+        self.set_ref(self.playground_id, commit)
+        self.assert_blobs_not_read()
+        with self.assertRaises(manifests.ManifestError) as caught:
+            manifests.read_commit_file(
+                self.connection,
+                self.admin,
+                self.repository,
+                self.playground_id,
+                commit,
+                "course/CON.py",
+            )
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_PATH_NOT_ALLOWED
+        )
+
     # ----- limits --------------------------------------------------------
 
     def test_entry_count_limit_is_enforced(self):

@@ -250,6 +250,70 @@ class PathRejectionTests(BundleTestCase):
                     valid_bundle(*entries),
                 )
 
+    def test_reserved_device_names_are_rejected(self):
+        for name in (
+            "CON",
+            "con.py",
+            "Con.txt",
+            "PRN",
+            "aux.tar.gz",
+            "NUL",
+            "com1",
+            "COM9.TXT",
+            "lpt1.py",
+            "Lpt9",
+            "con .txt",
+        ):
+            self.assert_reason_for_path(
+                bundles.REASON_PATH_RESERVED_NAME, "course/" + name
+            )
+
+    def test_dot_git_segment_is_rejected(self):
+        for path in (
+            "course/.git",
+            "course/.GIT/config",
+            "course/sub/.git/config",
+        ):
+            self.assert_reason_for_path(bundles.REASON_PATH_RESERVED_NAME, path)
+
+    def test_portable_characters_and_trailing_forms(self):
+        for name in (
+            "a:b.py",
+            "a<b.py",
+            "a>b.py",
+            'a"b.py',
+            "a|b.py",
+            "a?b.py",
+            "a*b.py",
+            "trailing.",
+            "trailing ",
+        ):
+            self.assert_reason_for_path(
+                bundles.REASON_PATH_PORTABLE_CHARACTER, "course/" + name
+            )
+
+    def test_casefold_collision_is_rejected(self):
+        self.assert_reason(
+            bundles.REASON_PATH_CASE_COLLISION,
+            valid_bundle(
+                BundleEntry("course/File.py", b"1"),
+                BundleEntry("course/file.py", b"2"),
+            ),
+        )
+
+    def test_portable_near_misses_are_valid(self):
+        result = validate_bundle(
+            valid_bundle(
+                BundleEntry("course/console.py", b"1"),
+                BundleEntry("course/com10.txt", b"2"),
+                BundleEntry("course/caf\u00e9/r\u00e9sum\u00e9.py", b"3"),
+                BundleEntry("course/a b.txt", b"4"),
+                BundleEntry("course/a.b.c", b"5"),
+            )
+        )
+        self.assertIn("course/console.py", result)
+        self.assertIn("course/com10.txt", result)
+
 
 class EntryKindTests(BundleTestCase):
     def test_only_file_kind_is_allowed(self):

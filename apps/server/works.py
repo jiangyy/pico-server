@@ -22,6 +22,7 @@ from types import MappingProxyType
 
 import accounts
 import authorization
+import bundles
 import repository as repository_module
 
 
@@ -61,6 +62,9 @@ __all__ = [
     "REASON_PATH_EMPTY_SEGMENT",
     "REASON_PATH_DOT_SEGMENT",
     "REASON_PATH_NOT_ALLOWED",
+    "REASON_PATH_PORTABLE_CHARACTER",
+    "REASON_PATH_RESERVED_NAME",
+    "REASON_PATH_CASE_COLLISION",
     "REASON_ENTRY_KIND_NOT_FILE",
     "REASON_ENTRY_DATA_NOT_BYTES",
     "REASON_DUPLICATE_PATH",
@@ -116,6 +120,9 @@ REASON_PATH_ABSOLUTE = "path_absolute"
 REASON_PATH_EMPTY_SEGMENT = "path_empty_segment"
 REASON_PATH_DOT_SEGMENT = "path_dot_segment"
 REASON_PATH_NOT_ALLOWED = "path_not_allowed"
+REASON_PATH_PORTABLE_CHARACTER = "path_portable_character"
+REASON_PATH_RESERVED_NAME = "path_reserved_name"
+REASON_PATH_CASE_COLLISION = "path_case_collision"
 REASON_ENTRY_KIND_NOT_FILE = "entry_kind_not_file"
 REASON_ENTRY_DATA_NOT_BYTES = "entry_data_not_bytes"
 REASON_DUPLICATE_PATH = "duplicate_path"
@@ -146,6 +153,9 @@ REASON_CODES = frozenset(
         REASON_PATH_EMPTY_SEGMENT,
         REASON_PATH_DOT_SEGMENT,
         REASON_PATH_NOT_ALLOWED,
+        REASON_PATH_PORTABLE_CHARACTER,
+        REASON_PATH_RESERVED_NAME,
+        REASON_PATH_CASE_COLLISION,
         REASON_ENTRY_KIND_NOT_FILE,
         REASON_ENTRY_DATA_NOT_BYTES,
         REASON_DUPLICATE_PATH,
@@ -233,26 +243,25 @@ class WorkRestoreRequest:
     source_commit_id: str
 
 
+# Maps the shared portable-path reason codes (owned by ``bundles``) to the
+# Work domain's reason codes.  Only one policy implementation exists.
+_PORTABLE_REASON_MAP = {
+    bundles.REASON_PATH_NUL: REASON_PATH_NUL,
+    bundles.REASON_PATH_CONTROL: REASON_PATH_CONTROL_CHARACTER,
+    bundles.REASON_PATH_INVALID_UNICODE: REASON_PATH_INVALID_UNICODE,
+    bundles.REASON_PATH_BACKSLASH: REASON_PATH_BACKSLASH,
+    bundles.REASON_PATH_EMPTY_SEGMENT: REASON_PATH_EMPTY_SEGMENT,
+    bundles.REASON_PATH_DOT_SEGMENT: REASON_PATH_DOT_SEGMENT,
+    bundles.REASON_PATH_PORTABLE_CHARACTER: REASON_PATH_PORTABLE_CHARACTER,
+    bundles.REASON_PATH_RESERVED_NAME: REASON_PATH_RESERVED_NAME,
+}
+
+
 def _normalize_work_path(path):
     """Return the one normalized ``work/**`` path, or raise a reason."""
 
     if type(path) is not str:
         raise WorkValidationError(REASON_PATH_NOT_STR)
-    if "\x00" in path:
-        raise WorkValidationError(REASON_PATH_NUL)
-    # Any other C0 control character or DEL is invalid in a Git tree path.
-    # Reject it here so the domain validator owns the complete reason-code
-    # contract instead of letting ``repository._is_safe_tree_path`` raise a
-    # later ``RepositoryError``.
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in path):
-        raise WorkValidationError(REASON_PATH_CONTROL_CHARACTER)
-    if "\\" in path:
-        raise WorkValidationError(REASON_PATH_BACKSLASH)
-    # A lone surrogate is not a valid Unicode scalar value.  It cannot be
-    # encoded as UTF-8, so it must be rejected here rather than reaching a
-    # Git object write (``.encode("utf-8")``) and crashing.
-    if any("\ud800" <= character <= "\udfff" for character in path):
-        raise WorkValidationError(REASON_PATH_INVALID_UNICODE)
 
     normalized = unicodedata.normalize("NFC", path)
 
@@ -264,6 +273,16 @@ def _normalize_work_path(path):
     if any(segment in (".", "..") for segment in segments):
         raise WorkValidationError(REASON_PATH_DOT_SEGMENT)
 
+    # Apply the shared portable-segment policy from ``bundles`` before the Work
+    # allowlist so a non-portable shape reports its precise reason.  A Work
+    # tree must install on both Web and Windows filesystems.
+    for segment in segments:
+        reason = bundles.portable_segment_reason(segment)
+        if reason is not None:
+            raise WorkValidationError(
+                _PORTABLE_REASON_MAP.get(reason, REASON_PATH_NOT_ALLOWED)
+            )
+
     # Only ``work/<something>`` is a client-submitted Work path.  This single
     # check rejects ``course/**``, ``starter/**``, ``picopg.json`` and
     # ``.picopg/**`` because none of them begin with the Work prefix.
@@ -272,6 +291,7 @@ def _normalize_work_path(path):
         or len(normalized) == len(WORK_PREFIX)
     ):
         raise WorkValidationError(REASON_PATH_NOT_ALLOWED)
+
     return normalized
 
 
@@ -332,6 +352,9 @@ def validate_work_files(entries):
         if normalized_path in normalized:
             raise WorkValidationError(REASON_DUPLICATE_PATH)
         normalized[normalized_path] = data
+
+    if bundles.portable_path_collision(normalized):
+        raise WorkValidationError(REASON_PATH_CASE_COLLISION)
 
     # Sorted for a deterministic view that does not depend on input order.
     return MappingProxyType(dict(sorted(normalized.items())))

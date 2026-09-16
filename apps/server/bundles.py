@@ -31,6 +31,8 @@ __all__ = [
     "BundleArchiveError",
     "validate_bundle",
     "decode_bundle_zip",
+    "portable_segment_reason",
+    "portable_path_collision",
     "SUPPORTED_SCHEMA_VERSIONS",
     "SUPPORTED_RUNTIMES",
     "SUPPORTED_COMPRESSIONS",
@@ -50,6 +52,9 @@ __all__ = [
     "REASON_PATH_CONTROL",
     "REASON_PATH_INVALID_UNICODE",
     "REASON_PATH_FILE_DIRECTORY",
+    "REASON_PATH_PORTABLE_CHARACTER",
+    "REASON_PATH_RESERVED_NAME",
+    "REASON_PATH_CASE_COLLISION",
     "REASON_PATH_BACKSLASH",
     "REASON_PATH_ABSOLUTE",
     "REASON_PATH_EMPTY_SEGMENT",
@@ -123,6 +128,9 @@ REASON_PATH_NUL = "path_nul"
 REASON_PATH_CONTROL = "path_control"
 REASON_PATH_INVALID_UNICODE = "path_invalid_unicode"
 REASON_PATH_FILE_DIRECTORY = "path_file_directory"
+REASON_PATH_PORTABLE_CHARACTER = "path_portable_character"
+REASON_PATH_RESERVED_NAME = "path_reserved_name"
+REASON_PATH_CASE_COLLISION = "path_case_collision"
 REASON_PATH_BACKSLASH = "path_backslash"
 REASON_PATH_ABSOLUTE = "path_absolute"
 REASON_PATH_EMPTY_SEGMENT = "path_empty_segment"
@@ -170,6 +178,9 @@ REASON_CODES: frozenset[str] = frozenset(
         REASON_PATH_CONTROL,
         REASON_PATH_INVALID_UNICODE,
         REASON_PATH_FILE_DIRECTORY,
+        REASON_PATH_PORTABLE_CHARACTER,
+        REASON_PATH_RESERVED_NAME,
+        REASON_PATH_CASE_COLLISION,
         REASON_PATH_BACKSLASH,
         REASON_PATH_ABSOLUTE,
         REASON_PATH_EMPTY_SEGMENT,
@@ -238,12 +249,69 @@ class BundleArchiveError(BundleValidationError):
 
 def _has_control_character(path: str) -> bool:
     """Return whether ``path`` contains a C0 control or DEL character."""
-    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in path)
+    return any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in path
+    )
 
 
 def _has_surrogate(path: str) -> bool:
     """Return whether ``path`` contains a lone surrogate code point."""
     return any(0xD800 <= ord(character) <= 0xDFFF for character in path)
+
+
+# Windows reserves these device basenames at every directory level; a tree
+# that uses one cannot be installed on a Windows filesystem.
+_WINDOWS_FORBIDDEN_CHARACTERS = frozenset('<>:"|?*')
+_RESERVED_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
+
+
+def portable_segment_reason(segment) -> str | None:
+    """Return a stable reason if ``segment`` is not a portable path segment.
+
+    This one policy is shared by Playground bundles, Work snapshots, and
+    manifest generation.  It returns ``None`` for a segment that can be
+    installed on both Web and Windows filesystems.
+    """
+
+    if type(segment) is not str or segment == "":
+        return REASON_PATH_EMPTY_SEGMENT
+    if segment in (".", ".."):
+        return REASON_PATH_DOT_SEGMENT
+    if "\x00" in segment:
+        return REASON_PATH_NUL
+    if _has_control_character(segment):
+        return REASON_PATH_CONTROL
+    if _has_surrogate(segment):
+        return REASON_PATH_INVALID_UNICODE
+    if "\\" in segment:
+        return REASON_PATH_BACKSLASH
+    if any(
+        character in _WINDOWS_FORBIDDEN_CHARACTERS for character in segment
+    ):
+        return REASON_PATH_PORTABLE_CHARACTER
+    if segment.endswith(" ") or segment.endswith("."):
+        return REASON_PATH_PORTABLE_CHARACTER
+    if segment.casefold() == ".git":
+        return REASON_PATH_RESERVED_NAME
+    stem = segment.rstrip(" .").split(".", 1)[0].rstrip(" ").casefold()
+    if stem in _RESERVED_DEVICE_NAMES:
+        return REASON_PATH_RESERVED_NAME
+    return None
+
+
+def portable_path_collision(paths) -> bool:
+    """Return whether two complete normalized paths collide under casefold."""
+    seen = set()
+    for path in paths:
+        folded = path.casefold()
+        if folded in seen:
+            return True
+        seen.add(folded)
+    return False
 
 
 def _reject_file_directory_collision(normalized: Mapping[str, bytes]) -> None:
@@ -283,18 +351,22 @@ def _normalize_path(path: object) -> str:
     if any(segment in (".", "..") for segment in segments):
         raise BundleValidationError(REASON_PATH_DOT_SEGMENT)
 
-    if normalized == MANIFEST_PATH:
-        return normalized
+    if normalized != MANIFEST_PATH:
+        for prefix in FORBIDDEN_ROOT_PREFIXES:
+            if normalized == prefix[:-1] or normalized.startswith(prefix):
+                raise BundleValidationError(REASON_PATH_FORBIDDEN)
+        for prefix in ALLOWED_PREFIXES:
+            if normalized.startswith(prefix) and len(normalized) > len(prefix):
+                break
+        else:
+            raise BundleValidationError(REASON_PATH_NOT_ALLOWED)
 
-    for prefix in FORBIDDEN_ROOT_PREFIXES:
-        if normalized == prefix[:-1] or normalized.startswith(prefix):
-            raise BundleValidationError(REASON_PATH_FORBIDDEN)
+    for segment in segments:
+        reason = portable_segment_reason(segment)
+        if reason is not None:
+            raise BundleValidationError(reason)
 
-    for prefix in ALLOWED_PREFIXES:
-        if normalized.startswith(prefix) and len(normalized) > len(prefix):
-            return normalized
-
-    raise BundleValidationError(REASON_PATH_NOT_ALLOWED)
+    return normalized
 
 
 def _reject_json_constant(value: str) -> None:
@@ -425,6 +497,8 @@ def validate_bundle(bundle: Iterable[BundleEntry]) -> Mapping[str, bytes]:
         raise BundleValidationError(REASON_MISSING_MANIFEST)
 
     _reject_file_directory_collision(normalized)
+    if portable_path_collision(normalized):
+        raise BundleValidationError(REASON_PATH_CASE_COLLISION)
     _validate_manifest(normalized[MANIFEST_PATH])
 
     # Sorted for a deterministic view that does not depend on input order.

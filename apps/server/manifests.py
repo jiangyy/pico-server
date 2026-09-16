@@ -60,6 +60,7 @@ REASON_ENTRY_NOT_BLOB = "entry_not_blob"
 REASON_ENTRY_MODE_NOT_FILE = "entry_mode_not_file"
 REASON_PATH_NOT_ALLOWED = "path_not_allowed"
 REASON_PATH_NOT_FOUND = "path_not_found"
+REASON_PATH_CASE_COLLISION = "path_case_collision"
 REASON_DUPLICATE_PATH = "duplicate_path"
 REASON_MISSING_BLOB = "missing_blob"
 REASON_BLOB_SIZE_MISMATCH = "blob_size_mismatch"
@@ -73,6 +74,7 @@ REASON_CODES = frozenset(
         REASON_ENTRY_MODE_NOT_FILE,
         REASON_PATH_NOT_ALLOWED,
         REASON_PATH_NOT_FOUND,
+        REASON_PATH_CASE_COLLISION,
         REASON_DUPLICATE_PATH,
         REASON_MISSING_BLOB,
         REASON_BLOB_SIZE_MISMATCH,
@@ -147,8 +149,13 @@ def _path_is_allowed(path):
         return True
     for prefix in ALLOWED_PREFIXES:
         if path.startswith(prefix) and len(path) > len(prefix):
-            return True
-    return False
+            break
+    else:
+        return False
+    for segment in segments:
+        if bundles.portable_segment_reason(segment) is not None:
+            return False
+    return True
 
 
 def _build_manifest(repository, commit_id):
@@ -157,6 +164,7 @@ def _build_manifest(repository, commit_id):
         raise ManifestError(REASON_TOO_MANY_ENTRIES)
 
     seen = set()
+    folded = set()
     total_bytes = 0
     planned = []
 
@@ -165,7 +173,11 @@ def _build_manifest(repository, commit_id):
             raise ManifestError(REASON_PATH_NOT_ALLOWED)
         if entry.path in seen:
             raise ManifestError(REASON_DUPLICATE_PATH)
+        folded_path = entry.path.casefold()
+        if folded_path in folded:
+            raise ManifestError(REASON_PATH_CASE_COLLISION)
         seen.add(entry.path)
+        folded.add(folded_path)
 
         if entry.kind != "blob":
             raise ManifestError(REASON_ENTRY_NOT_BLOB)

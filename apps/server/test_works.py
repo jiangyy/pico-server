@@ -506,6 +506,46 @@ class WorkCreationTest(WorkTestBase):
                     )
                 self.assertEqual(caught.exception.reason, reason)
 
+    def test_non_portable_work_paths_are_rejected(self):
+        cases = [
+            ("work/CON.py", works.REASON_PATH_RESERVED_NAME),
+            ("work/sub/LPT1.txt", works.REASON_PATH_RESERVED_NAME),
+            ("work/.git/config", works.REASON_PATH_RESERVED_NAME),
+            ("work/a:b.py", works.REASON_PATH_PORTABLE_CHARACTER),
+            ("work/trailing.", works.REASON_PATH_PORTABLE_CHARACTER),
+            ("work/trailing ", works.REASON_PATH_PORTABLE_CHARACTER),
+        ]
+        for path, reason in cases:
+            with self.subTest(path=path):
+                with self.assertRaises(works.WorkValidationError) as caught:
+                    works.validate_work_files([works.WorkEntry(path, b"x")])
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertIn(reason, works.REASON_CODES)
+
+    def test_casefold_collision_in_work_files_is_rejected(self):
+        entries = [
+            works.WorkEntry("work/File.py", b"1"),
+            works.WorkEntry("work/file.py", b"2"),
+        ]
+        with self.assertRaises(works.WorkValidationError) as caught:
+            works.validate_work_files(entries)
+        self.assertEqual(
+            caught.exception.reason, works.REASON_PATH_CASE_COLLISION
+        )
+        self.assertIn(works.REASON_PATH_CASE_COLLISION, works.REASON_CODES)
+
+    def test_portable_work_near_misses_are_valid(self):
+        result = works.validate_work_files(
+            [
+                works.WorkEntry("work/console.py", b"1"),
+                works.WorkEntry("work/com10.txt", b"2"),
+                works.WorkEntry("work/a b.txt", b"3"),
+                works.WorkEntry("work/caf\u00e9.py", b"4"),
+            ]
+        )
+        self.assertIn("work/console.py", result)
+        self.assertIn("work/com10.txt", result)
+
     def test_invalid_path_shapes_and_entry_types_are_rejected(self):
         cases = [
             (works.WorkEntry(None, b"x"), works.REASON_PATH_NOT_STR),
