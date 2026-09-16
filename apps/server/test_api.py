@@ -1,14 +1,20 @@
 """HTTP tests for the account API."""
 
+import io
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
 import uuid
+import zipfile
 from http.client import HTTPConnection
 from pathlib import Path
+from unittest import mock
 
 import accounts
+import bundles
+import repository
 from database import open_database
 from server import MAX_JSON_BODY_BYTES, make_server
 
@@ -930,14 +936,27 @@ class PlaygroundApiTest(unittest.TestCase):
         cls.thread.join(timeout=5)
         cls.temporary_directory.cleanup()
 
-    def request(self, method, path, payload=None, token=None):
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/zip",
+        extra_headers=None,
+    ):
         headers = {}
-        body = None
+        body = raw_body
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
 
         connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request(method, path, body=body, headers=headers)
@@ -1011,6 +1030,363 @@ class PlaygroundApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         return body["playground"]
+
+    # --- Playground commit upload ----------------------------------------
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    def build_zip(self, entries=None, compression=zipfile.ZIP_DEFLATED):
+        if entries is None:
+            entries = (
+                ("picopg.json", self.MANIFEST),
+                ("course/module/app.py", b"print(1)"),
+                ("starter/setup.py", b"setup"),
+            )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def build_zip_with_info(self, entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for info, data in entries:
+                archive.writestr(info, data)
+        return buffer.getvalue()
+
+    def publish(
+        self,
+        token,
+        playground_id,
+        body,
+        key,
+        content_type="application/zip",
+    ):
+        return self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=body,
+            token=token,
+            content_type=content_type,
+            extra_headers={"Idempotency-Key": key},
+        )
+
+    def count_idempotency_rows(self, endpoint):
+        connection = open_database(self.database_path)
+        try:
+            return connection.execute(
+                "SELECT COUNT(*) AS total FROM idempotency_results"
+                " WHERE endpoint = ?",
+                (endpoint,),
+            ).fetchone()["total"]
+        finally:
+            connection.close()
+
+    def test_publish_commit_success_and_exact_retry(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+        body = self.build_zip()
+
+        status, _, response = self.publish(token, playground_id, body, "key-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            set(response), {"playgroundId", "commitId", "noOp"}
+        )
+        self.assertEqual(response["playgroundId"], playground_id)
+        self.assertTrue(response["commitId"])
+        self.assertFalse(response["noOp"])
+
+        # The returned commit is the real Playground ref head.
+        ref = repository.Repository(self.repository_path).playground_ref(
+            playground_id
+        )
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository_path), "rev-parse", ref],
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(
+            completed.stdout.strip().decode(), response["commitId"]
+        )
+
+        # An exact retry returns the stored status and body, not a new commit.
+        retry_status, _, retry = self.publish(
+            token, playground_id, body, "key-1"
+        )
+        self.assertEqual(retry_status, 201)
+        self.assertEqual(retry, response)
+        self.assertEqual(
+            self.count_idempotency_rows(
+                f"POST /api/v1/playgrounds/{playground_id}/commits"
+            ),
+            1,
+        )
+
+    def test_repacked_identical_bundle_is_the_same_request(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+
+        stored = self.build_zip(compression=zipfile.ZIP_STORED)
+        deflated = self.build_zip(compression=zipfile.ZIP_DEFLATED)
+        self.assertNotEqual(stored, deflated)
+
+        status, _, first = self.publish(
+            token, playground_id, stored, "key-repack"
+        )
+        self.assertEqual(status, 201)
+        retry_status, _, second = self.publish(
+            token, playground_id, deflated, "key-repack"
+        )
+        self.assertEqual(retry_status, 201)
+        self.assertEqual(second, first)
+
+    def test_publishing_same_content_with_new_key_is_a_noop(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+
+        first = self.publish(
+            token, playground_id, self.build_zip(), "key-a"
+        )[2]
+        second_status, _, second = self.publish(
+            token,
+            playground_id,
+            self.build_zip(compression=zipfile.ZIP_STORED),
+            "key-b",
+        )
+        self.assertEqual(second_status, 201)
+        self.assertTrue(second["noOp"])
+        self.assertEqual(second["commitId"], first["commitId"])
+
+    def test_same_key_with_different_content_conflicts(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+
+        self.publish(token, playground_id, self.build_zip(), "key-conflict")
+        changed = self.build_zip(
+            (
+                ("picopg.json", self.MANIFEST),
+                ("course/module/app.py", b"print(2)"),
+            )
+        )
+        status, _, response = self.publish(
+            token, playground_id, changed, "key-conflict"
+        )
+        self.assertEqual(
+            (status, response["code"]), (409, "idempotency_conflict")
+        )
+
+    def test_invalid_bundles_return_a_bounded_reason(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+
+        symlink = zipfile.ZipInfo("course/link")
+        symlink.external_attr = (0o120777) << 16
+
+        cases = (
+            (b"not a zip", bundles.REASON_ARCHIVE_INVALID),
+            (
+                self.build_zip((("course/module/app.py", b"x"),)),
+                bundles.REASON_MISSING_MANIFEST,
+            ),
+            (
+                self.build_zip(
+                    (
+                        ("picopg.json", self.MANIFEST),
+                        ("../escape.py", b"x"),
+                    )
+                ),
+                bundles.REASON_PATH_DOT_SEGMENT,
+            ),
+            (
+                self.build_zip_with_info(((symlink, b"../../outside"),)),
+                bundles.REASON_ARCHIVE_LINK,
+            ),
+            (
+                self.build_zip(
+                    (
+                        ("picopg.json", self.MANIFEST),
+                        ("course/zeros.bin", b"\x00" * 65536),
+                    )
+                ),
+                bundles.REASON_ARCHIVE_SIZE_RATIO,
+            ),
+        )
+        for body, reason in cases:
+            with self.subTest(reason=reason):
+                status, _, response = self.publish(
+                    token, playground_id, body, self.unique("key")
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(response["code"], "invalid_bundle")
+                self.assertEqual(response["details"], {"reason": reason})
+
+    def test_invalid_bundle_error_does_not_echo_content(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+
+        secret = "SECRET-MANIFEST-SENTINEL"
+        body = self.build_zip(
+            (("picopg.json", ("{" + secret + ":").encode("utf-8")),)
+        )
+        status, _, response = self.publish(
+            token, playground_id, body, self.unique("key")
+        )
+        self.assertEqual(status, 400)
+        self.assertNotIn(secret, json.dumps(response))
+
+    def test_publish_request_requirements(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+        path = f"/api/v1/playgrounds/{playground_id}/commits"
+        body = self.build_zip()
+
+        status, _, response = self.publish(
+            token,
+            playground_id,
+            body,
+            "key",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(
+            (status, response["code"]), (415, "unsupported_media_type")
+        )
+
+        status, _, response = self.request(
+            "POST", path, raw_body=body, token=token
+        )
+        self.assertEqual((status, response["code"]), (400, "invalid_request"))
+
+        status, _, response = self.publish(token, playground_id, body, "  ")
+        self.assertEqual((status, response["code"]), (400, "invalid_request"))
+
+        status, _, response = self.publish(
+            token, playground_id, body, "k" * 256
+        )
+        self.assertEqual((status, response["code"]), (400, "invalid_request"))
+
+    def test_publish_rejects_oversized_request_before_reading(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+        path = f"/api/v1/playgrounds/{playground_id}/commits"
+
+        # The declared length is over the limit while the sent body stays
+        # small, so the server must answer 413 without consuming the stream.
+        status, _, response = self.request(
+            "POST",
+            path,
+            raw_body=b"x",
+            token=token,
+            extra_headers={
+                "Idempotency-Key": self.unique("key"),
+                "Content-Length": str(bundles.MAX_ARCHIVE_BYTES + 1),
+            },
+        )
+        self.assertEqual(
+            (status, response["code"]), (413, "request_too_large")
+        )
+
+    def test_publish_authorization(self):
+        admin = self.seed_user("admin")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        body = self.build_zip()
+
+        for token in (None, "bogus"):
+            status, _, response = self.publish(
+                token, playground_id, body, self.unique("key")
+            )
+            self.assertEqual(
+                (status, response["code"]), (401, "invalid_session")
+            )
+
+        status, _, response = self.publish(
+            student_token, playground_id, body, self.unique("key")
+        )
+        self.assertEqual((status, response["code"]), (403, "forbidden"))
+
+        status, _, response = self.publish(
+            admin_token, "missing-playground", body, self.unique("key")
+        )
+        self.assertEqual((status, response["code"]), (404, "not_found"))
+
+        # Archived playgrounds cannot be published to by anyone.
+        status, _, _ = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"archived": True},
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+        status, _, response = self.publish(
+            admin_token, playground_id, body, self.unique("key")
+        )
+        self.assertEqual((status, response["code"]), (403, "forbidden"))
+
+    def test_publish_cas_conflict_rolls_back_idempotency(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+        endpoint = f"POST /api/v1/playgrounds/{playground_id}/commits"
+
+        with mock.patch.object(
+            repository,
+            "publish_playground",
+            side_effect=repository.PlaygroundHeadChangedError(),
+        ):
+            status, _, response = self.publish(
+                token, playground_id, self.build_zip(), "key-cas"
+            )
+        self.assertEqual(
+            (status, response["code"]), (409, "playground_head_changed")
+        )
+        self.assertEqual(self.count_idempotency_rows(endpoint), 0)
+
+        # The failed attempt left no key, so the same key can be retried.
+        retry_status, _, retry = self.publish(
+            token, playground_id, self.build_zip(), "key-cas"
+        )
+        self.assertEqual(retry_status, 201)
+        self.assertFalse(retry["noOp"])
+
+    def test_publish_never_extracts_archive_to_disk(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(token, playground_id)
+
+        with mock.patch.object(
+            zipfile.ZipFile, "extract", side_effect=AssertionError("extract")
+        ), mock.patch.object(
+            zipfile.ZipFile,
+            "extractall",
+            side_effect=AssertionError("extractall"),
+        ):
+            status, _, response = self.publish(
+                token, playground_id, self.build_zip(), self.unique("key")
+            )
+        self.assertEqual(status, 201)
+        self.assertTrue(response["commitId"])
 
     def test_publisher_grant_lifecycle_and_creation_authorization(self):
         admin = self.seed_user("admin")
@@ -1321,6 +1697,10 @@ class PlaygroundApiTest(unittest.TestCase):
             ("POST", "/api/v1/playgrounds/some-id", "PATCH"),
             ("PUT", "/api/v1/playgrounds/some-id", "PATCH"),
             ("DELETE", "/api/v1/playgrounds/some-id", "PATCH"),
+            ("GET", "/api/v1/playgrounds/some-id/commits", "POST"),
+            ("PUT", "/api/v1/playgrounds/some-id/commits", "POST"),
+            ("PATCH", "/api/v1/playgrounds/some-id/commits", "POST"),
+            ("DELETE", "/api/v1/playgrounds/some-id/commits", "POST"),
             ("POST", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
             ("GET", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
             ("PATCH", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
@@ -1334,6 +1714,8 @@ class PlaygroundApiTest(unittest.TestCase):
         not_found = (
             ("GET", "/api/v1/playgrounds/"),
             ("GET", "/api/v1/playgrounds/a/b"),
+            ("POST", "/api/v1/playgrounds/a/b/commits"),
+            ("POST", "/api/v1/playgrounds/some-id/commits/extra"),
             ("GET", "/api/v1/admin/publishers"),
             ("GET", "/api/v1/admin/publishers/"),
             ("PUT", "/api/v1/admin/publishers/a/b"),

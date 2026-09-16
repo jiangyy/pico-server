@@ -1,7 +1,9 @@
 """PicoPG HTTP service using only the Python standard library."""
 
+import hashlib
 import json
 from contextlib import closing
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,6 +17,12 @@ from accounts import (
     change_user_role,
     create_user,
     register_student,
+)
+from bundles import (
+    MAX_ARCHIVE_BYTES,
+    BundleValidationError,
+    decode_bundle_zip,
+    validate_bundle,
 )
 from classes import (
     ArchivedClassError,
@@ -30,6 +38,11 @@ from classes import (
     remove_membership,
 )
 from database import open_database
+from idempotency import (
+    IdempotencyConflict,
+    IdempotencyRequestError,
+    execute as execute_idempotent,
+)
 from playgrounds import (
     InvalidPolicyError,
     InvalidRequestError,
@@ -37,10 +50,17 @@ from playgrounds import (
     PlaygroundConflictError,
     create_playground,
     grant_publisher,
+    publish_playground,
     revoke_publisher,
     update_playground,
 )
-from repository import DEFAULT_REPOSITORY_PATH, open_repository
+from repository import (
+    DEFAULT_REPOSITORY_PATH,
+    CommitMetadata,
+    PlaygroundHeadChangedError,
+    RepositoryError,
+    open_repository,
+)
 from sessions import (
     InvalidCredentialsError,
     InvalidSessionError,
@@ -72,6 +92,8 @@ CLASS_MEMBERS_SEGMENT = "/members/"
 CLASSES_PATH = "/api/v1/classes"
 ADMIN_PUBLISHERS_PATH = "/api/v1/admin/publishers"
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
+PLAYGROUND_COMMITS_SUFFIX = "/commits"
+MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
 
 def _match_admin_user_role(path):
@@ -153,6 +175,20 @@ def _match_playground(path):
     return playground_id
 
 
+def _match_playground_commit(path):
+    """Return the playground ID in a commit upload path, else None."""
+    prefix = PLAYGROUNDS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(
+        PLAYGROUND_COMMITS_SUFFIX
+    ):
+        return None
+
+    playground_id = path[len(prefix): -len(PLAYGROUND_COMMITS_SUFFIX)]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -176,9 +212,43 @@ def _allowed_methods(path):
         return ("PUT", "DELETE")
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
+    if _match_playground_commit(path) is not None:
+        return ("POST",)
     if _match_playground(path) is not None:
         return ("PATCH",)
     return None
+
+
+def _bundle_request(playground_id, bundle):
+    """Return the canonical, content-addressed logical publish request.
+
+    The identity is derived from the normalized validated bundle rather than
+    the raw ZIP bytes, so repacking identical content with different
+    compression or member order is the same logical request.
+    """
+
+    return {
+        "playgroundId": playground_id,
+        "files": [
+            {
+                "path": path,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            for path, data in bundle.items()
+        ],
+    }
+
+
+def _commit_metadata(actor):
+    """Build the trusted, server-owned commit identity for an actor."""
+
+    return CommitMetadata(
+        name=actor.username,
+        email=f"{actor.id}@picopg.invalid",
+        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        message="Publish playground bundle",
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -229,6 +299,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_admin_class()
         elif path == PLAYGROUNDS_PATH:
             self._post_playground()
+        elif _match_playground_commit(path) is not None:
+            self._post_playground_commit(_match_playground_commit(path))
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -668,6 +740,95 @@ class Handler(BaseHTTPRequestHandler):
             {"playground": self._playground_payload(playground)},
         )
 
+    def _post_playground_commit(self, playground_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        if self.headers.get_content_type() != "application/zip":
+            self._api_error(415, "unsupported_media_type")
+            return
+
+        request_key = self.headers.get("Idempotency-Key")
+        if request_key is None or not request_key.strip():
+            self._api_error(400, "invalid_request")
+            return
+        if len(request_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+            self._api_error(400, "invalid_request")
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._api_error(400, "invalid_request")
+            return
+
+        if content_length < 0:
+            self._api_error(400, "invalid_request")
+            return
+        if content_length > MAX_ARCHIVE_BYTES:
+            self._api_error(413, "request_too_large")
+            return
+
+        archive = self.rfile.read(content_length)
+        try:
+            bundle = validate_bundle(decode_bundle_zip(archive))
+        except BundleValidationError as error:
+            self._api_error(
+                400,
+                "invalid_bundle",
+                details={"reason": error.reason},
+            )
+            return
+
+        try:
+            with self._database() as connection:
+                status, body = execute_idempotent(
+                    connection,
+                    actor.id,
+                    f"POST /api/v1/playgrounds/{playground_id}/commits",
+                    request_key,
+                    _bundle_request(playground_id, bundle),
+                    lambda connection: self._publish_bundle(
+                        connection, actor, playground_id, bundle
+                    ),
+                )
+        except IdempotencyConflict:
+            self._api_error(409, "idempotency_conflict")
+            return
+        except IdempotencyRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingPlaygroundError:
+            self._api_error(404, "not_found")
+            return
+        except PlaygroundHeadChangedError:
+            self._api_error(409, "playground_head_changed")
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden")
+            return
+        except RepositoryError:
+            self._api_error(400, "invalid_request")
+            return
+
+        self._respond_json(status, body)
+
+    def _publish_bundle(self, connection, actor, playground_id, bundle):
+        result = publish_playground(
+            connection,
+            actor,
+            playground_id,
+            self.server.repository,
+            bundle,
+            _commit_metadata(actor),
+        )
+        return 201, {
+            "playgroundId": result.playground_id,
+            "commitId": result.commit_id,
+            "noOp": result.no_op,
+        }
+
     def _patch_playground(self, playground_id):
         actor = self._authenticate()
         if actor is None:
@@ -824,10 +985,15 @@ class Handler(BaseHTTPRequestHandler):
                 extra_headers=headers,
             )
 
-    def _api_error(self, status, code, head_only=False, extra_headers=()):
+    def _api_error(
+        self, status, code, head_only=False, extra_headers=(), details=None
+    ):
+        payload = {"code": code}
+        if details is not None:
+            payload["details"] = details
         self._respond_json(
             status,
-            {"code": code},
+            payload,
             head_only=head_only,
             extra_headers=extra_headers,
         )

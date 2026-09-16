@@ -1,8 +1,12 @@
 """Exhaustive tests for the pure Playground bundle validator."""
 
 import dataclasses
+import io
 import json
+import stat
 import unittest
+import warnings
+import zipfile
 from unittest import mock
 
 import bundles
@@ -15,6 +19,7 @@ from bundles import (
     REASON_CODES,
     SUPPORTED_RUNTIMES,
     SUPPORTED_SCHEMA_VERSIONS,
+    decode_bundle_zip,
     validate_bundle,
 )
 
@@ -665,6 +670,225 @@ class ReasonCodeTests(BundleTestCase):
             {getattr(bundles, name) for name in vars(bundles) if name.startswith("REASON_") and name != "REASON_CODES"},
             set(REASON_CODES),
         )
+
+
+class DecodeBundleZipTests(unittest.TestCase):
+    """The bounded ZIP-to-entries bridge that feeds the pure validator."""
+
+    VALID_ENTRIES = (
+        ("picopg.json", MANIFEST_BYTES),
+        ("course/module/app.py", b"print(1)"),
+        ("starter/setup.py", b"setup"),
+    )
+
+    def build_zip(self, entries, compression=zipfile.ZIP_DEFLATED):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def build_zip_with_info(self, entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for info, data in entries:
+                archive.writestr(info, data)
+        return buffer.getvalue()
+
+    def assert_archive_reason(self, reason, data):
+        with self.assertRaises(bundles.BundleArchiveError) as ctx:
+            decode_bundle_zip(data)
+        self.assertEqual(ctx.exception.reason, reason)
+        self.assertIn(reason, REASON_CODES)
+        self.assertIsInstance(ctx.exception, BundleValidationError)
+        # Raised outside the except scope: no archive-derived error is chained.
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertIsNone(ctx.exception.__context__)
+
+    def set_central_directory_encryption_flag(self, data):
+        signature = b"PK\x01\x02"
+        patched = bytearray(data)
+        index = patched.find(signature)
+        while index != -1:
+            patched[index + 8] |= 0x01
+            index = patched.find(signature, index + 4)
+        return bytes(patched)
+
+    def test_valid_zip_decodes_and_validates(self):
+        data = self.build_zip(self.VALID_ENTRIES)
+        result = validate_bundle(decode_bundle_zip(data))
+        self.assertEqual(
+            set(result),
+            {"picopg.json", "course/module/app.py", "starter/setup.py"},
+        )
+        self.assertEqual(result["course/module/app.py"], b"print(1)")
+
+    def test_stored_and_deflated_are_supported(self):
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=compression):
+                data = self.build_zip(self.VALID_ENTRIES, compression)
+                result = validate_bundle(decode_bundle_zip(data))
+                self.assertEqual(result["starter/setup.py"], b"setup")
+
+    def test_malformed_archives(self):
+        for data in (b"", b"not a zip", b"PK\x03\x04" + b"\x00" * 20):
+            with self.subTest(data=data[:8]):
+                self.assert_archive_reason(
+                    bundles.REASON_ARCHIVE_INVALID, data
+                )
+
+    def test_non_bytes_input(self):
+        for data in ("text", bytearray(b"x"), memoryview(b"x"), None, 5):
+            with self.subTest(data=data):
+                self.assert_archive_reason(
+                    bundles.REASON_ARCHIVE_INVALID, data
+                )
+
+    def test_oversized_compressed_request(self):
+        data = self.build_zip(self.VALID_ENTRIES)
+        with self.assertRaises(bundles.BundleArchiveError) as ctx:
+            decode_bundle_zip(data, max_archive_bytes=4)
+        self.assertEqual(
+            ctx.exception.reason, bundles.REASON_ARCHIVE_TOO_LARGE
+        )
+
+    def test_directory_member(self):
+        data = self.build_zip(
+            (("picopg.json", MANIFEST_BYTES), ("course/", b""))
+        )
+        self.assert_archive_reason(bundles.REASON_ARCHIVE_DIRECTORY, data)
+
+    def test_symlink_member(self):
+        info = zipfile.ZipInfo("course/link")
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        data = self.build_zip_with_info(((info, b"../../outside"),))
+        self.assert_archive_reason(bundles.REASON_ARCHIVE_LINK, data)
+
+    def test_non_regular_member(self):
+        info = zipfile.ZipInfo("course/fifo")
+        info.external_attr = (stat.S_IFIFO | 0o644) << 16
+        data = self.build_zip_with_info(((info, b"x"),))
+        self.assert_archive_reason(bundles.REASON_ARCHIVE_ENTRY_TYPE, data)
+
+    def test_encrypted_member(self):
+        data = self.set_central_directory_encryption_flag(
+            self.build_zip(self.VALID_ENTRIES)
+        )
+        self.assert_archive_reason(bundles.REASON_ARCHIVE_ENCRYPTED, data)
+
+    def test_unsupported_compression(self):
+        data = self.build_zip(self.VALID_ENTRIES, zipfile.ZIP_BZIP2)
+        self.assert_archive_reason(bundles.REASON_ARCHIVE_COMPRESSION, data)
+
+    def test_duplicate_member_name(self):
+        buffer = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("picopg.json", MANIFEST_BYTES)
+                archive.writestr("picopg.json", MANIFEST_BYTES)
+        self.assert_archive_reason(
+            bundles.REASON_ARCHIVE_DUPLICATE_NAME, buffer.getvalue()
+        )
+
+    def test_entry_count_limit(self):
+        entries = [("picopg.json", MANIFEST_BYTES)]
+        entries.extend(
+            (f"course/f{index}.py", b"") for index in range(MAX_ENTRY_COUNT)
+        )
+        data = self.build_zip(entries)
+        self.assert_archive_reason(
+            bundles.REASON_ARCHIVE_TOO_MANY_ENTRIES, data
+        )
+
+    def test_declared_file_size_limit(self):
+        data = self.build_zip(
+            (
+                ("picopg.json", MANIFEST_BYTES),
+                ("course/big.bin", b"\x00" * (MAX_FILE_BYTES + 1)),
+            ),
+            zipfile.ZIP_STORED,
+        )
+        self.assert_archive_reason(
+            bundles.REASON_ARCHIVE_FILE_TOO_LARGE, data
+        )
+
+    def test_total_size_limit(self):
+        entries = [("picopg.json", MANIFEST_BYTES)]
+        remaining = MAX_TOTAL_BYTES - len(MANIFEST_BYTES) + 1
+        index = 0
+        while remaining > 0:
+            chunk = min(remaining, MAX_FILE_BYTES)
+            entries.append((f"course/big{index}.bin", b"\x00" * chunk))
+            remaining -= chunk
+            index += 1
+        data = self.build_zip(entries, zipfile.ZIP_STORED)
+        self.assert_archive_reason(
+            bundles.REASON_ARCHIVE_BUNDLE_TOO_LARGE, data
+        )
+
+    def test_suspicious_compression_ratio(self):
+        data = self.build_zip(
+            (
+                ("picopg.json", MANIFEST_BYTES),
+                ("course/zeros.bin", b"\x00" * 65536),
+            )
+        )
+        self.assert_archive_reason(
+            bundles.REASON_ARCHIVE_SIZE_RATIO, data
+        )
+
+    def test_small_high_ratio_member_is_not_suspicious(self):
+        data = self.build_zip(
+            (
+                ("picopg.json", MANIFEST_BYTES),
+                ("course/small.bin", b"\x00" * 128),
+            )
+        )
+        result = validate_bundle(decode_bundle_zip(data))
+        self.assertEqual(len(result["course/small.bin"]), 128)
+
+    def test_traversal_is_rejected_by_validation(self):
+        for path in ("../escape.py", "course/../../escape.py", "/course/a.py"):
+            with self.subTest(path=path):
+                data = self.build_zip(
+                    (("picopg.json", MANIFEST_BYTES), (path, b"x"))
+                )
+                entries = decode_bundle_zip(data)
+                with self.assertRaises(BundleValidationError) as ctx:
+                    validate_bundle(entries)
+                self.assertIn(
+                    ctx.exception.reason,
+                    {
+                        bundles.REASON_PATH_DOT_SEGMENT,
+                        bundles.REASON_PATH_ABSOLUTE,
+                    },
+                )
+
+    def test_decoding_never_extracts_or_opens_files(self):
+        data = self.build_zip(self.VALID_ENTRIES)
+        with mock.patch.object(
+            zipfile.ZipFile, "extract", side_effect=AssertionError("extract")
+        ), mock.patch.object(
+            zipfile.ZipFile,
+            "extractall",
+            side_effect=AssertionError("extractall"),
+        ), mock.patch(
+            "builtins.open", side_effect=AssertionError("filesystem")
+        ):
+            result = validate_bundle(decode_bundle_zip(data))
+        self.assertEqual(result["course/module/app.py"], b"print(1)")
+
+    def test_errors_never_contain_member_names(self):
+        info = zipfile.ZipInfo("course/SECRET-MEMBER-NAME")
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        data = self.build_zip_with_info(((info, b"SECRET-BODY"),))
+        with self.assertRaises(bundles.BundleArchiveError) as ctx:
+            decode_bundle_zip(data)
+        self.assertNotIn("SECRET-MEMBER-NAME", str(ctx.exception))
+        self.assertNotIn("SECRET-MEMBER-NAME", repr(ctx.exception))
+        self.assertNotIn("SECRET-BODY", repr(ctx.exception))
+        self.assertEqual(ctx.exception.reason, bundles.REASON_ARCHIVE_LINK)
 
 
 if __name__ == "__main__":

@@ -1,31 +1,45 @@
-"""Pure validation for an already-decoded Playground publishing bundle.
+"""Validation and in-memory decoding for Playground publishing bundles.
 
-This module intentionally knows nothing about ZIP/TAR archives, HTTP, the
-filesystem, the database, or Git.  It takes an in-memory iterable of
+:func:`validate_bundle` is pure: it takes an already-decoded iterable of
 :class:`BundleEntry` values and, only if the whole bundle passes, returns an
-immutable mapping from normalized path to bytes.
+immutable mapping from normalized path to bytes.  It knows nothing about
+archives, HTTP, the filesystem, the database, or Git.
 
-Validation errors carry a stable machine-readable ``reason`` code.  Error
-messages never contain entry content.
+:func:`decode_bundle_zip` is the single bounded bridge from an untrusted ZIP
+archive to those entries.  It reads the archive exclusively in memory, rejects
+unsafe member metadata before extracting anything, and never touches the
+filesystem.
+
+Validation and decoding errors carry a stable machine-readable ``reason``
+code.  Error messages never contain entry content.
 """
 
 from __future__ import annotations
 
 import json
+import stat
 import unicodedata
+import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
 __all__ = [
     "BundleEntry",
     "BundleValidationError",
+    "BundleArchiveError",
     "validate_bundle",
+    "decode_bundle_zip",
     "SUPPORTED_SCHEMA_VERSIONS",
     "SUPPORTED_RUNTIMES",
+    "SUPPORTED_COMPRESSIONS",
     "MAX_ENTRY_COUNT",
     "MAX_FILE_BYTES",
     "MAX_TOTAL_BYTES",
+    "MAX_ARCHIVE_BYTES",
+    "MAX_COMPRESSION_RATIO",
+    "MIN_RATIO_FILE_BYTES",
     "MANIFEST_PATH",
     "REASON_CODES",
     # reason codes
@@ -53,6 +67,19 @@ __all__ = [
     "REASON_MANIFEST_INVALID_SCHEMA_VERSION",
     "REASON_MANIFEST_MISSING_RUNTIME",
     "REASON_MANIFEST_INVALID_RUNTIME",
+    # archive decoding reason codes
+    "REASON_ARCHIVE_INVALID",
+    "REASON_ARCHIVE_TOO_LARGE",
+    "REASON_ARCHIVE_ENCRYPTED",
+    "REASON_ARCHIVE_DIRECTORY",
+    "REASON_ARCHIVE_LINK",
+    "REASON_ARCHIVE_ENTRY_TYPE",
+    "REASON_ARCHIVE_COMPRESSION",
+    "REASON_ARCHIVE_DUPLICATE_NAME",
+    "REASON_ARCHIVE_TOO_MANY_ENTRIES",
+    "REASON_ARCHIVE_FILE_TOO_LARGE",
+    "REASON_ARCHIVE_BUNDLE_TOO_LARGE",
+    "REASON_ARCHIVE_SIZE_RATIO",
 ]
 
 # --- Declared compatibility contract -------------------------------------
@@ -70,6 +97,20 @@ MAX_TOTAL_BYTES: int = 8 * 1024 * 1024
 MANIFEST_PATH: str = "picopg.json"
 ALLOWED_PREFIXES: tuple[str, ...] = ("course/", "starter/")
 FORBIDDEN_ROOT_PREFIXES: tuple[str, ...] = (".picopg/", "work/")
+
+# --- Archive decoding limits ---------------------------------------------
+#
+# The compressed request is bounded before the body is read so a hostile
+# client cannot make the server buffer an arbitrarily large upload.  The
+# per-member ratio guards against metadata that advertises a tiny compressed
+# payload but expands enormously; it only applies to non-trivial members so
+# small files cannot trip it.
+MAX_ARCHIVE_BYTES: int = 10 * 1024 * 1024
+MAX_COMPRESSION_RATIO: int = 200
+MIN_RATIO_FILE_BYTES: int = 4096
+SUPPORTED_COMPRESSIONS: frozenset[int] = frozenset(
+    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+)
 
 # --- Stable reason codes --------------------------------------------------
 REASON_BUNDLE_NOT_ITERABLE = "bundle_not_iterable"
@@ -97,6 +138,23 @@ REASON_MANIFEST_INVALID_SCHEMA_VERSION = "manifest_invalid_schema_version"
 REASON_MANIFEST_MISSING_RUNTIME = "manifest_missing_runtime"
 REASON_MANIFEST_INVALID_RUNTIME = "manifest_invalid_runtime"
 
+# --- Archive decoding reason codes ----------------------------------------
+#
+# These are deliberately coarse and fixed: an HTTP caller receives one of
+# these codes and never the archive member name, path, or content.
+REASON_ARCHIVE_INVALID = "archive_invalid"
+REASON_ARCHIVE_TOO_LARGE = "archive_too_large"
+REASON_ARCHIVE_ENCRYPTED = "archive_encrypted"
+REASON_ARCHIVE_DIRECTORY = "archive_directory"
+REASON_ARCHIVE_LINK = "archive_link"
+REASON_ARCHIVE_ENTRY_TYPE = "archive_entry_type"
+REASON_ARCHIVE_COMPRESSION = "archive_compression"
+REASON_ARCHIVE_DUPLICATE_NAME = "archive_duplicate_name"
+REASON_ARCHIVE_TOO_MANY_ENTRIES = "archive_too_many_entries"
+REASON_ARCHIVE_FILE_TOO_LARGE = "archive_file_too_large"
+REASON_ARCHIVE_BUNDLE_TOO_LARGE = "archive_bundle_too_large"
+REASON_ARCHIVE_SIZE_RATIO = "archive_size_ratio"
+
 REASON_CODES: frozenset[str] = frozenset(
     {
         REASON_BUNDLE_NOT_ITERABLE,
@@ -123,6 +181,18 @@ REASON_CODES: frozenset[str] = frozenset(
         REASON_MANIFEST_INVALID_SCHEMA_VERSION,
         REASON_MANIFEST_MISSING_RUNTIME,
         REASON_MANIFEST_INVALID_RUNTIME,
+        REASON_ARCHIVE_INVALID,
+        REASON_ARCHIVE_TOO_LARGE,
+        REASON_ARCHIVE_ENCRYPTED,
+        REASON_ARCHIVE_DIRECTORY,
+        REASON_ARCHIVE_LINK,
+        REASON_ARCHIVE_ENTRY_TYPE,
+        REASON_ARCHIVE_COMPRESSION,
+        REASON_ARCHIVE_DUPLICATE_NAME,
+        REASON_ARCHIVE_TOO_MANY_ENTRIES,
+        REASON_ARCHIVE_FILE_TOO_LARGE,
+        REASON_ARCHIVE_BUNDLE_TOO_LARGE,
+        REASON_ARCHIVE_SIZE_RATIO,
     }
 )
 
@@ -146,6 +216,15 @@ class BundleValidationError(ValueError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+class BundleArchiveError(BundleValidationError):
+    """Raised when an archive cannot be safely decoded into bundle entries.
+
+    This is a :class:`BundleValidationError` so callers that only care about
+    a bounded machine-readable ``reason`` handle archives and decoded bundles
+    uniformly.
+    """
 
 
 def _normalize_path(path: object) -> str:
@@ -317,3 +396,140 @@ def validate_bundle(bundle: Iterable[BundleEntry]) -> Mapping[str, bytes]:
 
     # Sorted for a deterministic view that does not depend on input order.
     return MappingProxyType(dict(sorted(normalized.items())))
+
+
+# --- In-memory ZIP decoding ------------------------------------------------
+#
+# Everything below converts an untrusted ZIP archive into the ``BundleEntry``
+# values that :func:`validate_bundle` consumes.  Member bytes are read into
+# memory; the archive is never extracted, and no member name reaches the
+# filesystem.  Failures are returned as sentinel exception values and raised
+# outside the ``except`` scope so no underlying error (which may quote archive
+# bytes) remains chained.
+
+
+def decode_bundle_zip(
+    data: bytes, *, max_archive_bytes: int = MAX_ARCHIVE_BYTES
+) -> list[BundleEntry]:
+    """Decode a ZIP archive into entries without touching the filesystem.
+
+    The returned list is unvalidated: callers must pass it to
+    :func:`validate_bundle`.  Archive-level problems raise
+    :class:`BundleArchiveError`.  ``max_archive_bytes`` bounds the compressed
+    input so the same policy can be exercised in tests without large buffers.
+    """
+
+    outcome = _decode_archive(data, max_archive_bytes)
+    if isinstance(outcome, BundleArchiveError):
+        raise outcome
+    return outcome
+
+
+def _decode_archive(data: bytes, max_archive_bytes: int) -> object:
+    if type(data) is not bytes:
+        return BundleArchiveError(REASON_ARCHIVE_INVALID)
+    if len(data) > max_archive_bytes:
+        return BundleArchiveError(REASON_ARCHIVE_TOO_LARGE)
+
+    archive = _open_archive(data)
+    if archive is None:
+        return BundleArchiveError(REASON_ARCHIVE_INVALID)
+
+    try:
+        return _read_archive(archive)
+    except BundleArchiveError as error:
+        return error
+    except Exception:
+        return BundleArchiveError(REASON_ARCHIVE_INVALID)
+    finally:
+        try:
+            archive.close()
+        except Exception:
+            pass
+
+
+def _open_archive(data: bytes):
+    try:
+        return zipfile.ZipFile(BytesIO(data))
+    except Exception:
+        return None
+
+
+def _read_archive(archive) -> list[BundleEntry]:
+    members = archive.infolist()
+    if len(members) > MAX_ENTRY_COUNT:
+        raise BundleArchiveError(REASON_ARCHIVE_TOO_MANY_ENTRIES)
+
+    seen: set[str] = set()
+    entries: list[BundleEntry] = []
+    total_bytes = 0
+
+    for info in members:
+        reason = _member_metadata_reason(info)
+        if reason is not None:
+            raise BundleArchiveError(reason)
+
+        if info.filename in seen:
+            raise BundleArchiveError(REASON_ARCHIVE_DUPLICATE_NAME)
+        seen.add(info.filename)
+
+        if info.file_size > MAX_FILE_BYTES:
+            raise BundleArchiveError(REASON_ARCHIVE_FILE_TOO_LARGE)
+        total_bytes += info.file_size
+        if total_bytes > MAX_TOTAL_BYTES:
+            raise BundleArchiveError(REASON_ARCHIVE_BUNDLE_TOO_LARGE)
+        if _is_suspicious_ratio(info):
+            raise BundleArchiveError(REASON_ARCHIVE_SIZE_RATIO)
+
+        member = _read_member(archive, info)
+        if isinstance(member, BundleArchiveError):
+            raise member
+        entries.append(BundleEntry(info.filename, member))
+
+    return entries
+
+
+def _member_metadata_reason(info) -> str | None:
+    """Return a rejection reason from member metadata, reading nothing."""
+
+    if info.flag_bits & 0x1:
+        return REASON_ARCHIVE_ENCRYPTED
+    if info.is_dir() or info.filename.endswith("/"):
+        return REASON_ARCHIVE_DIRECTORY
+    if info.compress_type not in SUPPORTED_COMPRESSIONS:
+        return REASON_ARCHIVE_COMPRESSION
+
+    mode = (info.external_attr >> 16) & 0xFFFF
+    file_type = stat.S_IFMT(mode)
+    if file_type == stat.S_IFLNK:
+        return REASON_ARCHIVE_LINK
+    if file_type == stat.S_IFDIR:
+        return REASON_ARCHIVE_DIRECTORY
+    if file_type not in (0, stat.S_IFREG):
+        return REASON_ARCHIVE_ENTRY_TYPE
+    return None
+
+
+def _is_suspicious_ratio(info) -> bool:
+    if info.compress_size <= 0:
+        return False
+    if info.file_size < MIN_RATIO_FILE_BYTES:
+        return False
+    return info.file_size > info.compress_size * MAX_COMPRESSION_RATIO
+
+
+def _read_member(archive, info) -> object:
+    """Read one member, bounded to the per-file limit, or return an error."""
+
+    try:
+        with archive.open(info) as member:
+            data = member.read(MAX_FILE_BYTES + 1)
+            if len(data) > MAX_FILE_BYTES:
+                return BundleArchiveError(REASON_ARCHIVE_FILE_TOO_LARGE)
+            if member.read(1):
+                return BundleArchiveError(REASON_ARCHIVE_FILE_TOO_LARGE)
+    except BundleArchiveError as error:
+        return error
+    except Exception:
+        return BundleArchiveError(REASON_ARCHIVE_INVALID)
+    return data
