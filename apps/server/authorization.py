@@ -159,6 +159,17 @@ def _commit_in_playground_history(repository, playground_id, commit_id):
         return False
 
 
+def playground_commit_is_published(repository, playground_id, commit_id):
+    """Return whether ``commit_id`` belongs to the named Playground history.
+
+    This is a read-only Git check used by the Work content service.  It makes
+    no actor decision; authorization is decided separately by
+    :func:`authorize_content_read`.
+    """
+
+    return _commit_in_playground_history(repository, playground_id, commit_id)
+
+
 def _commit_in_work_history(repository, playground_id, student_id, commit_id):
     try:
         ref = repository.work_ref(playground_id, student_id)
