@@ -1221,6 +1221,36 @@ class WorkCommitWriteTest(unittest.TestCase):
             b"2",
         )
 
+    def test_first_parent_history_stops_at_playground_boundary(self):
+        playground_id = "pg-history"
+        playground = self.publish_playground(playground_id)
+        first = self.write(playground_id, "student-1", playground.commit_id)
+        second = self.write(
+            playground_id,
+            "student-1",
+            playground.commit_id,
+            base_commit_id=first,
+            files=self.full_tree(playground.commit_id, work={"work/a.py": b"a"}),
+        )
+        third = self.write(
+            playground_id,
+            "student-1",
+            playground.commit_id,
+            base_commit_id=second,
+            files=self.full_tree(playground.commit_id, work={"work/a.py": b"b"}),
+        )
+
+        history = repository.list_first_parent_commits(
+            self.repository, third, playground.commit_id, 10
+        )
+        self.assertEqual(
+            [item.commit_id for item in history], [third, second, first]
+        )
+        self.assertEqual(history[-1].parent_commit_id, playground.commit_id)
+        self.assertNotIn(
+            playground.commit_id, [item.commit_id for item in history]
+        )
+
     def test_students_get_separate_refs(self):
         playground_id = "pg-multi"
         playground = self.publish_playground(playground_id)

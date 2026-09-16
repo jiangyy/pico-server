@@ -718,6 +718,88 @@ def resolve_work_head(repository, playground_id, student_id):
     return resolve_commit(repository, head)
 
 
+@dataclass(frozen=True)
+class CommitInfo:
+    """One commit of a linear first-parent history walk.
+
+    ``parent_commit_id`` is the commit's single Git parent, or ``None`` for a
+    root commit.  ``committed_at`` is the committer time as Unix seconds.
+    """
+
+    commit_id: str
+    parent_commit_id: str | None
+    committed_at: int
+
+
+def list_first_parent_commits(
+    repository, start_commit_id, stop_commit_id, limit
+):
+    """Return up to ``limit`` first-parent commits, newest first.
+
+    The walk starts at ``start_commit_id`` and never includes
+    ``stop_commit_id`` (exclusive), so a Work history stops exactly at its
+    pinned Playground commit.  Every returned commit must have exactly one
+    parent; a merge commit would make the history ambiguous and is rejected.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    start = _require_object_id(start_commit_id)
+    stop = (
+        None
+        if stop_commit_id is None
+        else _require_object_id(stop_commit_id)
+    )
+    if type(limit) is not int or limit <= 0:
+        raise RepositoryError("history limit must be a positive integer")
+    if stop is not None and start == stop:
+        return []
+
+    completed = _run_git(
+        (
+            "log",
+            "--first-parent",
+            "-n",
+            str(limit),
+            "--format=%H%x1f%P%x1f%ct",
+            start,
+        ),
+        cwd=repository.path,
+    )
+    if completed.returncode != 0:
+        raise RepositoryError("could not read commit history")
+
+    entries = []
+    for line in completed.stdout.decode("ascii", "replace").splitlines():
+        if not line:
+            continue
+        commit_id, separator, rest = line.partition("\x1f")
+        parents_field, separator_two, timestamp_field = rest.partition(
+            "\x1f"
+        )
+        if not separator or not separator_two:
+            raise RepositoryError("malformed commit history")
+        if stop is not None and commit_id == stop:
+            break
+        if _OBJECT_ID_PATTERN.match(commit_id) is None:
+            raise RepositoryError("malformed commit history")
+        parents = parents_field.split()
+        if len(parents) != 1:
+            raise RepositoryError("commit history is not linear")
+        try:
+            committed_at = int(timestamp_field)
+        except ValueError:
+            raise RepositoryError("malformed commit history") from None
+        entries.append(
+            CommitInfo(
+                commit_id=commit_id,
+                parent_commit_id=parents[0],
+                committed_at=committed_at,
+            )
+        )
+    return entries
+
+
 def list_commit_tree(repository, commit_id):
     """Recursively list one exact commit's tree without any checkout.
 

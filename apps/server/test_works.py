@@ -1729,5 +1729,86 @@ class WorkSyncDecodeTest(WorkTestBase):
                 self.assertIn(reason, works.REASON_CODES)
 
 
+class WorkHistoryTest(WorkTestBase):
+    """Bounded, newest-first Work history with an exclusive cursor."""
+
+    def setUp(self):
+        super().setUp()
+        self.playground_id = "pg-work-history"
+        self.create_playground(self.admin, self.playground_id)
+        self.make_public(self.playground_id)
+        self.playground_commit_id = self.publish(
+            self.admin, self.playground_id
+        ).commit_id
+        self.first = works.create_work_commit(
+            self.connection,
+            self.student,
+            self.repository,
+            self.playground_id,
+            self.playground_commit_id,
+            self.work_files({"work/main.py": b"first"}),
+        )
+        self.second = works.create_work_commit(
+            self.connection,
+            self.student,
+            self.repository,
+            self.playground_id,
+            self.playground_commit_id,
+            self.work_files({"work/main.py": b"second"}),
+            base_commit_id=self.first.commit_id,
+        )
+
+    def history(self, **kwargs):
+        return works.list_work_history(
+            self.repository,
+            self.playground_id,
+            self.student.id,
+            **kwargs,
+        )
+
+    def test_history_is_newest_first_and_bounded(self):
+        page = self.history(limit=1)
+        self.assertEqual(len(page.entries), 1)
+        self.assertEqual(
+            page.entries[0].work_commit_id, self.second.commit_id
+        )
+        self.assertEqual(
+            page.entries[0].parent_work_commit_id, self.first.commit_id
+        )
+        self.assertEqual(
+            page.entries[0].playground_commit_id,
+            self.playground_commit_id,
+        )
+        self.assertEqual(page.next_cursor, self.second.commit_id)
+
+        rest = self.history(cursor=page.next_cursor, limit=1)
+        self.assertEqual(
+            [entry.work_commit_id for entry in rest.entries],
+            [self.first.commit_id],
+        )
+        self.assertIsNone(rest.entries[0].parent_work_commit_id)
+        self.assertIsNone(rest.next_cursor)
+
+    def test_history_without_work_is_empty(self):
+        other = self.create_user("student")
+        page = works.list_work_history(
+            self.repository,
+            self.playground_id,
+            other.id,
+            limit=50,
+        )
+        self.assertEqual(page.entries, ())
+        self.assertIsNone(page.next_cursor)
+
+    def test_history_rejects_foreign_and_malformed_cursors(self):
+        for cursor in (self.other_student.id, "x", "0" * 40, "short"):
+            with self.subTest(cursor=cursor):
+                with self.assertRaises(works.WorkValidationError) as caught:
+                    self.history(cursor=cursor, limit=1)
+                self.assertEqual(
+                    caught.exception.reason, works.REASON_INVALID_CURSOR
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3775,6 +3775,339 @@ class WorkSyncApiTest(unittest.TestCase):
                 (status, body["code"]), (404, "not_found"), bad
             )
 
+    # ----- Work content reads --------------------------------------------
+
+    def _raw_work_file(self, path, method="GET", token=None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+        return status, response_headers, body
+
+    @staticmethod
+    def _work_file_path(playground_id, commit_id, encoded_path):
+        return (
+            f"/api/v1/works/{playground_id}/commits/{commit_id}"
+            f"/files/{encoded_path}"
+        )
+
+    def test_work_content_head_manifest_and_file_flow(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.request(
+            "GET", f"/api/v1/works/{playground_id}/head", token=token
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {
+                "work/main.py": b"print('work')\n",
+                "work/data.bin": b"\x00\xff",
+                "work/empty.bin": b"",
+            },
+        )
+        self.assertEqual(status, 201)
+        work_commit_id = body["workCommitId"]
+
+        status, _, body = self.request(
+            "GET", f"/api/v1/works/{playground_id}/head", token=token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["work"],
+            {
+                "playgroundId": playground_id,
+                "workCommitId": work_commit_id,
+                "playgroundCommitId": commit_id,
+            },
+        )
+
+        manifest_path = (
+            f"/api/v1/works/{playground_id}/commits/{work_commit_id}"
+            "/manifest"
+        )
+        status, _, body = self.request("GET", manifest_path, token=token)
+        self.assertEqual(status, 200)
+        manifest = body["manifest"]
+        self.assertEqual(manifest["workCommitId"], work_commit_id)
+        self.assertEqual(manifest["playgroundCommitId"], commit_id)
+        self.assertEqual(
+            [item["path"] for item in manifest["files"]],
+            ["data.bin", "empty.bin", "main.py"],
+        )
+
+        file_path = self._work_file_path(
+            playground_id, work_commit_id, "data.bin"
+        )
+        status, headers, body = self._raw_work_file(file_path, token=token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"\x00\xff")
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(headers["content-length"], "2")
+
+        status, headers, body = self._raw_work_file(
+            self._work_file_path(playground_id, work_commit_id, "empty.bin"),
+            token=token,
+        )
+        self.assertEqual((status, body), (200, b""))
+
+        # HEAD has the GET status and headers with an empty body.
+        status, headers, body = self._raw_work_file(
+            file_path, method="HEAD", token=token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertEqual(headers["content-length"], "2")
+
+    def test_work_content_history_pagination_and_cursor(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        _, _, first = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"first"}
+        )
+        _, _, second = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"second"},
+            base=first["workCommitId"],
+        )
+        first_id = first["workCommitId"]
+        second_id = second["workCommitId"]
+
+        status, _, body = self.request(
+            "GET", f"/api/v1/works/{playground_id}/history", token=token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["workCommitId"] for item in body["commits"]],
+            [second_id, first_id],
+        )
+        self.assertEqual(
+            body["commits"][0]["parentWorkCommitId"], first_id
+        )
+        self.assertIsNone(body["commits"][1]["parentWorkCommitId"])
+        self.assertIsNone(body["nextCursor"])
+
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/works/{playground_id}/history?limit=1",
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["workCommitId"] for item in body["commits"]], [second_id]
+        )
+        self.assertEqual(body["nextCursor"], second_id)
+
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/works/{playground_id}/history?limit=1&cursor={second_id}",
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["workCommitId"] for item in body["commits"]], [first_id]
+        )
+        self.assertIsNone(body["nextCursor"])
+
+    def test_work_content_history_query_validation(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        self.sync(token, playground_id, commit_id, {"work/main.py": b"x"})
+
+        for query in (
+            "?limit=0",
+            "?limit=101",
+            "?limit=",
+            "?limit=1&limit=2",
+            "?limit=1.0",
+            "?limit=-1",
+            "?unknown=1",
+            "?cursor=",
+            "?cursor=" + "0" * 40,
+            "?cursor=not-a-commit",
+        ):
+            with self.subTest(query=query):
+                status, _, body = self.request(
+                    "GET",
+                    f"/api/v1/works/{playground_id}/history{query}",
+                    token=token,
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["code"], "invalid_request")
+
+        # A cursor from another Student's Work is not in this history.
+        other = self.seed_user("student")
+        other_token = self.login_token(other.username)
+        _, _, other_body = self.sync(
+            other_token, playground_id, commit_id, {"work/main.py": b"other"}
+        )
+        other_cursor = other_body["workCommitId"]
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/works/{playground_id}/history?cursor={other_cursor}",
+            token=token,
+        )
+        self.assertEqual(status, 400)
+
+    def test_work_content_hidden_denials(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        _, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"x"}
+        )
+        work_commit_id = body["workCommitId"]
+        manifest_path = (
+            f"/api/v1/works/{playground_id}/commits/{work_commit_id}"
+            "/manifest"
+        )
+
+        # Anonymous and an invalid session stay 401.
+        for bad_token in (None, "not-a-session"):
+            status, _, _ = self.request(
+                "GET", f"/api/v1/works/{playground_id}/head", token=bad_token
+            )
+            self.assertEqual(status, 401)
+            status, _, _ = self.request(
+                "GET", manifest_path, token=bad_token
+            )
+            self.assertEqual(status, 401)
+
+        # Another Student sees an empty own history, but the same hidden 404
+        # as an unknown Work resource for the head, manifest, and file.
+        other = self.seed_user("student")
+        other_token = self.login_token(other.username)
+        for path in (
+            f"/api/v1/works/{playground_id}/head",
+            manifest_path,
+            self._work_file_path(playground_id, work_commit_id, "main.py"),
+        ):
+            status, _, response = self.request("GET", path, token=other_token)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(response["code"], "not_found")
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/works/{playground_id}/history",
+            token=other_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["commits"], [])
+
+        # A Teacher and an Admin receive the hidden 404 on every route.
+        for role in ("teacher", "admin"):
+            user = self.seed_user(role)
+            user_token = self.login_token(user.username)
+            for path in (
+                f"/api/v1/works/{playground_id}/head",
+                f"/api/v1/works/{playground_id}/history",
+                manifest_path,
+                self._work_file_path(
+                    playground_id, work_commit_id, "main.py"
+                ),
+            ):
+                status, _, response = self.request(
+                    "GET", path, token=user_token
+                )
+                self.assertEqual(status, 404, (role, path))
+                self.assertEqual(response["code"], "not_found")
+
+    def test_work_content_file_path_rejections(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        _, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"x"}
+        )
+        work_commit_id = body["workCommitId"]
+        for encoded in (
+            "..%2fsecret.py",
+            "..%5csecret.py",
+            "missing.py",
+            "course%2fmodule%2fapp.py",
+            ".picopg%2fwork.json",
+            "work%2fmain.py",
+        ):
+            with self.subTest(encoded=encoded):
+                status, _, response = self.request(
+                    "GET",
+                    self._work_file_path(
+                        playground_id, work_commit_id, encoded
+                    ),
+                    token=token,
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(response["code"], "not_found")
+
+        status, _, response = self.request(
+            "GET",
+            f"/api/v1/works/{playground_id}/commits/not-a-commit/manifest",
+            token=token,
+        )
+        self.assertEqual((status, response["code"]), (404, "not_found"))
+
+    def test_work_content_reads_do_not_mutate(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        _, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"x"}
+        )
+        work_commit_id = body["workCommitId"]
+        ref = self.server.repository.work_ref(playground_id, student.id)
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-C", str(self.repository_path), *arguments],
+                capture_output=True,
+                check=True,
+            ).stdout
+
+        before_ref = git("rev-parse", ref)
+        connection = open_database(self.database_path)
+        try:
+            before = connection.execute(
+                "SELECT COUNT(*) AS n FROM submissions"
+            ).fetchone()["n"]
+        finally:
+            connection.close()
+
+        for path in (
+            f"/api/v1/works/{playground_id}/head",
+            f"/api/v1/works/{playground_id}/history",
+            f"/api/v1/works/{playground_id}/commits/{work_commit_id}/manifest",
+        ):
+            _, _, _ = self.request("GET", path, token=token)
+        self._raw_work_file(
+            self._work_file_path(playground_id, work_commit_id, "main.py"),
+            token=token,
+        )
+
+        self.assertEqual(git("rev-parse", ref), before_ref)
+        connection = open_database(self.database_path)
+        try:
+            after = connection.execute(
+                "SELECT COUNT(*) AS n FROM submissions"
+            ).fetchone()["n"]
+        finally:
+            connection.close()
+        self.assertEqual(after, before)
+
 
 class WorkRestoreApiTest(unittest.TestCase):
     """HTTP contract for the append-only Work restoration endpoint."""

@@ -15,6 +15,7 @@ record cannot be told apart from an unreadable one.
 
 import base64
 import json
+import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,12 +32,16 @@ __all__ = [
     "WorkError",
     "WorkValidationError",
     "WorkCommit",
+    "WorkHistoryEntry",
+    "WorkHistory",
     "WorkSyncRequest",
     "WorkRestoreRequest",
     "validate_work_files",
     "decode_work_sync_request",
     "decode_work_restore_request",
     "current_work_head",
+    "current_work_head_info",
+    "list_work_history",
     "create_work_commit",
     "restore_work_commit",
     "MAX_WORK_ENTRY_COUNT",
@@ -80,6 +85,7 @@ __all__ = [
     "REASON_INVALID_PAYLOAD",
     "REASON_INVALID_FILES",
     "REASON_INVALID_BASE64",
+    "REASON_INVALID_CURSOR",
     "REASON_SOURCE_TREE_INVALID",
 ]
 
@@ -138,6 +144,7 @@ REASON_WORK_PLAYGROUND_MISMATCH = "work_playground_mismatch"
 REASON_INVALID_PAYLOAD = "invalid_payload"
 REASON_INVALID_FILES = "invalid_files"
 REASON_INVALID_BASE64 = "invalid_base64"
+REASON_INVALID_CURSOR = "invalid_cursor"
 REASON_SOURCE_TREE_INVALID = "source_tree_invalid"
 
 REASON_CODES = frozenset(
@@ -171,6 +178,7 @@ REASON_CODES = frozenset(
         REASON_INVALID_PAYLOAD,
         REASON_INVALID_FILES,
         REASON_INVALID_BASE64,
+        REASON_INVALID_CURSOR,
         REASON_SOURCE_TREE_INVALID,
     }
 )
@@ -241,6 +249,29 @@ class WorkRestoreRequest:
 
     base_commit_id: str
     source_commit_id: str
+
+
+@dataclass(frozen=True)
+class WorkHistoryEntry:
+    """One Work commit in a bounded, newest-first Work history page."""
+
+    work_commit_id: str
+    playground_commit_id: str
+    parent_work_commit_id: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class WorkHistory:
+    """One page of Work history plus the exclusive cursor for the next page."""
+
+    entries: tuple
+    next_cursor: str | None
+
+
+# Git object IDs are lowercase hexadecimal; a cursor must be the exact full
+# width so a symbolic name or short prefix can never be treated as a commit.
+_FULL_OBJECT_ID = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
 
 
 # Maps the shared portable-path reason codes (owned by ``bundles``) to the
@@ -580,6 +611,90 @@ def current_work_head(repository, playground_id, student_id):
     return repository_module.resolve_work_head(
         repository, playground_id, student_id
     )
+
+
+def current_work_head_info(repository, playground_id, student_id):
+    """Return ``(work_commit_id, playground_commit_id)`` or ``None``.
+
+    The pinned Playground commit is read from the Server-owned Work metadata,
+    so a malformed or missing manifest fails closed with
+    :class:`WorkValidationError` instead of returning a partial head.
+    """
+
+    head = repository_module.resolve_work_head(
+        repository, playground_id, student_id
+    )
+    if head is None:
+        return None
+    pinned = _read_base_work_playground_commit_id(repository, head)
+    return head, pinned
+
+
+def _canonical_timestamp(epoch_seconds):
+    return (
+        datetime.fromtimestamp(epoch_seconds, timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    )
+
+
+def list_work_history(
+    repository, playground_id, student_id, *, cursor=None, limit=50
+):
+    """Return one bounded page of Work history, newest first.
+
+    The walk follows the exact Student/Playground Work ref and stops at the
+    pinned Playground commit, so it can never descend into Playground history
+    or another Work.  ``cursor`` is an exclusive full Work commit id that must
+    belong to this exact history; a malformed or out-of-history cursor raises
+    :class:`WorkValidationError` with :data:`REASON_INVALID_CURSOR`.
+    """
+
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise WorkValidationError(REASON_INVALID_CURSOR)
+
+    head = repository_module.resolve_work_head(
+        repository, playground_id, student_id
+    )
+    if head is None:
+        return WorkHistory(entries=(), next_cursor=None)
+    pinned = _read_base_work_playground_commit_id(repository, head)
+
+    if cursor is None:
+        commits = repository_module.list_first_parent_commits(
+            repository, head, pinned, limit + 1
+        )
+    else:
+        if type(cursor) is not str or not _FULL_OBJECT_ID.match(cursor):
+            raise WorkValidationError(REASON_INVALID_CURSOR)
+        if not authorization._commit_in_work_history(
+            repository, playground_id, student_id, cursor
+        ):
+            raise WorkValidationError(REASON_INVALID_CURSOR)
+        # The cursor is exclusive: drop the cursor commit itself.
+        commits = repository_module.list_first_parent_commits(
+            repository, cursor, pinned, limit + 2
+        )
+        if commits and commits[0].commit_id == cursor:
+            commits = commits[1:]
+        else:
+            raise WorkValidationError(REASON_INVALID_CURSOR)
+
+    page = commits[:limit]
+    next_cursor = page[-1].commit_id if len(commits) > limit else None
+    entries = tuple(
+        WorkHistoryEntry(
+            work_commit_id=info.commit_id,
+            playground_commit_id=pinned,
+            parent_work_commit_id=(
+                None
+                if info.parent_commit_id == pinned
+                else info.parent_commit_id
+            ),
+            created_at=_canonical_timestamp(info.committed_at),
+        )
+        for info in page
+    )
+    return WorkHistory(entries=entries, next_cursor=next_cursor)
 
 
 def create_work_commit(

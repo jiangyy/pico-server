@@ -7,12 +7,13 @@ from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import audit
 import authorization
 import manifests
 import submissions
+import work_content
 import works
 from accounts import (
     ForbiddenActionError,
@@ -136,6 +137,8 @@ PLAYGROUND_COMMITS_SUFFIX = "/commits"
 WORKS_PATH = "/api/v1/works"
 WORK_SYNC_SUFFIX = "/sync"
 WORK_RESTORE_SUFFIX = "/restore"
+WORK_HEAD_SUFFIX = "/head"
+WORK_HISTORY_SUFFIX = "/history"
 COMMITS_SEGMENT = "commits"
 FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
@@ -255,6 +258,80 @@ def _match_work_restore(path):
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
+
+
+def _match_work_head(path):
+    """Return the playground ID in a Work head path, else None."""
+    prefix = WORKS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(WORK_HEAD_SUFFIX):
+        return None
+
+    playground_id = path[len(prefix): -len(WORK_HEAD_SUFFIX)]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
+def _match_work_history(path):
+    """Return the playground ID in a Work history path, else None."""
+    prefix = WORKS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(
+        WORK_HISTORY_SUFFIX
+    ):
+        return None
+
+    playground_id = path[len(prefix): -len(WORK_HISTORY_SUFFIX)]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
+def _work_commit_route_parts(path):
+    """Split ``.../works/<playground>/commits/<commit>/<tail>``.
+
+    Returns ``(playground_id, commit_id, tail)`` or ``None`` for any other
+    shape, so a missing or extra segment never matches.
+    """
+
+    prefix = WORKS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    parts = path[len(prefix):].split("/", 3)
+    if len(parts) != 4:
+        return None
+    playground_id, segment, commit_id, tail = parts
+    if segment != COMMITS_SEGMENT or not playground_id or not commit_id:
+        return None
+    return playground_id, commit_id, tail
+
+
+def _match_work_manifest(path):
+    """Return ``(playground_id, commit_id)`` for a Work manifest path."""
+
+    parts = _work_commit_route_parts(path)
+    if parts is None:
+        return None
+    playground_id, commit_id, tail = parts
+    if tail != MANIFEST_SEGMENT:
+        return None
+    return playground_id, commit_id
+
+
+def _match_work_commit_files(path):
+    """Return ``(playground_id, commit_id, encoded_path)`` for a Work file."""
+
+    parts = _work_commit_route_parts(path)
+    if parts is None:
+        return None
+    playground_id, commit_id, tail = parts
+    prefix = FILES_SEGMENT + "/"
+    if not tail.startswith(prefix):
+        return None
+    encoded_path = tail[len(prefix):]
+    if not encoded_path:
+        return None
+    return playground_id, commit_id, encoded_path
 
 
 def _match_playground_commit(path):
@@ -416,6 +493,14 @@ def _allowed_methods(path):
         return ("POST",)
     if _match_work_restore(path) is not None:
         return ("POST",)
+    if _match_work_head(path) is not None:
+        return ALLOWED_METHODS
+    if _match_work_history(path) is not None:
+        return ALLOWED_METHODS
+    if _match_work_manifest(path) is not None:
+        return ALLOWED_METHODS
+    if _match_work_commit_files(path) is not None:
+        return ALLOWED_METHODS
     if _match_manifest(path) is not None:
         return ALLOWED_METHODS
     if _match_commit_files(path) is not None:
@@ -647,6 +732,20 @@ class Handler(BaseHTTPRequestHandler):
         elif _match_commit_files(path) is not None:
             self._get_commit_file(
                 *_match_commit_files(path), head_only=head_only
+            )
+        elif _match_work_head(path) is not None:
+            self._get_work_head(_match_work_head(path), head_only=head_only)
+        elif _match_work_history(path) is not None:
+            self._get_work_history(
+                _match_work_history(path), head_only=head_only
+            )
+        elif _match_work_manifest(path) is not None:
+            self._get_work_manifest(
+                *_match_work_manifest(path), head_only=head_only
+            )
+        elif _match_work_commit_files(path) is not None:
+            self._get_work_commit_file(
+                *_match_work_commit_files(path), head_only=head_only
             )
         elif path == RELEASES_PATH:
             self._get_releases(head_only=head_only)
@@ -1009,6 +1108,220 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._respond_file(content.data, content.sha256, head_only=head_only)
+
+    def _get_work_head(self, playground_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        if actor.role != "student":
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        try:
+            info = works.current_work_head_info(
+                self.server.repository, playground_id, actor.id
+            )
+        except works.WorkError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+        if info is None:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        head, pinned = info
+        self._respond_json(
+            200,
+            {
+                "work": {
+                    "playgroundId": playground_id,
+                    "workCommitId": head,
+                    "playgroundCommitId": pinned,
+                }
+            },
+            head_only=head_only,
+        )
+
+    def _get_work_history(self, playground_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        if actor.role != "student":
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        parsed = self._parse_work_history_query()
+        if parsed is None:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        limit, cursor = parsed
+
+        try:
+            history = works.list_work_history(
+                self.server.repository,
+                playground_id,
+                actor.id,
+                cursor=cursor,
+                limit=limit,
+            )
+        except works.WorkValidationError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {
+                "commits": [
+                    {
+                        "workCommitId": entry.work_commit_id,
+                        "playgroundCommitId": entry.playground_commit_id,
+                        "parentWorkCommitId": entry.parent_work_commit_id,
+                        "createdAt": entry.created_at,
+                    }
+                    for entry in history.entries
+                ],
+                "nextCursor": history.next_cursor,
+            },
+            head_only=head_only,
+        )
+
+    def _parse_work_history_query(self):
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {"limit", "cursor"}:
+            return None
+        for values in pairs.values():
+            if len(values) != 1:
+                return None
+
+        limit = 50
+        if "limit" in pairs:
+            raw = pairs["limit"][0]
+            if not raw.isascii() or not raw.isdigit():
+                return None
+            limit = int(raw)
+            if not 1 <= limit <= 100:
+                return None
+
+        cursor = None
+        if "cursor" in pairs:
+            cursor = pairs["cursor"][0]
+            if not cursor:
+                return None
+        return limit, cursor
+
+    def _get_work_manifest(self, playground_id, commit_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        if actor.role != "student":
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        try:
+            with self._database() as connection:
+                manifest = work_content.get_work_manifest(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    actor.id,
+                    playground_id,
+                    commit_id,
+                )
+        except authorization.ContentAccessDeniedError:
+            self._deny_work_read(playground_id, commit_id, head_only=head_only)
+            return
+        except work_content.WorkContentError as error:
+            self._handle_work_content_error(
+                error, playground_id, commit_id, head_only
+            )
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {
+                "manifest": {
+                    "playgroundId": manifest.playground_id,
+                    "workCommitId": manifest.work_commit_id,
+                    "playgroundCommitId": manifest.playground_commit_id,
+                    "files": [
+                        {
+                            "path": item.path,
+                            "size": item.size,
+                            "sha256": item.sha256,
+                        }
+                        for item in manifest.files
+                    ],
+                }
+            },
+            head_only=head_only,
+        )
+
+    def _get_work_commit_file(
+        self, playground_id, commit_id, encoded_path, head_only=False
+    ):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        if actor.role != "student":
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        path = _decode_content_path(encoded_path)
+        if path is None:
+            self._deny_work_read(playground_id, commit_id, head_only=head_only)
+            return
+
+        try:
+            with self._database() as connection:
+                content = work_content.read_work_file(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    actor.id,
+                    playground_id,
+                    commit_id,
+                    path,
+                )
+        except authorization.ContentAccessDeniedError:
+            self._deny_work_read(playground_id, commit_id, head_only=head_only)
+            return
+        except work_content.WorkContentError as error:
+            self._handle_work_content_error(
+                error, playground_id, commit_id, head_only
+            )
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+
+        self._respond_file(content.data, content.sha256, head_only=head_only)
+
+    def _handle_work_content_error(
+        self, error, playground_id, commit_id, head_only
+    ):
+        if error.reason in (
+            work_content.REASON_PATH_NOT_FOUND,
+            work_content.REASON_PATH_NOT_ALLOWED,
+        ):
+            self._deny_work_read(playground_id, commit_id, head_only=head_only)
+            return
+        self._api_error(500, "internal_error", head_only=head_only)
+
+    def _deny_work_read(self, playground_id, commit_id, head_only=False):
+        self._audit_code = "content_denied"
+        self._audit_override = (
+            "work.read",
+            f"{playground_id}/{commit_id}",
+        )
+        self._respond_json(404, {"code": "not_found"}, head_only=head_only)
 
     def _post_admin_user(self):
         actor = self._authenticate()
