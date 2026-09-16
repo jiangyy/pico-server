@@ -9,6 +9,7 @@ authorization never depends on the generated cache.
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -109,10 +110,20 @@ class GeneratedCacheTest(unittest.TestCase):
         )
 
     def read_generated(self):
+        generation = generated.resolve_current_generation(self.generated_path)
         return {
-            filename: (self.generated_path / filename).read_bytes()
-            for filename in generated.GENERATED_FILENAMES
-            if (self.generated_path / filename).is_file()
+            generated.BOOTSTRAP_FILENAME: generation.bootstrap,
+            generated.ARTIFACT_INDEX_FILENAME: generation.artifact_index,
+        }
+
+    def generation_payloads(self, payloads):
+        return {
+            generated.BOOTSTRAP_FILENAME: payloads[
+                generated.BOOTSTRAP_FILENAME
+            ],
+            generated.ARTIFACT_INDEX_FILENAME: payloads[
+                generated.ARTIFACT_INDEX_FILENAME
+            ],
         }
 
     # ----- tests ---------------------------------------------------------
@@ -169,26 +180,120 @@ class GeneratedCacheTest(unittest.TestCase):
         second = self.rebuild()
 
         self.assertEqual(first, second)
-        self.assertEqual(self.read_generated(), first)
+        self.assertEqual(
+            self.read_generated(), self.generation_payloads(first)
+        )
 
     def test_delete_all_generated_files_then_rebuild_restores_them(self):
         self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
         self.write_artifact("v1", "runtime.exe", b"runtime")
         first = self.rebuild()
 
-        for filename in generated.GENERATED_FILENAMES:
-            (self.generated_path / filename).unlink()
+        shutil.rmtree(self.generated_path)
+        with self.assertRaises(generated.GeneratedCacheError):
+            self.read_generated()
 
-        self.assertEqual(self.read_generated(), {})
-        self.assertEqual(
-            list(self.generated_path.iterdir())
-            if self.generated_path.exists()
-            else [],
-            [],
-        )
         second = self.rebuild()
         self.assertEqual(first, second)
-        self.assertEqual(self.read_generated(), second)
+        self.assertEqual(
+            self.read_generated(), self.generation_payloads(second)
+        )
+
+    def test_publish_is_deterministic_and_pointer_is_durable(self):
+        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.write_artifact("v1", "runtime.exe", b"runtime")
+        payloads = self.rebuild()
+
+        # The pointer is canonical JSON naming the content-derived id.
+        pointer = (self.generated_path / generated.CURRENT_FILENAME).read_bytes()
+        self.assertTrue(pointer.endswith(b"\n"))
+        document = json.loads(pointer)
+        expected = generated.generation_id(
+            payloads[generated.BOOTSTRAP_FILENAME],
+            payloads[generated.ARTIFACT_INDEX_FILENAME],
+        )
+        self.assertEqual(document, {"generation": expected})
+        self.assertTrue(
+            (
+                self.generated_path
+                / generated.GENERATIONS_DIRNAME
+                / expected
+            ).is_dir()
+        )
+
+    def test_identical_rebuild_reuses_one_generation(self):
+        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.write_artifact("v1", "runtime.exe", b"runtime")
+        self.rebuild()
+        first = generated.resolve_current_generation(self.generated_path)
+        self.rebuild()
+        second = generated.resolve_current_generation(self.generated_path)
+        self.assertEqual(first.generation_id, second.generation_id)
+        entries = list(
+            (self.generated_path / generated.GENERATIONS_DIRNAME).iterdir()
+        )
+        self.assertEqual(
+            [entry.name for entry in entries], [first.generation_id]
+        )
+
+    def test_failed_pointer_replace_keeps_old_generation_current(self):
+        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.write_artifact("v1", "runtime.exe", b"runtime")
+        self.rebuild()
+        before = generated.resolve_current_generation(self.generated_path)
+
+        # A second public Playground changes authority, so the next rebuild
+        # builds a new generation and then fails while replacing the pointer.
+        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        original_replace = generated.os.replace
+
+        def failing_replace(source, destination, *arguments, **keywords):
+            if str(destination).endswith(generated.CURRENT_FILENAME):
+                raise OSError("pointer replace failed")
+            return original_replace(
+                source, destination, *arguments, **keywords
+            )
+
+        with mock.patch.object(
+            generated.os, "replace", side_effect=failing_replace
+        ):
+            with self.assertRaises(OSError):
+                self.rebuild()
+
+        after = generated.resolve_current_generation(self.generated_path)
+        self.assertEqual(after.generation_id, before.generation_id)
+
+    def test_corrupt_generation_is_rejected(self):
+        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.rebuild()
+        identifier = generated.resolve_current_generation(
+            self.generated_path
+        ).generation_id
+        target = (
+            self.generated_path
+            / generated.GENERATIONS_DIRNAME
+            / identifier
+            / generated.ARTIFACT_INDEX_FILENAME
+        )
+        target.write_bytes(b"{}\n")
+        with self.assertRaises(generated.GeneratedCacheError):
+            generated.resolve_current_generation(self.generated_path)
+
+    def test_symlinked_generation_is_rejected(self):
+        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.rebuild()
+        identifier = generated.resolve_current_generation(
+            self.generated_path
+        ).generation_id
+        directory = (
+            self.generated_path
+            / generated.GENERATIONS_DIRNAME
+            / identifier
+        )
+        shutil.rmtree(directory)
+        directory.symlink_to(self.artifacts_path)
+        with self.assertRaises(generated.GeneratedCacheError):
+            generated.resolve_current_generation(self.generated_path)
 
     def test_failure_before_replacement_keeps_old_output(self):
         self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)

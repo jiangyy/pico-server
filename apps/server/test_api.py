@@ -3180,7 +3180,14 @@ class GeneratedCacheApiTest(unittest.TestCase):
 
         status, body = self.request("GET", "/api/v1/catalog")
         self.assertEqual(status, 200)
-        self.assertEqual(body["catalog"], [])
+        self.assertEqual(
+            [
+                item
+                for item in body["catalog"]
+                if item["playgroundId"] == playground_id
+            ],
+            [],
+        )
 
         status, body = self.request(
             "GET",
@@ -3188,6 +3195,113 @@ class GeneratedCacheApiTest(unittest.TestCase):
             f"/commits/{commit_id}/manifest",
         )
         self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_publish_refreshes_generation_and_rebuild_failure_is_nonfatal(
+        self,
+    ):
+        token = self.seed_admin_token()
+        playground_id = f"public-{uuid.uuid4().hex[:8]}"
+        self.assertEqual(
+            self.request(
+                "POST", "/api/v1/playgrounds", {"id": playground_id}, token
+            )[0],
+            201,
+        )
+        self.assertEqual(
+            self.request(
+                "PATCH",
+                f"/api/v1/playgrounds/{playground_id}",
+                {"policy": "public"},
+                token,
+            )[0],
+            200,
+        )
+        status, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            token=token,
+            raw_body=self.build_zip(
+                (("picopg.json", self.MANIFEST), ("course/a.py", b"print(1)"))
+            ),
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+        self.assertEqual(status, 201)
+        commit_id = body["commitId"]
+
+        # The publish itself rebuilt the current generation from authority.
+        generation = generated.resolve_current_generation(self.generated_path)
+        bootstrap = json.loads(generation.bootstrap)
+        self.assertEqual(
+            bootstrap["catalog"],
+            [{"playgroundId": playground_id, "commitId": commit_id}],
+        )
+
+        # A failed post-authority rebuild preserves authority and still
+        # returns the mutation's success response.
+        second_id = f"public-{uuid.uuid4().hex[:8]}"
+        self.assertEqual(
+            self.request(
+                "POST", "/api/v1/playgrounds", {"id": second_id}, token
+            )[0],
+            201,
+        )
+        self.assertEqual(
+            self.request(
+                "PATCH",
+                f"/api/v1/playgrounds/{second_id}",
+                {"policy": "public"},
+                token,
+            )[0],
+            200,
+        )
+        with mock.patch.object(
+            generated,
+            "rebuild",
+            side_effect=generated.GeneratedCacheError("injected"),
+        ):
+            status, body = self.request(
+                "POST",
+                f"/api/v1/playgrounds/{second_id}/commits",
+                token=token,
+                raw_body=self.build_zip(
+                    (
+                        ("picopg.json", self.MANIFEST),
+                        ("course/b.py", b"print(2)"),
+                    )
+                ),
+                content_type="application/zip",
+                extra_headers={"Idempotency-Key": uuid.uuid4().hex},
+            )
+        self.assertEqual(status, 201)
+        second_commit = body["commitId"]
+
+        # The old generation is still current; authority is intact.
+        preserved = generated.resolve_current_generation(self.generated_path)
+        self.assertEqual(preserved.generation_id, generation.generation_id)
+        status, body = self.request(
+            "GET", f"/api/v1/playgrounds/{second_id}"
+            f"/commits/{second_commit}/manifest"
+        )
+        self.assertEqual(status, 200)
+
+        # A later rebuild converges to current authority.
+        connection = open_database(self.database_path)
+        try:
+            generated.rebuild(
+                self.generated_path,
+                connection=connection,
+                repository=self.server.repository,
+                artifacts_path=self.artifacts_path,
+            )
+        finally:
+            connection.close()
+        refreshed = generated.resolve_current_generation(self.generated_path)
+        catalog = json.loads(refreshed.bootstrap)["catalog"]
+        self.assertEqual(
+            {item["playgroundId"] for item in catalog},
+            {playground_id, second_id},
+        )
 
 
 class WorkSyncApiTest(unittest.TestCase):

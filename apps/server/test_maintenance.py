@@ -212,7 +212,11 @@ class MaintenanceTest(unittest.TestCase):
             artifacts_path=restore_dir / "artifacts",
         )
         self.assertTrue(
-            (restore_dir / "generated" / "catalog.json").is_file()
+            (
+                restore_dir
+                / "generated"
+                / generated.CURRENT_FILENAME
+            ).is_file()
         )
 
         # Representative reads go through the restored authority only.

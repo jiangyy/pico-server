@@ -141,10 +141,20 @@ class CrossStoreFailureTest(unittest.TestCase):
         )
 
     def read_generated(self):
+        generation = generated.resolve_current_generation(self.generated_path)
         return {
-            filename: (self.generated_path / filename).read_bytes()
-            for filename in generated.GENERATED_FILENAMES
-            if (self.generated_path / filename).is_file()
+            generated.BOOTSTRAP_FILENAME: generation.bootstrap,
+            generated.ARTIFACT_INDEX_FILENAME: generation.artifact_index,
+        }
+
+    def generation_payloads(self, payloads):
+        return {
+            generated.BOOTSTRAP_FILENAME: payloads[
+                generated.BOOTSTRAP_FILENAME
+            ],
+            generated.ARTIFACT_INDEX_FILENAME: payloads[
+                generated.ARTIFACT_INDEX_FILENAME
+            ],
         }
 
     def git(self, *arguments):
@@ -311,7 +321,9 @@ class CrossStoreFailureTest(unittest.TestCase):
             {item["playgroundId"] for item in catalog},
             {first_id, second_id},
         )
-        self.assertEqual(self.read_generated(), rebuilt)
+        self.assertEqual(
+            self.read_generated(), self.generation_payloads(rebuilt)
+        )
 
     # ----- 3. Idempotent callback fails --------------------------------
 

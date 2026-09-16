@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import audit
 import authorization
+import generated
 import manifests
 import submissions
 import work_content
@@ -1710,6 +1711,9 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(400, "invalid_request")
             return
 
+        if not self._refresh_generated():
+            self._audit_code = "generated_rebuild_failed"
+            self._audit_override = ("generated.rebuild", None)
         self._respond_json(status, body)
 
     def _post_work_sync(self, playground_id):
@@ -1853,6 +1857,26 @@ class Handler(BaseHTTPRequestHandler):
             "commitId": result.commit_id,
             "noOp": result.no_op,
         }
+
+    def _refresh_generated(self):
+        """Rebuild disposable caches after an authoritative mutation.
+
+        Authority is already committed, so a cache write failure never rolls
+        it back and never changes the mutation's response.  ``rebuild`` itself
+        preserves the previous complete generation on failure.
+        """
+
+        try:
+            with self._database() as connection:
+                generated.rebuild(
+                    self.server.generated_path,
+                    connection=connection,
+                    repository=self.server.repository,
+                    artifacts_path=self.server.artifacts_path,
+                )
+            return True
+        except Exception:
+            return False
 
     def _get_releases(self, head_only=False):
         actor = self._authenticate(head_only=head_only)
@@ -2320,6 +2344,9 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden")
             return
 
+        if not self._refresh_generated():
+            self._audit_code = "generated_rebuild_failed"
+            self._audit_override = ("generated.rebuild", None)
         self._respond_json(
             200,
             {"playground": self._playground_payload(playground)},
@@ -2636,6 +2663,31 @@ class AuditHTTPServer(ThreadingHTTPServer):
             pass
 
 
+def _initialize_generated(server):
+    """Build the first complete generation, or fail startup closed.
+
+    Startup never runs with absent bootstrap data.  ``generated.rebuild``
+    preserves a previously valid generation when a rebuild fails, but startup
+    still fails closed so a broken authoritative source cannot be masked by a
+    stale cache.
+    """
+
+    try:
+        with closing(open_database(server.database_path)) as connection:
+            generated.rebuild(
+                server.generated_path,
+                connection=connection,
+                repository=server.repository,
+                artifacts_path=server.artifacts_path,
+            )
+    except generated.GeneratedCacheError:
+        raise
+    except Exception as error:
+        raise generated.GeneratedCacheError(
+            "generated cache could not be initialized"
+        ) from error
+
+
 def make_server(
     host=HOST,
     port=PORT,
@@ -2682,6 +2734,7 @@ def make_server(
         clock=audit_clock,
         request_ids=audit_request_ids,
     )
+    _initialize_generated(server)
     return server
 
 
