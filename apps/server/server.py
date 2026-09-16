@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import audit
+import artifacts
 import authorization
 import generated
 import manifests
@@ -114,6 +115,8 @@ PORT = 8001
 DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
+BOOTSTRAP_PATH = "/api/v1/bootstrap"
+ARTIFACTS_PATH = "/api/v1/artifacts"
 MAX_JSON_BODY_BYTES = 16 * 1024
 # A Comment body may use the full Comment-domain byte ceiling, and JSON string
 # escaping can expand it several times over.  The comment route accepts a
@@ -515,11 +518,33 @@ def _match_submission_work_files(path):
     return submission_id, encoded_path
 
 
+def _match_artifact_version(path):
+    """Return the single decoded version segment for an artifact path.
+
+    The version is taken from the raw path exactly once; an encoded slash or
+    backslash stays literal text and can never become a path separator.
+    """
+
+    prefix = ARTIFACTS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+    version = path[len(prefix):]
+    if not version or "/" in version:
+        return None
+    return version
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
     if methods is not None:
         return methods
+    if path == BOOTSTRAP_PATH:
+        return ALLOWED_METHODS
+    if path == ARTIFACTS_PATH:
+        return ALLOWED_METHODS
+    if _match_artifact_version(path) is not None:
+        return ALLOWED_METHODS
     if path == ADMIN_USERS_PATH:
         return ("POST",)
     if _match_admin_user_role(path) is not None:
@@ -682,6 +707,20 @@ def _decode_content_path(encoded_path):
         return None
 
 
+def _content_disposition(filename):
+    """Return a safe attachment disposition for an indexed artifact name."""
+
+    safe = "".join(
+        character
+        for character in filename
+        if character.isascii()
+        and (character.isalnum() or character in "._-")
+    )
+    if not safe:
+        safe = "artifact"
+    return f'attachment; filename="{safe}"'
+
+
 def _commit_metadata(actor):
     """Build the trusted, server-owned commit identity for an actor."""
 
@@ -770,6 +809,14 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, "Pico service is running\n", head_only=head_only)
         elif path == "/healthz":
             self._respond(200, "ok\n", head_only=head_only)
+        elif path == BOOTSTRAP_PATH:
+            self._get_bootstrap(head_only=head_only)
+        elif path == ARTIFACTS_PATH:
+            self._get_artifact_index(head_only=head_only)
+        elif _match_artifact_version(path) is not None:
+            self._get_artifact(
+                _match_artifact_version(path), head_only=head_only
+            )
         elif path == "/api/v1/me":
             self._get_me(head_only=head_only)
         elif path == CLASSES_PATH:
@@ -1023,6 +1070,163 @@ class Handler(BaseHTTPRequestHandler):
             {"members": [self._membership_payload(item) for item in members]},
             head_only=head_only,
         )
+
+    def _current_generation(self):
+        """Resolve the current generation, rebuilding at most once."""
+
+        try:
+            return generated.resolve_current_generation(
+                self.server.generated_path
+            )
+        except generated.GeneratedCacheError:
+            pass
+        try:
+            with self._database() as connection:
+                generated.rebuild(
+                    self.server.generated_path,
+                    connection=connection,
+                    repository=self.server.repository,
+                    artifacts_path=self.server.artifacts_path,
+                )
+            return generated.resolve_current_generation(
+                self.server.generated_path
+            )
+        except Exception:
+            return None
+
+    def _get_bootstrap(self, head_only=False):
+        self._respond_generation_file(
+            generated.BOOTSTRAP_FILENAME, head_only=head_only
+        )
+
+    def _get_artifact_index(self, head_only=False):
+        self._respond_generation_file(
+            generated.ARTIFACT_INDEX_FILENAME, head_only=head_only
+        )
+
+    def _respond_generation_file(self, name, head_only=False):
+        if self._reject_query_or_body(head_only=head_only):
+            return
+        generation = self._current_generation()
+        if generation is None:
+            self._api_error(
+                503, "generated_unavailable", head_only=head_only
+            )
+            return
+        data = (
+            generation.bootstrap
+            if name == generated.BOOTSTRAP_FILENAME
+            else generation.artifact_index
+        )
+        self._respond_bytes(
+            200,
+            data,
+            content_type="application/json; charset=utf-8",
+            etag=hashlib.sha256(data).hexdigest(),
+            head_only=head_only,
+        )
+
+    def _get_artifact(self, version, head_only=False):
+        if self._reject_query_or_body(head_only=head_only):
+            return
+        generation = self._current_generation()
+        if generation is None:
+            self._api_error(
+                503, "generated_unavailable", head_only=head_only
+            )
+            return
+        try:
+            entries = artifacts.mapping_to_index(
+                json.loads(generation.artifact_index)
+            )
+        except (ValueError, artifacts.ArtifactError):
+            self._api_error(
+                503, "generated_unavailable", head_only=head_only
+            )
+            return
+        entry = artifacts.entries_by_version(entries).get(version)
+        if entry is None:
+            self._audit_code = "not_found"
+            self._audit_override = ("artifact.read", version)
+            self._respond_json(
+                404, {"code": "not_found"}, head_only=head_only
+            )
+            return
+        try:
+            target = artifacts.verify_artifact(
+                self.server.artifacts_path, entry
+            )
+        except artifacts.ArtifactError:
+            self._audit_code = "artifact_unavailable"
+            self._audit_override = ("artifact.read", version)
+            self._api_error(
+                503, "artifact_unavailable", head_only=head_only
+            )
+            return
+        self._respond_bytes(
+            200,
+            None,
+            content_type="application/octet-stream",
+            etag=entry.sha256,
+            extra_headers=(
+                (
+                    "Content-Disposition",
+                    _content_disposition(entry.filename),
+                ),
+            ),
+            stream_path=target,
+            stream_size=entry.size,
+            head_only=head_only,
+        )
+
+    def _respond_bytes(
+        self,
+        status,
+        data,
+        *,
+        content_type,
+        etag=None,
+        extra_headers=(),
+        stream_path=None,
+        stream_size=None,
+        head_only=False,
+    ):
+        if etag is not None and self._if_none_match(etag):
+            self._respond_not_modified(head_only=head_only)
+            return
+        length = stream_size if stream_path is not None else len(data)
+        self.send_response(status)
+        self._send_request_id()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        if etag is not None:
+            self.send_header("ETag", f'"{etag}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in extra_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        if not head_only:
+            if stream_path is not None:
+                with open(stream_path, "rb") as handle:
+                    for chunk in iter(
+                        lambda: handle.read(1024 * 1024), b""
+                    ):
+                        self.wfile.write(chunk)
+            else:
+                self.wfile.write(data)
+        self._audit_status = status
+
+    def _if_none_match(self, etag):
+        header = self.headers.get("If-None-Match")
+        return header is not None and header.strip() == f'"{etag}"'
+
+    def _respond_not_modified(self, head_only=False):
+        self.send_response(304)
+        self._send_request_id()
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self._audit_status = 304
 
     def _get_catalog(self, head_only=False):
         actor = self._optional_actor(head_only=head_only)

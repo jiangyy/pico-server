@@ -39,6 +39,7 @@ __all__ = [
     "index_to_mapping",
     "mapping_to_index",
     "serve_artifact",
+    "verify_artifact",
 ]
 
 
@@ -217,6 +218,39 @@ def index_artifacts(root, previous=None):
         entries.append(entry)
 
     return entries
+
+
+def verify_artifact(root, entry):
+    """Verify ``entry``'s presence, size and digest without returning bytes.
+
+    Raises :class:`ArtifactError` on any containment, type, size or checksum
+    problem.  A caller can stream the file after this check; the file is never
+    executed, imported, or extracted.
+    """
+
+    if not isinstance(entry, ArtifactEntry):
+        raise TypeError("entry must be an ArtifactEntry")
+    if not _validate_segment(entry.version) or not _validate_segment(
+        entry.filename
+    ):
+        raise ArtifactError(REASON_INVALID_VERSION)
+
+    resolved_root = _real_directory(root)
+    if resolved_root is None:
+        raise ArtifactError(REASON_MISSING_ARTIFACT)
+
+    target = Path(root) / entry.version / entry.filename
+    if target.is_symlink():
+        raise ArtifactError(REASON_PATH_ESCAPE)
+    if not target.is_file():
+        raise ArtifactError(REASON_MISSING_ARTIFACT)
+    if not _contained(resolved_root, target):
+        raise ArtifactError(REASON_PATH_ESCAPE)
+    if target.stat().st_size != entry.size:
+        raise ArtifactError(REASON_CHECKSUM_MISMATCH)
+    if _digest(target) != entry.sha256:
+        raise ArtifactError(REASON_CHECKSUM_MISMATCH)
+    return target
 
 
 def serve_artifact(root, entry):

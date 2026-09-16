@@ -68,6 +68,21 @@ class ArtifactIndexTest(unittest.TestCase):
             caught.exception.reason, artifacts.REASON_CHECKSUM_MISMATCH
         )
 
+    def test_verify_artifact_checks_without_returning_bytes(self):
+        data = b"trusted-runtime"
+        self.write_artifact("v1", "runtime.exe", data)
+        entry = artifacts.index_artifacts(self.root)[0]
+
+        target = artifacts.verify_artifact(self.root, entry)
+        self.assertEqual(target.read_bytes(), data)
+
+        self.write_artifact("v1", "runtime.exe", b"tampered-runtime!")
+        with self.assertRaises(artifacts.ArtifactError) as caught:
+            artifacts.verify_artifact(self.root, entry)
+        self.assertEqual(
+            caught.exception.reason, artifacts.REASON_CHECKSUM_MISMATCH
+        )
+
     def test_resized_file_is_rejected(self):
         data = b"trusted-runtime"
         self.write_artifact("v1", "runtime.exe", data)

@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import io
 import json
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -3301,6 +3302,283 @@ class GeneratedCacheApiTest(unittest.TestCase):
         self.assertEqual(
             {item["playgroundId"] for item in catalog},
             {playground_id, second_id},
+        )
+
+
+class RuntimeDistributionApiTest(unittest.TestCase):
+    """HTTP contract for the unauthenticated runtime distribution endpoints."""
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        base = Path(self.temporary_directory.name)
+        self.database_path = base / "app.db"
+        self.repository_path = base / "picopg.git"
+        self.artifacts_path = base / "artifacts"
+        self.generated_path = base / "generated"
+        (self.artifacts_path / "v1").mkdir(parents=True)
+        (self.artifacts_path / "v1" / "runtime.exe").write_bytes(
+            b"runtime-bytes"
+        )
+        self.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=self.database_path,
+            repository_path=self.repository_path,
+            artifacts_path=self.artifacts_path,
+            generated_path=self.generated_path,
+            audit_output=io.StringIO(),
+        )
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+        return status, response_headers, response_body
+
+    def seed_admin_token(self):
+        username = f"admin-{uuid.uuid4().hex[:8]}"
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    "admin",
+                )
+        finally:
+            connection.close()
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return json.loads(body)["sessionToken"]
+
+    def build_zip(self, entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def test_bootstrap_and_index_byte_contract(self):
+        get_status, get_headers, get_body = self.request(
+            "GET", "/api/v1/bootstrap"
+        )
+        head_status, head_headers, head_body = self.request(
+            "HEAD", "/api/v1/bootstrap"
+        )
+        self.assertEqual(get_status, 200)
+        self.assertEqual(head_status, 200)
+        self.assertEqual(head_body, b"")
+        self.assertEqual(
+            head_headers["content-length"], get_headers["content-length"]
+        )
+        self.assertEqual(
+            get_headers["content-type"],
+            "application/json; charset=utf-8",
+        )
+        self.assertEqual(
+            int(get_headers["content-length"]), len(get_body)
+        )
+        self.assertEqual(
+            get_headers["etag"],
+            '"' + hashlib.sha256(get_body).hexdigest() + '"',
+        )
+        self.assertNotIn("set-cookie", get_headers)
+
+        status, headers, body = self.request(
+            "GET",
+            "/api/v1/bootstrap",
+            extra_headers={"If-None-Match": get_headers["etag"]},
+        )
+        self.assertEqual((status, body), (304, b""))
+
+        index_status, index_headers, index_body = self.request(
+            "GET", "/api/v1/artifacts"
+        )
+        self.assertEqual(index_status, 200)
+        self.assertEqual(
+            index_headers["etag"],
+            '"' + hashlib.sha256(index_body).hexdigest() + '"',
+        )
+        index = json.loads(index_body)
+        self.assertEqual(
+            [item["version"] for item in index["artifacts"]], ["v1"]
+        )
+        self.assertIn("runtime", get_body.decode("utf-8"))
+
+    def test_artifact_bytes_headers_and_head(self):
+        digest = hashlib.sha256(b"runtime-bytes").hexdigest()
+        status, headers, body = self.request(
+            "GET", "/api/v1/artifacts/v1"
+        )
+        self.assertEqual((status, body), (200, b"runtime-bytes"))
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(headers["content-length"], "13")
+        self.assertEqual(headers["etag"], f'"{digest}"')
+        self.assertEqual(headers["x-content-type-options"], "nosniff")
+        self.assertIn("runtime.exe", headers["content-disposition"])
+        self.assertNotIn("set-cookie", headers)
+
+        status, headers, body = self.request(
+            "HEAD", "/api/v1/artifacts/v1"
+        )
+        self.assertEqual((status, body), (200, b""))
+        self.assertEqual(headers["content-length"], "13")
+        self.assertEqual(headers["etag"], f'"{digest}"')
+
+        status, _, body = self.request(
+            "GET",
+            "/api/v1/artifacts/v1",
+            extra_headers={"If-None-Match": f'"{digest}"'},
+        )
+        self.assertEqual((status, body), (304, b""))
+
+    def test_unknown_and_malformed_versions_are_hidden(self):
+        for path in (
+            "/api/v1/artifacts/missing",
+            "/api/v1/artifacts/runtime.exe",
+            "/api/v1/artifacts/%2e%2e",
+            "/api/v1/artifacts/a%2fb",
+            "/api/v1/artifacts/a%5cb",
+            "/api/v1/artifacts/..",
+        ):
+            with self.subTest(path=path):
+                status, _, body = self.request("GET", path)
+                self.assertEqual(status, 404)
+                self.assertEqual(json.loads(body)["code"], "not_found")
+
+    def test_tampered_and_missing_artifacts_return_stable_503(self):
+        target = self.artifacts_path / "v1" / "runtime.exe"
+        target.write_bytes(b"tampered-bytes")
+        status, _, body = self.request("GET", "/api/v1/artifacts/v1")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["code"], "artifact_unavailable")
+
+        target.unlink()
+        status, _, body = self.request("GET", "/api/v1/artifacts/v1")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["code"], "artifact_unavailable")
+
+    def test_symlinked_artifact_returns_stable_503(self):
+        target = self.artifacts_path / "v1" / "runtime.exe"
+        target.unlink()
+        target.symlink_to(self.artifacts_path / "v1")
+        status, _, body = self.request("GET", "/api/v1/artifacts/v1")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["code"], "artifact_unavailable")
+
+    def test_missing_generated_cache_triggers_one_rebuild(self):
+        shutil.rmtree(self.generated_path)
+        status, _, body = self.request("GET", "/api/v1/bootstrap")
+        self.assertEqual(status, 200)
+        self.assertIn(b"catalog", body)
+
+        (self.generated_path / generated.CURRENT_FILENAME).write_bytes(
+            b"not json"
+        )
+        status, _, body = self.request("GET", "/api/v1/bootstrap")
+        self.assertEqual(status, 200)
+
+        with mock.patch.object(
+            generated,
+            "rebuild",
+            side_effect=generated.GeneratedCacheError("injected"),
+        ):
+            shutil.rmtree(self.generated_path)
+            status, _, body = self.request("GET", "/api/v1/bootstrap")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["code"], "generated_unavailable")
+
+    def test_publish_becomes_visible_without_restart(self):
+        token = self.seed_admin_token()
+        playground_id = f"public-{uuid.uuid4().hex[:8]}"
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/api/v1/playgrounds",
+                {"id": playground_id},
+                token=token,
+            )[0],
+            201,
+        )
+        self.assertEqual(
+            self.request(
+                "PATCH",
+                f"/api/v1/playgrounds/{playground_id}",
+                {"policy": "public"},
+                token=token,
+            )[0],
+            200,
+        )
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            token=token,
+            raw_body=self.build_zip(
+                (("picopg.json", self.MANIFEST), ("course/a.py", b"print(1)"))
+            ),
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+        self.assertEqual(status, 201)
+        commit_id = json.loads(body)["commitId"]
+
+        status, _, body = self.request("GET", "/api/v1/bootstrap")
+        self.assertEqual(status, 200)
+        bootstrap = json.loads(body)
+        self.assertEqual(
+            bootstrap["catalog"],
+            [{"playgroundId": playground_id, "commitId": commit_id}],
         )
 
 
