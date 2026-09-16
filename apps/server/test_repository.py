@@ -619,6 +619,50 @@ class PlaygroundPublishingTest(unittest.TestCase):
                 if "refs/" in argument:
                     self.assertEqual(argument, expected_ref)
 
+    def test_invalid_playground_ids_never_start_git(self):
+        seen = []
+        original = repository._run_git
+
+        def spy(arguments, cwd=None, stdin=None, environment=None):
+            seen.append(tuple(arguments))
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        invalid = (
+            "",
+            "../escape",
+            "bad/id",
+            "bad\\id",
+            "bad id",
+            "bad%2fid",
+            ".leading",
+            "trailing.",
+            "double..dot",
+            "name.lock",
+            "NAME.LOCK",
+            "caf\u00e9",
+            "has\x01control",
+            "a" * 129,
+            None,
+            7,
+        )
+        with mock.patch.object(repository, "_run_git", spy):
+            for playground_id in invalid:
+                with self.subTest(playground_id=playground_id):
+                    with self.assertRaises(RepositoryError):
+                        self.repository.playground_ref(playground_id)
+                    with self.assertRaises(RepositoryError):
+                        self.repository.work_ref(playground_id, "student-1")
+        self.assertEqual(seen, [])
+
+        self.assertFalse(repository.valid_playground_id("a" * 129))
+        self.assertFalse(repository.valid_playground_id("a..b"))
+        self.assertFalse(repository.valid_playground_id("bad/id"))
+        self.assertTrue(repository.valid_playground_id("a"))
+        self.assertTrue(repository.valid_playground_id("a" * 128))
+        self.assertTrue(repository.valid_playground_id("A-z.0_9"))
+
     def test_environment_redirection_is_sanitized(self):
         decoy_path = Path(self.temporary_directory.name) / "decoy.git"
         open_repository(decoy_path)

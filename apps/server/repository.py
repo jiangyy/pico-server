@@ -43,14 +43,14 @@ class Repository:
 
     def playground_ref(self, opaque_id):
         """Return the Playground ref for ``opaque_id``."""
-        _validate_identifier(opaque_id, "playground id")
+        validate_playground_id(opaque_id)
         ref = f"refs/heads/playgrounds/{opaque_id}"
         _check_ref_format(ref)
         return ref
 
     def work_ref(self, playground_id, student_id):
         """Return the Work ref for ``playground_id`` and ``student_id``."""
-        _validate_identifier(playground_id, "playground id")
+        validate_playground_id(playground_id)
         _validate_identifier(student_id, "student id")
         ref = f"refs/heads/works/{playground_id}/{student_id}"
         _check_ref_format(ref)
@@ -104,6 +104,37 @@ def _validate_identifier(value, label):
         raise RepositoryError(f"{label} must not end with .lock")
     if _CONTROL_CHARACTERS.search(value):
         raise RepositoryError(f"{label} contains a control character")
+
+
+# Playground identifiers are the only opaque IDs that must simultaneously be a
+# Git ref component, an HTTP path segment, and part of an idempotency endpoint.
+# The exact rule is deliberately narrower than ``_validate_identifier`` so a
+# metadata row can never name a route or ref the Server cannot represent.
+_PLAYGROUND_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def valid_playground_id(value):
+    """Return ``True`` for an exact, representable Playground identifier."""
+
+    if type(value) is not str:
+        return False
+    if _PLAYGROUND_ID_PATTERN.match(value) is None:
+        return False
+    if value.endswith("."):
+        return False
+    if ".." in value:
+        return False
+    if value.casefold().endswith(".lock"):
+        return False
+    return True
+
+
+def validate_playground_id(value):
+    """Return ``value`` when it is a valid Playground identifier."""
+
+    if not valid_playground_id(value):
+        raise RepositoryError("playground id is not valid")
+    return value
 
 
 def _check_ref_format(ref):

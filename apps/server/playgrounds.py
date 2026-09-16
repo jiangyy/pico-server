@@ -42,8 +42,8 @@ def _now():
 
 
 def _require_opaque_id(value):
-    if not isinstance(value, str) or not value:
-        raise InvalidRequestError("identifier must be a non-empty string")
+    if not _repository.valid_playground_id(value):
+        raise InvalidRequestError("playground id is not valid")
     return value
 
 

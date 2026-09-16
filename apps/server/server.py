@@ -82,6 +82,7 @@ from repository import (
     RepositoryError,
     WorkHeadChangedError,
     open_repository,
+    valid_playground_id,
 )
 from sessions import (
     InvalidCredentialsError,
@@ -850,6 +851,11 @@ class Handler(BaseHTTPRequestHandler):
             (PUBLIC_POLICY,),
         ).fetchall()
         for row in rows:
+            playground_id = row["id"]
+            if not valid_playground_id(playground_id):
+                raise RepositoryError(
+                    "stored playground identifier is invalid"
+                )
             commit_id = manifests.current_playground_commit(
                 self.server.repository, row["id"]
             )
@@ -1270,6 +1276,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         except MissingPlaygroundError:
             self._api_error(404, "not_found")
+            return
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
             return
         except PlaygroundHeadChangedError:
             self._api_error(409, "playground_head_changed")

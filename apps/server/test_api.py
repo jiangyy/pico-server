@@ -1529,6 +1529,48 @@ class PlaygroundApiTest(unittest.TestCase):
         for path in self.repository_path.rglob("*"):
             self.assertNotIn(playground_id, path.name)
 
+    def test_playground_creation_rejects_invalid_ids(self):
+        admin = self.seed_user("admin")
+        token = self.login_token(admin.username)
+        invalid_ids = (
+            "../escape",
+            "bad/id",
+            "bad\\id",
+            "bad id",
+            "bad%2fid",
+            ".leading",
+            "trailing.",
+            "double..dot",
+            "name.lock",
+            "NAME.LOCK",
+            "caf\u00e9",
+            "has\x01control",
+            "a" * 129,
+            "",
+        )
+        for playground_id in invalid_ids:
+            with self.subTest(playground_id=playground_id):
+                status, _, body = self.request(
+                    "POST",
+                    "/api/v1/playgrounds",
+                    {"id": playground_id},
+                    token=token,
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["code"], "invalid_request")
+
+        connection = open_database(self.database_path)
+        try:
+            stored = {
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM playgrounds"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+        self.assertEqual(stored.intersection(invalid_ids), set())
+
     def test_playground_mutation_validation(self):
         admin = self.seed_user("admin")
         admin_token = self.login_token(admin.username)

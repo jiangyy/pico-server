@@ -83,11 +83,49 @@ class PlaygroundDomainTest(unittest.TestCase):
             )
 
     def test_create_rejects_malformed_ids(self):
-        for playground_id in ("", None, 7):
-            with self.assertRaises(playgrounds.InvalidRequestError):
-                playgrounds.create_playground(
+        for playground_id in (
+            "",
+            None,
+            7,
+            "../escape",
+            "bad/id",
+            "bad\\id",
+            "bad id",
+            "bad%2fid",
+            ".leading",
+            "trailing.",
+            "double..dot",
+            "name.lock",
+            "NAME.LOCK",
+            "caf\u00e9",
+            "a" * 129,
+        ):
+            with self.subTest(playground_id=playground_id):
+                with self.assertRaises(playgrounds.InvalidRequestError):
+                    playgrounds.create_playground(
+                        self.connection, self.admin_actor, playground_id
+                    )
+
+    def test_identifier_length_boundaries_and_subclass(self):
+        for playground_id in ("a", "a" * 128, "A-z.0_9"):
+            with self.subTest(playground_id=playground_id):
+                created = playgrounds.create_playground(
                     self.connection, self.admin_actor, playground_id
                 )
+                self.assertEqual(created.id, playground_id)
+
+        with self.assertRaises(playgrounds.InvalidRequestError):
+            playgrounds.create_playground(
+                self.connection, self.admin_actor, "a" * 129
+            )
+
+        class Sneaky(str):
+            pass
+
+        with self.assertRaises(playgrounds.InvalidRequestError):
+            playgrounds.create_playground(
+                self.connection, self.admin_actor, Sneaky("pg-subclass")
+            )
 
     def test_policy_change_requires_admin(self):
         playgrounds.create_playground(
@@ -391,15 +429,35 @@ class PlaygroundPublishingTest(unittest.TestCase):
         )
         self.assertEqual(completed.stdout.strip().decode(), first.commit_id)
 
-    def test_unsafe_playground_id_is_rejected(self):
-        playgrounds.create_playground(
-            self.connection, self.admin_actor, "../escape"
-        )
-        with self.assertRaises(repository.RepositoryError):
+    def test_legacy_invalid_playground_row_is_fail_closed(self):
+        # A row that predates the identifier contract must never be silently
+        # deleted or rewritten; normal operations fail closed instead.
+        playground_id = "../escape"
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO playgrounds"
+                " (id, creator_id, policy, created_at, archived_at)"
+                " VALUES (?, ?, ?, ?, NULL)",
+                (
+                    playground_id,
+                    self.admin_actor.id,
+                    playgrounds.RELEASE_ONLY_POLICY,
+                    "2026-01-01T00:00:00.000000Z",
+                ),
+            )
+
+        with self.assertRaises(playgrounds.InvalidRequestError):
+            playgrounds.update_playground(
+                self.connection,
+                self.admin_actor,
+                playground_id,
+                {"archived": True},
+            )
+        with self.assertRaises(playgrounds.InvalidRequestError):
             playgrounds.publish_playground(
                 self.connection,
                 self.admin_actor,
-                "../escape",
+                playground_id,
                 self.repository,
                 self.make_bundle(),
                 self.metadata(),
