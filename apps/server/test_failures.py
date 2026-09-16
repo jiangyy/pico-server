@@ -190,7 +190,7 @@ class CrossStoreFailureTest(unittest.TestCase):
         with mock.patch.object(
             repository, "_create_commit", side_effect=record_create
         ), mock.patch.object(repository, "_run_git", side_effect=failing_run):
-            with self.assertRaises(repository.PlaygroundHeadChangedError):
+            with self.assertRaises(repository.RepositoryError) as failure:
                 playgrounds.publish_playground(
                     self.connection,
                     self.admin,
@@ -199,6 +199,13 @@ class CrossStoreFailureTest(unittest.TestCase):
                     self.make_bundle(b"print(2)"),
                     commit_metadata("losing publish"),
                 )
+
+        # The injected failure leaves the protected ref unchanged, so this is
+        # an operational update-ref failure rather than a lost CAS race.  It
+        # must not be classified as a Playground head change.
+        self.assertNotIsInstance(
+            failure.exception, repository.PlaygroundHeadChangedError
+        )
 
         # The winner HEAD is untouched and authoritative.
         self.assertEqual(

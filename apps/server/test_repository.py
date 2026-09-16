@@ -597,6 +597,172 @@ class PlaygroundPublishingTest(unittest.TestCase):
         ).stdout.decode("utf-8").strip()
         self.assertEqual(author, "Test Author <author@example.test>")
 
+    def test_inherited_git_control_variables_cannot_redirect_publish(self):
+        decoy_path = Path(self.temporary_directory.name) / "decoy.git"
+        open_repository(decoy_path)
+        playground_id = "pg-control"
+        ref = self.repository.playground_ref(playground_id)
+        trace_file = Path(self.temporary_directory.name) / "git-trace.log"
+
+        redirected = {
+            "GIT_COMMON_DIR": str(decoy_path),
+            "GIT_OBJECT_DIRECTORY": str(decoy_path / "objects"),
+            "GIT_CONFIG_PARAMETERS": "'core.sharedRepository=group'",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_TRACE": str(trace_file),
+            "GIT_TRACE2_EVENT": str(trace_file),
+            "GIT_TRACE_PACK_ACCESS": str(trace_file),
+        }
+        with mock.patch.dict(os.environ, redirected):
+            result = repository.publish_playground(
+                self.repository,
+                playground_id,
+                self.make_bundle(self.default_entries()),
+                self.metadata(),
+            )
+
+        self.assertEqual(
+            self.git("rev-parse", ref).stdout.strip().decode("ascii"),
+            result.commit_id,
+        )
+        decoy_check = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(decoy_path),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                ref,
+            ],
+            capture_output=True,
+        )
+        self.assertNotEqual(decoy_check.returncode, 0)
+        fsck = subprocess.run(
+            ["git", "-C", str(self.path), "fsck", "--no-progress"],
+            capture_output=True,
+        )
+        self.assertEqual(
+            fsck.returncode, 0, fsck.stderr.decode("utf-8", "replace")
+        )
+        self.assertFalse(trace_file.exists())
+
+    def test_reference_transaction_hook_cannot_be_injected(self):
+        hooks_path = Path(self.temporary_directory.name) / "hooks"
+        hooks_path.mkdir()
+        marker = Path(self.temporary_directory.name) / "hook-ran"
+        hook = hooks_path / "reference-transaction"
+        hook.write_text(
+            "#!/bin/sh\n"
+            f"echo ran >> '{marker}'\n"
+            "cat >/dev/null\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+
+        injected = {
+            "GIT_CONFIG_PARAMETERS": f"'core.hooksPath={hooks_path}'"
+        }
+        with mock.patch.dict(os.environ, injected):
+            repository.publish_playground(
+                self.repository,
+                "pg-hook",
+                self.make_bundle(self.default_entries()),
+                self.metadata(),
+            )
+
+        self.assertFalse(marker.exists())
+
+    def test_update_ref_failure_without_move_is_plain_repository_error(self):
+        playground_id = "pg-lock-failure"
+        first = repository.publish_playground(
+            self.repository,
+            playground_id,
+            self.make_bundle(self.default_entries(b"print(1)")),
+            self.metadata(),
+        )
+        ref = self.repository.playground_ref(playground_id)
+        original = repository._run_git
+
+        def failing_update_ref(
+            arguments, cwd=None, stdin=None, environment=None
+        ):
+            if arguments and arguments[0] == "update-ref":
+                return subprocess.CompletedProcess(
+                    ["git", *arguments], 1, b"", b"fatal: cannot lock ref"
+                )
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(
+            repository, "_run_git", side_effect=failing_update_ref
+        ):
+            with self.assertRaises(RepositoryError) as context:
+                repository.publish_playground(
+                    self.repository,
+                    playground_id,
+                    self.make_bundle(self.default_entries(b"print(2)")),
+                    self.metadata(),
+                )
+
+        # An unchanged ref means disk/lock failure, not a lost race.
+        self.assertNotIsInstance(
+            context.exception, PlaygroundHeadChangedError
+        )
+        self.assertEqual(
+            self.git("rev-parse", ref).stdout.strip().decode("ascii"),
+            first.commit_id,
+        )
+
+    def test_update_ref_failure_after_move_is_head_changed(self):
+        playground_id = "pg-move-failure"
+        first = repository.publish_playground(
+            self.repository,
+            playground_id,
+            self.make_bundle(self.default_entries(b"print(1)")),
+            self.metadata(),
+        )
+        ref = self.repository.playground_ref(playground_id)
+        tree_id = (
+            self.git("rev-parse", f"{first.commit_id}^{{tree}}")
+            .stdout.strip()
+            .decode("ascii")
+        )
+        decoy = self.commit_tree(tree_id)
+        original = repository._run_git
+
+        def moving_update_ref(
+            arguments, cwd=None, stdin=None, environment=None
+        ):
+            if arguments and arguments[0] == "update-ref":
+                original(("update-ref", ref, decoy), cwd=self.path)
+                return subprocess.CompletedProcess(
+                    ["git", *arguments], 1, b"", b"fatal: cannot lock ref"
+                )
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(
+            repository, "_run_git", side_effect=moving_update_ref
+        ):
+            with self.assertRaises(PlaygroundHeadChangedError) as context:
+                repository.publish_playground(
+                    self.repository,
+                    playground_id,
+                    self.make_bundle(self.default_entries(b"print(2)")),
+                    self.metadata(),
+                )
+
+        self.assertEqual(context.exception.reason, "playground_head_changed")
+        self.assertEqual(
+            self.git("rev-parse", ref).stdout.strip().decode("ascii"), decoy
+        )
+
 
 class CommitTreeReadTest(unittest.TestCase):
     """Read-only commit tree and blob access without any checkout."""
@@ -1083,6 +1249,133 @@ class WorkCommitWriteTest(unittest.TestCase):
             self.git("rev-parse", ref).strip().decode("ascii"), decoy
         )
 
+    def test_inherited_git_control_variables_cannot_redirect_work_write(self):
+        decoy_path = Path(self.temporary_directory.name) / "decoy.git"
+        open_repository(decoy_path)
+        playground_id = "pg-work-control"
+        playground = self.publish_playground(playground_id)
+        ref = self.repository.work_ref(playground_id, "student-1")
+        trace_file = Path(self.temporary_directory.name) / "git-trace.log"
+
+        redirected = {
+            "GIT_COMMON_DIR": str(decoy_path),
+            "GIT_OBJECT_DIRECTORY": str(decoy_path / "objects"),
+            "GIT_CONFIG_PARAMETERS": "'core.sharedRepository=group'",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_TRACE": str(trace_file),
+            "GIT_TRACE2_EVENT": str(trace_file),
+        }
+        with mock.patch.dict(os.environ, redirected):
+            commit_id = self.write(
+                playground_id, "student-1", playground.commit_id
+            )
+
+        self.assertEqual(
+            self.git("rev-parse", ref).strip().decode("ascii"), commit_id
+        )
+        decoy_check = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(decoy_path),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                ref,
+            ],
+            capture_output=True,
+        )
+        self.assertNotEqual(decoy_check.returncode, 0)
+        fsck = subprocess.run(
+            ["git", "-C", str(self.path), "fsck", "--no-progress"],
+            capture_output=True,
+        )
+        self.assertEqual(
+            fsck.returncode, 0, fsck.stderr.decode("utf-8", "replace")
+        )
+        self.assertFalse(trace_file.exists())
+
+    def test_update_ref_failure_without_move_is_plain_repository_error(self):
+        playground_id = "pg-work-lock"
+        playground = self.publish_playground(playground_id)
+        first = self.write(
+            playground_id, "student-1", playground.commit_id
+        )
+        ref = self.repository.work_ref(playground_id, "student-1")
+        original = repository._run_git
+
+        def failing_update_ref(
+            arguments, cwd=None, stdin=None, environment=None
+        ):
+            if arguments and arguments[0] == "update-ref":
+                return subprocess.CompletedProcess(
+                    ["git", *arguments], 1, b"", b"fatal: cannot lock ref"
+                )
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(
+            repository, "_run_git", side_effect=failing_update_ref
+        ):
+            with self.assertRaises(RepositoryError) as context:
+                self.write(
+                    playground_id,
+                    "student-1",
+                    playground.commit_id,
+                    base_commit_id=first,
+                )
+
+        self.assertNotIsInstance(context.exception, WorkHeadChangedError)
+        self.assertEqual(
+            self.git("rev-parse", ref).strip().decode("ascii"), first
+        )
+
+    def test_update_ref_failure_after_move_is_head_changed(self):
+        playground_id = "pg-work-move"
+        playground = self.publish_playground(playground_id)
+        first = self.write(
+            playground_id, "student-1", playground.commit_id
+        )
+        ref = self.repository.work_ref(playground_id, "student-1")
+        tree_id = (
+            self.git("rev-parse", f"{playground.commit_id}^{{tree}}")
+            .strip()
+            .decode("ascii")
+        )
+        decoy = self.commit_tree(tree_id)
+        original = repository._run_git
+
+        def moving_update_ref(
+            arguments, cwd=None, stdin=None, environment=None
+        ):
+            if arguments and arguments[0] == "update-ref":
+                original(("update-ref", ref, decoy), cwd=self.path)
+                return subprocess.CompletedProcess(
+                    ["git", *arguments], 1, b"", b"fatal: cannot lock ref"
+                )
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(
+            repository, "_run_git", side_effect=moving_update_ref
+        ):
+            with self.assertRaises(WorkHeadChangedError) as context:
+                self.write(
+                    playground_id,
+                    "student-1",
+                    playground.commit_id,
+                    base_commit_id=first,
+                )
+
+        self.assertEqual(context.exception.reason, "work_head_changed")
+        self.assertEqual(
+            self.git("rev-parse", ref).strip().decode("ascii"), decoy
+        )
+
     # -- tree exactness --------------------------------------------------
 
     def test_tree_is_exactly_the_supplied_mapping(self):
@@ -1255,6 +1548,80 @@ class WorkCommitWriteTest(unittest.TestCase):
                 if "refs/" in argument:
                     self.assertEqual(argument, expected_ref)
                 self.assertNotIn("checkout", argument)
+
+
+class GitSubprocessIsolationTest(unittest.TestCase):
+    """Direct checks of the child environment and override guard."""
+
+    _SAFE_GIT_KEYS = {
+        "GIT_TERMINAL_PROMPT",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+    }
+
+    def test_sanitized_environment_drops_every_inherited_git_variable(self):
+        inherited = {
+            "GIT_DIR": "/tmp/decoy",
+            "GIT_COMMON_DIR": "/tmp/common",
+            "GIT_OBJECT_DIRECTORY": "/tmp/objects",
+            "GIT_CONFIG_PARAMETERS": "'core.hooksPath=/tmp/hooks'",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_TRACE": "/tmp/trace",
+            "GIT_TRACE2_EVENT": "/tmp/trace2",
+            "GIT_TRACE_PACK_ACCESS": "/tmp/trace3",
+            # A novel variable must also be dropped: the filter is not a
+            # blacklist that a future Git version can outgrow.
+            "GIT_UNKNOWN_FUTURE_VARIABLE": "1",
+            "UNRELATED": "keep",
+        }
+        with mock.patch.dict(os.environ, inherited):
+            environment = repository._sanitized_git_environment()
+
+        self.assertEqual(environment["UNRELATED"], "keep")
+        for key in environment:
+            if key.startswith("GIT_"):
+                self.assertIn(key, self._SAFE_GIT_KEYS)
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(environment["GIT_CONFIG_SYSTEM"], os.devnull)
+
+    def test_only_commit_identity_overrides_are_accepted(self):
+        for override in (
+            {"GIT_DIR": "/tmp/decoy"},
+            {"GIT_CONFIG_PARAMETERS": "'core.hooksPath=/tmp/hooks'"},
+            {"PATH": "/usr/bin"},
+            {"GIT_AUTHOR_NAME": "ok", "GIT_OBJECT_DIRECTORY": "/tmp/x"},
+        ):
+            with self.subTest(override=override):
+                with self.assertRaises(RepositoryError):
+                    repository._run_git(
+                        ("rev-parse", "--is-bare-repository"),
+                        environment=override,
+                    )
+
+    def test_commit_identity_override_is_allowed(self):
+        environment = {
+            "GIT_AUTHOR_NAME": "n",
+            "GIT_AUTHOR_EMAIL": "e@x",
+            "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+            "GIT_COMMITTER_NAME": "n",
+            "GIT_COMMITTER_EMAIL": "e@x",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            completed = repository._run_git(
+                ("rev-parse", "--is-bare-repository"),
+                cwd=directory,
+                environment=environment,
+            )
+        # The command fails outside a repository, but the environment guard
+        # accepted all six identity fields instead of rejecting them.
+        self.assertIsInstance(completed, subprocess.CompletedProcess)
+        self.assertNotEqual(completed.returncode, 0)
 
 
 if __name__ == "__main__":

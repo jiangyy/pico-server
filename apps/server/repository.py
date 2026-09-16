@@ -115,6 +115,8 @@ def _check_ref_format(ref):
 def _run_git(arguments, cwd=None, stdin=None, environment=None):
     effective_environment = _sanitized_git_environment()
     if environment is not None:
+        if set(environment) - _COMMIT_ENVIRONMENT_KEYS:
+            raise RepositoryError("git environment override is not allowed")
         effective_environment.update(environment)
     options = {
         "cwd": cwd,
@@ -141,24 +143,11 @@ def _run_git(arguments, cwd=None, stdin=None, environment=None):
 # :class:`Repository`: the class keeps the small, stable public surface that
 # callers already rely on, and the low-level plumbing stays private here.
 
-# Caller-provided variables that could redirect the repository, its object
-# store, its configuration, or the commit identity are dropped before every
-# Git invocation.  The explicit author/committer identity is supplied by
-# :func:`publish_playground` itself after validation.
-_REDIRECTING_GIT_ENVIRONMENT = frozenset(
+# The only caller-supplied Git variables accepted by :func:`_run_git`.  The
+# author/committer identity is constructed inside this module from validated
+# metadata; any other override is rejected rather than merged.
+_COMMIT_ENVIRONMENT_KEYS = frozenset(
     {
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CONFIG_NOSYSTEM",
         "GIT_AUTHOR_NAME",
         "GIT_AUTHOR_EMAIL",
         "GIT_AUTHOR_DATE",
@@ -172,15 +161,13 @@ _OBJECT_FORMAT_WIDTHS = {"sha1": 40, "sha256": 64}
 
 
 def _sanitized_git_environment():
-    environment = {}
-    for key, value in os.environ.items():
-        if key in _REDIRECTING_GIT_ENVIRONMENT:
-            continue
-        if key.startswith("GIT_CONFIG_KEY_") or key.startswith(
-            "GIT_CONFIG_VALUE_"
-        ):
-            continue
-        environment[key] = value
+    # Drop every inherited ``GIT_*`` variable instead of blacklisting known
+    # redirects: a new Git control variable must not be able to leak in.
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
@@ -456,6 +443,23 @@ def _create_commit(
     return completed.stdout.strip().decode("ascii")
 
 
+def _is_zero_object_id(object_id):
+    return bool(object_id) and set(object_id) == {"0"}
+
+
+def _reference_matches(repository, ref, object_id):
+    """Return whether ``ref`` still holds exactly ``object_id``.
+
+    A zero object id means "the ref must not exist", so a missing ref is the
+    unchanged state.  Any other id must equal the resolved ref target.
+    """
+
+    current = _resolve_head(repository, ref)
+    if _is_zero_object_id(object_id):
+        return current is None
+    return current == object_id
+
+
 def _compare_and_swap(
     repository, ref, new_id, old_id, error=PlaygroundHeadChangedError
 ):
@@ -463,6 +467,11 @@ def _compare_and_swap(
         ("update-ref", ref, new_id, old_id), cwd=repository.path
     )
     if completed.returncode != 0:
+        # A failed update is only a lost race when the protected ref no longer
+        # holds the expected object.  An unchanged ref means disk, lock, or
+        # repository failure, which must not surface as concurrency.
+        if _reference_matches(repository, ref, old_id):
+            raise RepositoryError("could not update reference")
         raise error()
 
 
