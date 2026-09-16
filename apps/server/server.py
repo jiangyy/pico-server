@@ -759,8 +759,12 @@ class Handler(BaseHTTPRequestHandler):
         """Run one request and emit its audit event after the response."""
 
         log = getattr(self.server, "audit", None)
+        self._headers_sent = False
         if log is None:
-            route(**kwargs)
+            try:
+                route(**kwargs)
+            except Exception:
+                self._handle_unexpected_failure()
             return
 
         self._request_id = log.request_id(
@@ -779,8 +783,27 @@ class Handler(BaseHTTPRequestHandler):
             context.handler = self
         try:
             route(**kwargs)
+        except Exception:
+            self._handle_unexpected_failure()
         finally:
             self._emit_audit(log, started_at)
+
+    def _handle_unexpected_failure(self):
+        """Turn an unexpected route exception into one bounded response.
+
+        Once response headers are committed no second response is possible,
+        so the connection is aborted instead.  The single audit event is left
+        to the completed-response path or to :meth:`_emit_audit`.
+        """
+
+        if self._headers_sent:
+            self.close_connection = True
+            return
+        self._audit_code = "internal_error"
+        try:
+            self._api_error(500, "internal_error")
+        except Exception:
+            self.close_connection = True
 
     def _emit_audit(self, log, started_at):
         status = self._audit_status
@@ -794,21 +817,30 @@ class Handler(BaseHTTPRequestHandler):
             action, target = _audit_action(self.command, path)
             if action is None:
                 # Unauthenticated login failures carry no actor or target
-                # worth auditing; every other authorization failure is a
-                # bounded event.
-                if status not in (401, 403) or path == "/api/v1/login":
+                # worth auditing; every other authorization failure and every
+                # server error is a bounded event.
+                if status >= 500:
+                    action = "request.error"
+                elif status in (401, 403) and path != "/api/v1/login":
+                    action = "request.denied"
+                else:
                     return
-                action = "request.denied"
         self._audit_recorded = True
-        log.record(
-            request_id=self._request_id,
-            actor_id=self._audit_actor_id,
-            action=action,
-            target=target,
-            status=status,
-            code=self._audit_code,
-            started_at=started_at,
-        )
+        try:
+            log.record(
+                request_id=self._request_id,
+                actor_id=self._audit_actor_id,
+                action=action,
+                target=target,
+                status=status,
+                code=self._audit_code,
+                started_at=started_at,
+            )
+        except Exception:
+            # An audit-sink failure never changes the HTTP result and never
+            # causes a retry or a recursive audit.  The connection is aborted
+            # only when the response itself could not be written.
+            pass
 
     def _route_get(self, head_only=False):
         path = urlsplit(self.path).path
@@ -888,9 +920,9 @@ class Handler(BaseHTTPRequestHandler):
         elif _match_release(path) is not None:
             self._get_release(_match_release(path), head_only=head_only)
         elif _allowed_methods(path) is not None:
-            self._method_not_allowed()
+            self._method_not_allowed(head_only=head_only)
         else:
-            self._not_found()
+            self._not_found(head_only=head_only)
 
     def _route_post(self):
         path = urlsplit(self.path).path
@@ -1218,6 +1250,7 @@ class Handler(BaseHTTPRequestHandler):
         for name, value in extra_headers:
             self.send_header(name, value)
         self.end_headers()
+        self._headers_sent = True
         if not head_only:
             if stream_path is not None:
                 with open(stream_path, "rb") as handle:
@@ -1238,6 +1271,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_request_id()
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+        self._headers_sent = True
         self._audit_status = 304
 
     def _get_catalog(self, head_only=False):
@@ -1335,7 +1369,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         except RepositoryError:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._api_error(500, "internal_error", head_only=head_only)
             return
 
         self._respond_json(
@@ -1383,7 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         except RepositoryError:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._api_error(500, "internal_error", head_only=head_only)
             return
 
         self._respond_file(content.data, content.sha256, head_only=head_only)
@@ -1393,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
         if actor.role != "student":
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("work.head", playground_id, head_only)
             return
 
         try:
@@ -1407,7 +1441,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(500, "internal_error", head_only=head_only)
             return
         if info is None:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("work.head", playground_id, head_only)
             return
 
         head, pinned = info
@@ -1428,7 +1462,7 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
         if actor.role != "student":
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("work.history", playground_id, head_only)
             return
 
         parsed = self._parse_work_history_query()
@@ -1595,7 +1629,7 @@ class Handler(BaseHTTPRequestHandler):
         self._api_error(500, "internal_error", head_only=head_only)
 
     def _deny_work_read(self, playground_id, commit_id, head_only=False):
-        self._audit_code = "content_denied"
+        self._audit_code = "not_found_or_denied"
         self._audit_override = (
             "work.read",
             f"{playground_id}/{commit_id}",
@@ -2014,7 +2048,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden")
             return
         except RepositoryError:
-            self._api_error(400, "invalid_request")
+            self._api_error(500, "internal_error")
             return
 
         if not self._refresh_generated():
@@ -2074,7 +2108,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden")
             return
         except RepositoryError:
-            self._api_error(400, "invalid_request")
+            self._api_error(500, "internal_error")
             return
 
         status = 201 if result.base_commit_id is None else 200
@@ -2138,7 +2172,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden")
             return
         except RepositoryError:
-            self._api_error(400, "invalid_request")
+            self._api_error(500, "internal_error")
             return
 
         self._respond_json(
@@ -2211,7 +2245,7 @@ class Handler(BaseHTTPRequestHandler):
             with self._database() as connection:
                 release = get_release(connection, actor, release_id)
         except MissingReleaseError:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("release.read", release_id, head_only)
             return
         except ForbiddenActionError:
             self._api_error(403, "forbidden", head_only=head_only)
@@ -2255,7 +2289,7 @@ class Handler(BaseHTTPRequestHandler):
                 release = get_release(connection, actor, release_id)
                 records = list_submissions(connection, actor)
         except MissingReleaseError:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("release.read", release_id, head_only)
             return
         except ForbiddenActionError:
             self._api_error(403, "forbidden", head_only=head_only)
@@ -2279,7 +2313,7 @@ class Handler(BaseHTTPRequestHandler):
             with self._database() as connection:
                 submission = get_submission(connection, actor, submission_id)
         except MissingSubmissionError:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("submission.read", submission_id, head_only)
             return
         except InvalidSubmissionRequestError:
             self._api_error(400, "invalid_request", head_only=head_only)
@@ -2303,7 +2337,7 @@ class Handler(BaseHTTPRequestHandler):
             with self._database() as connection:
                 records = list_comments(connection, actor, submission_id)
         except MissingSubmissionError:
-            self._api_error(404, "not_found", head_only=head_only)
+            self._deny_hidden_read("comment.read", submission_id, head_only)
             return
         except InvalidCommentRequestError:
             self._api_error(400, "invalid_request", head_only=head_only)
@@ -2558,7 +2592,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden")
             return
         except RepositoryError:
-            self._api_error(400, "invalid_request")
+            self._api_error(500, "internal_error")
             return
 
         self._respond_json(status, body)
@@ -2615,7 +2649,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden")
             return
         except RepositoryError:
-            self._api_error(400, "invalid_request")
+            self._api_error(500, "internal_error")
             return
 
         self._respond_json(status, body)
@@ -2791,26 +2825,32 @@ class Handler(BaseHTTPRequestHandler):
     def _database(self):
         return closing(open_database(self.server.database_path))
 
-    def _not_found(self):
+    def _not_found(self, head_only=False):
         if urlsplit(self.path).path.startswith("/api/"):
-            self._api_error(404, "not_found")
+            self._api_error(404, "not_found", head_only=head_only)
         else:
-            self._respond(404, "not found\n")
+            self._respond(404, "not found\n", head_only=head_only)
 
-    def _method_not_allowed(self):
+    def _method_not_allowed(self, head_only=False):
         path = urlsplit(self.path).path
         methods = _allowed_methods(path)
         if methods is None:
-            self._not_found()
+            self._not_found(head_only=head_only)
             return
 
         headers = (("Allow", ", ".join(methods)),)
         if path.startswith("/api/"):
-            self._api_error(405, "method_not_allowed", extra_headers=headers)
+            self._api_error(
+                405,
+                "method_not_allowed",
+                head_only=head_only,
+                extra_headers=headers,
+            )
         else:
             self._respond(
                 405,
                 "method not allowed\n",
+                head_only=head_only,
                 extra_headers=headers,
             )
 
@@ -2828,20 +2868,27 @@ class Handler(BaseHTTPRequestHandler):
             extra_headers=extra_headers,
         )
 
+    def _deny_hidden_read(self, action, target, head_only=False):
+        """Answer one hidden missing/denied read with a single opaque code."""
+
+        self._audit_code = "not_found_or_denied"
+        self._audit_override = (action, target)
+        self._respond_json(404, {"code": "not_found"}, head_only=head_only)
+
     def _deny_content_read(
-        self, playground_id, commit_id, code, head_only=False
+        self, playground_id, commit_id, code=None, head_only=False
     ):
         """Answer an unreadable or missing content read and audit opaquely.
 
         The client sees the same indistinguishable ``404 not_found`` whether
-        the read was denied or the target does not exist.  ``code``
-        distinguishes the two for the audit stream only.  The audit event
-        records only the opaque playground/commit target and the result code;
-        the request path, filename, contents, body, and credential are never
+        the read was denied or the target does not exist.  One audit code
+        covers both cases so the event never claims which occurred.  The
+        audit event records only the opaque playground/commit target; the
+        request path, filename, contents, body, and credential are never
         recorded.
         """
 
-        self._audit_code = code
+        self._audit_code = "not_found_or_denied"
         self._audit_override = (
             "content.read",
             f"{playground_id}/{commit_id}",
@@ -2874,6 +2921,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
+        self._headers_sent = True
         if not head_only:
             self.wfile.write(data)
         self._audit_status = 200
@@ -2896,6 +2944,7 @@ class Handler(BaseHTTPRequestHandler):
         for name, value in extra_headers:
             self.send_header(name, value)
         self.end_headers()
+        self._headers_sent = True
         if not head_only:
             self.wfile.write(body)
         # Only a completed response is audited as a success.  A failed write

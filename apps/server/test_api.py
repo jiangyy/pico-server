@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -7480,7 +7481,7 @@ class AuditApiTest(unittest.TestCase):
         denied = [
             event
             for event in self.audit_events(minimum=4)
-            if event["code"] == "content_denied"
+            if event["code"] == "not_found_or_denied"
         ]
         self.assertEqual(len(denied), 2)
         for event in denied:
@@ -7659,7 +7660,7 @@ class AuditApiTest(unittest.TestCase):
         ]
         self.assertEqual(len(content_reads), 1)
         event = content_reads[0]
-        self.assertEqual(event["code"], "not_found")
+        self.assertEqual(event["code"], "not_found_or_denied")
         self.assertEqual(event["status"], 404)
         self.assertEqual(event["target"], f"{playground_id}/{commit_id}")
 
@@ -7667,6 +7668,123 @@ class AuditApiTest(unittest.TestCase):
         self.assertNotIn(secret_name, text)
         self.assertNotIn("course/", text)
         self.assertNotIn(token, text)
+
+    # ----- global error boundary -----------------------------------------
+
+    def test_generic_repository_failure_is_sanitized_500(self):
+        admin = self.seed_admin("audit-repo-admin")
+        token = self.login_token(admin.username)
+        with mock.patch.object(
+            server,
+            "create_playground",
+            side_effect=repository.RepositoryError(
+                "opaque disk failure /private/path"
+            ),
+        ):
+            status, _, body = self.request(
+                "POST",
+                "/api/v1/playgrounds",
+                {"id": self.unique("pg")},
+                token=token,
+            )
+        self.assertEqual((status, body["code"]), (500, "internal_error"))
+        event = self.audit_events(minimum=1)[-1]
+        self.assertEqual(event["status"], 500)
+        self.assertEqual(event["code"], "internal_error")
+        for secret in ("private/path", "opaque disk failure"):
+            self.assertNotIn(secret, self.output.getvalue())
+
+    def test_sqlite_failure_is_sanitized_500(self):
+        admin = self.seed_admin("audit-sql-admin")
+        token = self.login_token(admin.username)
+        with mock.patch.object(
+            server,
+            "create_playground",
+            side_effect=sqlite3.OperationalError("disk I/O error at /tmp/x"),
+        ):
+            status, _, body = self.request(
+                "POST",
+                "/api/v1/playgrounds",
+                {"id": self.unique("pg")},
+                token=token,
+            )
+        self.assertEqual((status, body["code"]), (500, "internal_error"))
+        self.assertNotIn("/tmp/x", self.output.getvalue())
+
+    def test_head_error_classes_have_empty_bodies(self):
+        admin = self.seed_admin("audit-head-admin")
+        admin_token = self.login_token(admin.username)
+        student = self.seed_user("student")
+        student_token = self.login_token(student.username)
+        cases = (
+            ("/api/v1/admin/users?limit=0", admin_token, 400),
+            ("/api/v1/admin/users", None, 401),
+            ("/api/v1/admin/users", student_token, 403),
+            ("/api/v1/releases/missing-release", student_token, 404),
+            ("/api/v1/login", admin_token, 405),
+            ("/api/v1/artifacts/missing-version", None, 404),
+        )
+        for path, token, expected in cases:
+            with self.subTest(path=path):
+                get_status, get_headers, _ = self.request(
+                    "GET", path, token=token
+                )
+                head_status, head_headers, head_body = self.request(
+                    "HEAD", path, token=token
+                )
+                self.assertEqual(get_status, expected, path)
+                self.assertEqual(head_status, expected, path)
+                self.assertIsNone(head_body, path)
+                self.assertEqual(
+                    head_headers["content-length"],
+                    get_headers["content-length"],
+                    path,
+                )
+
+    def test_hidden_read_families_are_opaquely_audited(self):
+        student = self.seed_user("student")
+        token = self.login_token(student.username)
+        playground_id = self.unique("pg")
+        cases = (
+            (f"/api/v1/submissions/missing-id", "submission.read"),
+            ("/api/v1/releases/missing-id", "release.read"),
+            ("/api/v1/submissions/missing-id/comments", "comment.read"),
+            (f"/api/v1/works/{playground_id}/head", "work.head"),
+        )
+        for path, action in cases:
+            with self.subTest(path=path):
+                status, _, body = self.request("GET", path, token=token)
+                self.assertEqual((status, body["code"]), (404, "not_found"))
+                match = self.wait_for_action(action)
+                self.assertTrue(match, action)
+                self.assertEqual(match[-1]["code"], "not_found_or_denied")
+                self.assertEqual(match[-1]["status"], 404)
+
+        # A non-student Work history request is the same hidden 404.
+        teacher = self.seed_user("teacher")
+        teacher_token = self.login_token(teacher.username)
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/works/{playground_id}/history",
+            token=teacher_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        match = self.wait_for_action("work.history")
+        self.assertTrue(match)
+        self.assertEqual(match[-1]["code"], "not_found_or_denied")
+
+    def wait_for_action(self, action, timeout=2):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            match = [
+                event
+                for event in self.audit_events()
+                if event["action"] == action
+            ]
+            if match:
+                return match
+            time.sleep(0.005)
+        return []
 
 
 if __name__ == "__main__":
