@@ -67,20 +67,6 @@ class DatabaseTest(unittest.TestCase):
             (playground_id, creator_id, policy),
         )
 
-    def insert_publisher_grant(
-        self,
-        connection,
-        user_id="user-1",
-        granted_by="admin-1",
-    ):
-        connection.execute(
-            """
-            INSERT INTO publisher_grants (user_id, granted_by, created_at)
-            VALUES (?, ?, '2026-09-15T00:00:00Z')
-            """,
-            (user_id, granted_by),
-        )
-
     def insert_idempotency_result(
         self,
         connection,
@@ -601,27 +587,32 @@ class DatabaseTest(unittest.TestCase):
         tables = connection.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name IN ('playgrounds', 'publisher_grants')
+            WHERE type = 'table' AND name = 'playgrounds'
             """
         ).fetchall()
         self.assertEqual(
-            {row["name"] for row in tables},
-            {"playgrounds", "publisher_grants"},
+            {row["name"] for row in tables}, {"playgrounds"}
         )
 
         indexes = connection.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE type = 'index' AND name IN (
-                'playgrounds_creator_id_idx',
-                'publisher_grants_granted_by_idx'
-            )
+            WHERE type = 'index' AND name = 'playgrounds_creator_id_idx'
             """
         ).fetchall()
         self.assertEqual(
             {row["name"] for row in indexes},
-            {"playgrounds_creator_id_idx", "publisher_grants_granted_by_idx"},
+            {"playgrounds_creator_id_idx"},
         )
+
+        # Migration 10 drops the retired publisher-grant table and its index.
+        remaining = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'publisher_grants'
+            """
+        ).fetchall()
+        self.assertEqual(remaining, [])
 
     def test_version_four_database_is_upgraded(self):
         self.create_version_four_database()
@@ -688,26 +679,6 @@ class DatabaseTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.insert_playground(connection, creator_id="missing")
 
-    def test_publisher_grant_requires_existing_user_and_grantor(self):
-        connection = self.open()
-        self.insert_user(connection, user_id="admin-1", username="admin")
-
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.insert_publisher_grant(connection, user_id="missing")
-
-        self.insert_user(connection, user_id="user-1", username="alice")
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.insert_publisher_grant(connection, granted_by="missing")
-
-    def test_publisher_grant_has_at_most_one_row_per_user(self):
-        connection = self.open()
-        self.insert_user(connection, user_id="admin-1", username="admin")
-        self.insert_user(connection, user_id="user-1", username="alice")
-        self.insert_publisher_grant(connection)
-
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.insert_publisher_grant(connection, granted_by="admin-1")
-
     def test_deleting_playground_creator_is_restricted(self):
         connection = self.open()
         self.insert_user(connection, user_id="teacher-1", username="teacher")
@@ -716,17 +687,6 @@ class DatabaseTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             connection.execute("DELETE FROM users WHERE id = 'teacher-1'")
 
-    def test_deleting_publisher_grant_owner_is_restricted(self):
-        connection = self.open()
-        self.insert_user(connection, user_id="admin-1", username="admin")
-        self.insert_user(connection, user_id="user-1", username="alice")
-        self.insert_publisher_grant(connection)
-
-        with self.assertRaises(sqlite3.IntegrityError):
-            connection.execute("DELETE FROM users WHERE id = 'user-1'")
-        with self.assertRaises(sqlite3.IntegrityError):
-            connection.execute("DELETE FROM users WHERE id = 'admin-1'")
-
     def test_version_five_database_is_upgraded(self):
         connection = self.open()
         self.insert_user(connection)
@@ -734,10 +694,11 @@ class DatabaseTest(unittest.TestCase):
         connection.execute("DROP TABLE submissions")
         connection.execute("DROP TABLE releases")
         connection.execute("DROP TABLE idempotency_results")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 8")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+        for stale_version in range(6, SCHEMA_VERSION + 1):
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = ?",
+                (stale_version,),
+            )
         connection.commit()
 
         upgraded = self.open()
@@ -858,7 +819,7 @@ class DatabaseTest(unittest.TestCase):
             "payload",
         }
 
-        for table in ("playgrounds", "publisher_grants"):
+        for table in ("playgrounds",):
             columns = connection.execute(
                 f"PRAGMA table_info({table})"
             ).fetchall()
@@ -971,13 +932,13 @@ class DatabaseTest(unittest.TestCase):
             [(row["id"], row["creator_id"], row["policy"]) for row in playgrounds],
             [("playground-1", "teacher-1", "release_only")],
         )
-        grants = connection.execute(
-            "SELECT user_id, granted_by FROM publisher_grants"
+        remaining_grants = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'publisher_grants'
+            """
         ).fetchall()
-        self.assertEqual(
-            [(row["user_id"], row["granted_by"]) for row in grants],
-            [("teacher-1", "admin-1")],
-        )
+        self.assertEqual(remaining_grants, [])
         idempotency = connection.execute(
             """
             SELECT actor_id, endpoint, request_key, response_status
@@ -1677,16 +1638,13 @@ class DatabaseTest(unittest.TestCase):
                 )
             ],
         )
-        grants = connection.execute(
-            "SELECT user_id, granted_by, created_at FROM publisher_grants"
+        remaining_grants = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'publisher_grants'
+            """
         ).fetchall()
-        self.assertEqual(
-            [
-                (row["user_id"], row["granted_by"], row["created_at"])
-                for row in grants
-            ],
-            [("teacher-1", "admin-1", "2026-09-15T00:00:00Z")],
-        )
+        self.assertEqual(remaining_grants, [])
         idempotency = connection.execute(
             """
             SELECT actor_id, endpoint, request_key, request_sha256,
@@ -2295,13 +2253,13 @@ class DatabaseTest(unittest.TestCase):
             [(row["id"], row["creator_id"], row["policy"]) for row in playgrounds],
             [("playground-1", "teacher-1", "release_only")],
         )
-        grants = connection.execute(
-            "SELECT user_id, granted_by FROM publisher_grants"
+        remaining_grants = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'publisher_grants'
+            """
         ).fetchall()
-        self.assertEqual(
-            [(row["user_id"], row["granted_by"]) for row in grants],
-            [("teacher-1", "admin-1")],
-        )
+        self.assertEqual(remaining_grants, [])
         idempotency = connection.execute(
             "SELECT actor_id, endpoint, request_key FROM idempotency_results"
         ).fetchall()

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def open_database(path):
@@ -248,6 +248,10 @@ def _initialize_schema(connection):
                 "ON comments(submission_id, created_at, id)"
             )
             _record_migration(connection, 9)
+
+        if version < 10:
+            connection.execute("DROP TABLE IF EXISTS publisher_grants")
+            _record_migration(connection, 10)
 
 
 def _record_migration(connection, version):

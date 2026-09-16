@@ -48,73 +48,12 @@ class PlaygroundDomainTest(unittest.TestCase):
             role,
         )
 
-    def grant_count(self, user_id):
-        rows = self.connection.execute(
-            "SELECT user_id FROM publisher_grants WHERE user_id = ?",
-            (user_id,),
-        ).fetchall()
-        return len(rows)
-
     def playground_policy(self, playground_id):
         row = self.connection.execute(
             "SELECT policy FROM playgrounds WHERE id = ?",
             (playground_id,),
         ).fetchone()
         return None if row is None else row["policy"]
-
-    def test_grant_is_idempotent_and_records_grant(self):
-        user = self.create_user("teacher")
-
-        first = playgrounds.grant_publisher(
-            self.connection, self.admin_actor, user.id
-        )
-        self.assertEqual(first.user_id, user.id)
-        self.assertEqual(first.granted_by, self.admin_actor.id)
-        self.assertTrue(first.created_at)
-
-        retry = playgrounds.grant_publisher(
-            self.connection, self.admin_actor, user.id
-        )
-        self.assertEqual(retry, first)
-        self.assertEqual(self.grant_count(user.id), 1)
-
-    def test_revoke_is_idempotent(self):
-        user = self.create_user("teacher")
-        never_granted = self.create_user("teacher")
-
-        playgrounds.revoke_publisher(
-            self.connection, self.admin_actor, never_granted.id
-        )
-        self.assertEqual(self.grant_count(never_granted.id), 0)
-
-        playgrounds.grant_publisher(self.connection, self.admin_actor, user.id)
-        playgrounds.revoke_publisher(self.connection, self.admin_actor, user.id)
-        playgrounds.revoke_publisher(self.connection, self.admin_actor, user.id)
-        self.assertEqual(self.grant_count(user.id), 0)
-
-    def test_grant_and_revoke_require_admin(self):
-        actor = self.create_user("teacher")
-        target = self.create_user("student")
-
-        with self.assertRaises(accounts.ForbiddenActionError):
-            playgrounds.grant_publisher(self.connection, actor, target.id)
-        with self.assertRaises(accounts.ForbiddenActionError):
-            playgrounds.revoke_publisher(self.connection, actor, target.id)
-        self.assertEqual(self.grant_count(target.id), 0)
-
-    def test_grant_and_revoke_require_existing_user(self):
-        with self.assertRaises(accounts.MissingUserError):
-            playgrounds.grant_publisher(
-                self.connection, self.admin_actor, "missing-user"
-            )
-        with self.assertRaises(accounts.MissingUserError):
-            playgrounds.revoke_publisher(
-                self.connection, self.admin_actor, "missing-user"
-            )
-        with self.assertRaises(playgrounds.InvalidRequestError):
-            playgrounds.grant_publisher(self.connection, self.admin_actor, "")
-        with self.assertRaises(playgrounds.InvalidRequestError):
-            playgrounds.revoke_publisher(self.connection, self.admin_actor, None)
 
     def test_create_requires_admin(self):
         actor = self.create_user("teacher")
@@ -247,21 +186,6 @@ class PlaygroundDomainTest(unittest.TestCase):
                 self.connection, self.admin_actor, "pg-invalid", []
             )
         self.assertEqual(self.playground_policy("pg-invalid"), "release_only")
-
-    def test_invalid_actor_is_rejected_for_grant_and_revoke(self):
-        target = self.create_user("student")
-        playgrounds.grant_publisher(
-            self.connection, self.admin_actor, target.id
-        )
-
-        for actor in (None, "seed-actor", target.id, 7, object()):
-            with self.assertRaises(accounts.ForbiddenActionError):
-                playgrounds.grant_publisher(self.connection, actor, target.id)
-            with self.assertRaises(accounts.ForbiddenActionError):
-                playgrounds.revoke_publisher(self.connection, actor, target.id)
-
-        # The pre-existing grant survives and no extra grant was written.
-        self.assertEqual(self.grant_count(target.id), 1)
 
     def test_invalid_actor_is_rejected_for_create(self):
         for actor in (None, "seed-actor", 7, object()):

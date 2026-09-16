@@ -1007,24 +1007,6 @@ class PlaygroundApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         return body["sessionToken"]
 
-    def grant_publisher(self, token, user_id):
-        status, _, body = self.request(
-            "PUT",
-            f"/api/v1/admin/publishers/{user_id}",
-            token=token,
-        )
-        self.assertEqual(status, 204)
-        self.assertIsNone(body)
-
-    def revoke_publisher(self, token, user_id):
-        status, _, body = self.request(
-            "DELETE",
-            f"/api/v1/admin/publishers/{user_id}",
-            token=token,
-        )
-        self.assertEqual(status, 204)
-        self.assertIsNone(body)
-
     def create_playground(self, token, playground_id):
         status, _, body = self.request(
             "POST",
@@ -1392,63 +1374,6 @@ class PlaygroundApiTest(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertTrue(response["commitId"])
 
-    def test_publisher_grant_lifecycle(self):
-        admin = self.seed_user("admin")
-        teacher = self.seed_user("teacher")
-        student = self.seed_user("student")
-        admin_token = self.login_token(admin.username)
-        teacher_token = self.login_token(teacher.username)
-
-        # A non-Admin cannot grant or revoke publisher permission.
-        for method in ("PUT", "DELETE"):
-            status, _, body = self.request(
-                method,
-                f"/api/v1/admin/publishers/{student.id}",
-                token=teacher_token,
-            )
-            self.assertEqual((status, body["code"]), (403, "forbidden"))
-
-        # Admin grant is idempotent and persists exactly one row.
-        self.grant_publisher(admin_token, teacher.id)
-        self.grant_publisher(admin_token, teacher.id)
-        connection = open_database(self.database_path)
-        try:
-            rows = connection.execute(
-                "SELECT user_id, granted_by FROM publisher_grants"
-                " WHERE user_id = ?",
-                (teacher.id,),
-            ).fetchall()
-        finally:
-            connection.close()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["granted_by"], admin.id)
-
-        # Revoke is idempotent and removes the stored grant.
-        self.revoke_publisher(admin_token, teacher.id)
-        self.revoke_publisher(admin_token, teacher.id)
-        connection = open_database(self.database_path)
-        try:
-            remaining = connection.execute(
-                "SELECT user_id FROM publisher_grants WHERE user_id = ?",
-                (teacher.id,),
-            ).fetchall()
-        finally:
-            connection.close()
-        self.assertEqual(remaining, [])
-
-        # Admin creates metadata without needing a grant.
-        admin_playground = self.create_playground(admin_token, self.unique("pg"))
-        self.assertEqual(admin_playground["creatorId"], admin.id)
-
-        # Unknown targets are not found for both grant and revoke.
-        for method in ("PUT", "DELETE"):
-            status, _, body = self.request(
-                method,
-                "/api/v1/admin/publishers/missing-user",
-                token=admin_token,
-            )
-            self.assertEqual((status, body["code"]), (404, "not_found"))
-
     def test_playground_policy_archive_and_unarchive_authorization(self):
         admin = self.seed_user("admin")
         owner = self.seed_user("teacher")
@@ -1644,8 +1569,6 @@ class PlaygroundApiTest(unittest.TestCase):
         playground = self.create_playground(admin_token, self.unique("pg"))
 
         calls = (
-            ("PUT", f"/api/v1/admin/publishers/{admin.id}", None),
-            ("DELETE", f"/api/v1/admin/publishers/{admin.id}", None),
             ("POST", "/api/v1/playgrounds", {"id": "pg-unauthorized"}),
             (
                 "PATCH",
@@ -1678,9 +1601,6 @@ class PlaygroundApiTest(unittest.TestCase):
             ("PUT", "/api/v1/playgrounds/some-id/commits", "POST"),
             ("PATCH", "/api/v1/playgrounds/some-id/commits", "POST"),
             ("DELETE", "/api/v1/playgrounds/some-id/commits", "POST"),
-            ("POST", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
-            ("GET", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
-            ("PATCH", "/api/v1/admin/publishers/some-id", "PUT, DELETE"),
         )
         for method, path, allow in method_not_allowed:
             status, headers, body = self.request(method, path)
@@ -1693,9 +1613,6 @@ class PlaygroundApiTest(unittest.TestCase):
             ("GET", "/api/v1/playgrounds/a/b"),
             ("POST", "/api/v1/playgrounds/a/b/commits"),
             ("POST", "/api/v1/playgrounds/some-id/commits/extra"),
-            ("GET", "/api/v1/admin/publishers"),
-            ("GET", "/api/v1/admin/publishers/"),
-            ("PUT", "/api/v1/admin/publishers/a/b"),
         )
         for method, path in not_found:
             status, _, body = self.request(method, path)
@@ -1793,13 +1710,6 @@ class ReleaseApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         return body["sessionToken"]
-
-    def grant_publisher(self, token, user_id):
-        status, _, body = self.request(
-            "PUT", f"/api/v1/admin/publishers/{user_id}", token=token
-        )
-        self.assertEqual(status, 204)
-        self.assertIsNone(body)
 
     def create_class(self, admin_token, teacher_id, name="Class"):
         status, _, body = self.request(
@@ -2345,12 +2255,6 @@ class ContentApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         return body["sessionToken"]
-
-    def grant_publisher(self, token, user_id):
-        status, _, _ = self.request(
-            "PUT", f"/api/v1/admin/publishers/{user_id}", token=token
-        )
-        self.assertEqual(status, 204)
 
     def create_class(self, admin_token, teacher_id):
         status, _, body = self.request(

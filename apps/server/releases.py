@@ -171,13 +171,6 @@ def _require_playground(connection, playground_id):
     return row
 
 
-def _is_granted_publisher(connection, user_id):
-    row = connection.execute(
-        "SELECT 1 FROM publisher_grants WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    return row is not None
-
-
 def _authorize_playground(connection, actor, playground_id):
     """Reject a missing or archived Playground.
 

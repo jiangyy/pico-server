@@ -212,13 +212,6 @@ def _playground_row(connection, playground_id):
     ).fetchone()
 
 
-def _is_granted_publisher(connection, user_id):
-    row = connection.execute(
-        "SELECT 1 FROM publisher_grants WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    return row is not None
-
-
 def _current_class_id(connection, student_id):
     row = connection.execute(
         "SELECT class_id FROM class_memberships WHERE student_id = ?",

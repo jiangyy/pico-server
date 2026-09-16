@@ -1,10 +1,10 @@
-"""Playground metadata and publisher authorization domain logic."""
+"""Playground metadata domain logic."""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import repository as _repository
-from accounts import ForbiddenActionError, MissingUserError, User
+from accounts import ForbiddenActionError, User
 
 
 RELEASE_ONLY_POLICY = "release_only"
@@ -37,13 +37,6 @@ class Playground:
     archived_at: str | None
 
 
-@dataclass(frozen=True)
-class PublisherGrant:
-    user_id: str
-    granted_by: str
-    created_at: str
-
-
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -66,25 +59,6 @@ def _require_admin(actor):
         raise ForbiddenActionError("admin role required")
 
 
-def _require_user(connection, user_id):
-    user_id = _require_opaque_id(user_id)
-    row = connection.execute(
-        "SELECT id FROM users WHERE id = ?",
-        (user_id,),
-    ).fetchone()
-    if row is None:
-        raise MissingUserError("user does not exist")
-    return row["id"]
-
-
-def _require_granted(connection, user_id):
-    row = connection.execute(
-        "SELECT 1 FROM publisher_grants WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    return row is not None
-
-
 def _playground_row(connection, playground_id):
     playground_id = _require_opaque_id(playground_id)
     return connection.execute(
@@ -102,41 +76,6 @@ def _playground_from_row(row):
         created_at=row["created_at"],
         archived_at=row["archived_at"],
     )
-
-
-def grant_publisher(connection, actor, user_id):
-    """Grant publishing permission to an existing user, idempotently."""
-    _require_actor(actor)
-    with connection:
-        _require_admin(actor)
-        user_id = _require_user(connection, user_id)
-        connection.execute(
-            "INSERT OR IGNORE INTO publisher_grants"
-            " (user_id, granted_by, created_at) VALUES (?, ?, ?)",
-            (user_id, actor.id, _now()),
-        )
-        row = connection.execute(
-            "SELECT user_id, granted_by, created_at"
-            " FROM publisher_grants WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-    return PublisherGrant(
-        user_id=row["user_id"],
-        granted_by=row["granted_by"],
-        created_at=row["created_at"],
-    )
-
-
-def revoke_publisher(connection, actor, user_id):
-    """Revoke publishing permission from an existing user, idempotently."""
-    _require_actor(actor)
-    with connection:
-        _require_admin(actor)
-        user_id = _require_user(connection, user_id)
-        connection.execute(
-            "DELETE FROM publisher_grants WHERE user_id = ?",
-            (user_id,),
-        )
 
 
 def create_playground(connection, actor, playground_id):

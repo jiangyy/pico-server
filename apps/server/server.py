@@ -53,9 +53,7 @@ from playgrounds import (
     MissingPlaygroundError,
     PlaygroundConflictError,
     create_playground,
-    grant_publisher,
     publish_playground,
-    revoke_publisher,
     update_playground,
 )
 from releases import (
@@ -106,7 +104,6 @@ ADMIN_CLASSES_PATH = "/api/v1/admin/classes"
 CLASS_OWNER_SUFFIX = "/owner"
 CLASS_MEMBERS_SEGMENT = "/members/"
 CLASSES_PATH = "/api/v1/classes"
-ADMIN_PUBLISHERS_PATH = "/api/v1/admin/publishers"
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
 WORKS_PATH = "/api/v1/works"
@@ -184,18 +181,6 @@ def _match_class(path):
     if not class_id or "/" in class_id:
         return None
     return class_id
-
-
-def _match_admin_publisher(path):
-    """Return the opaque user ID in an admin publisher path, else None."""
-    prefix = ADMIN_PUBLISHERS_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-
-    user_id = path[len(prefix):]
-    if not user_id or "/" in user_id:
-        return None
-    return user_id
 
 
 def _match_playground(path):
@@ -331,8 +316,6 @@ def _allowed_methods(path):
         return ALLOWED_METHODS
     if _match_class(path) is not None:
         return ALLOWED_METHODS
-    if _match_admin_publisher(path) is not None:
-        return ("PUT", "DELETE")
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
     if _match_playground_commit(path) is not None:
@@ -495,11 +478,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route_put(self):
         path = urlsplit(self.path).path
         member = _match_class_member(path)
-        publisher_id = _match_admin_publisher(path)
         if member is not None:
             self._put_class_member(*member)
-        elif publisher_id is not None:
-            self._put_admin_publisher(publisher_id)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -508,11 +488,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route_delete(self):
         path = urlsplit(self.path).path
         member = _match_class_member(path)
-        publisher_id = _match_admin_publisher(path)
         if member is not None:
             self._delete_class_member(*member)
-        elif publisher_id is not None:
-            self._delete_admin_publisher(publisher_id)
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
@@ -946,46 +923,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         except ArchivedClassError:
             self._api_error(409, "class_archived")
-            return
-        except ForbiddenActionError:
-            self._api_error(403, "forbidden")
-            return
-
-        self._respond(204, "")
-
-    def _put_admin_publisher(self, user_id):
-        actor = self._authenticate()
-        if actor is None:
-            return
-
-        try:
-            with self._database() as connection:
-                grant_publisher(connection, actor, user_id)
-        except InvalidRequestError:
-            self._api_error(400, "invalid_request")
-            return
-        except MissingUserError:
-            self._api_error(404, "not_found")
-            return
-        except ForbiddenActionError:
-            self._api_error(403, "forbidden")
-            return
-
-        self._respond(204, "")
-
-    def _delete_admin_publisher(self, user_id):
-        actor = self._authenticate()
-        if actor is None:
-            return
-
-        try:
-            with self._database() as connection:
-                revoke_publisher(connection, actor, user_id)
-        except InvalidRequestError:
-            self._api_error(400, "invalid_request")
-            return
-        except MissingUserError:
-            self._api_error(404, "not_found")
             return
         except ForbiddenActionError:
             self._api_error(403, "forbidden")
