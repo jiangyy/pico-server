@@ -13,6 +13,7 @@ Playground commit.  Every denial uses the one authorization error so a missing
 record cannot be told apart from an unreadable one.
 """
 
+import base64
 import json
 import unicodedata
 from dataclasses import dataclass
@@ -29,11 +30,15 @@ __all__ = [
     "WorkError",
     "WorkValidationError",
     "WorkCommit",
+    "WorkSyncRequest",
     "validate_work_files",
+    "decode_work_sync_request",
+    "current_work_head",
     "create_work_commit",
     "MAX_WORK_ENTRY_COUNT",
     "MAX_WORK_FILE_BYTES",
     "MAX_WORK_TOTAL_BYTES",
+    "MAX_SYNC_JSON_BODY_BYTES",
     "WORK_MANIFEST_PATH",
     "PICOPG_MANIFEST_PATH",
     "WORK_PREFIX",
@@ -65,6 +70,9 @@ __all__ = [
     "REASON_PATH_OVERLAP",
     "REASON_WORK_MANIFEST_INVALID",
     "REASON_WORK_PLAYGROUND_MISMATCH",
+    "REASON_INVALID_PAYLOAD",
+    "REASON_INVALID_FILES",
+    "REASON_INVALID_BASE64",
 ]
 
 
@@ -74,6 +82,11 @@ __all__ = [
 MAX_WORK_ENTRY_COUNT = 1024
 MAX_WORK_FILE_BYTES = 1024 * 1024
 MAX_WORK_TOTAL_BYTES = 8 * 1024 * 1024
+
+# A sync body carries base64 (a 4/3 expansion of the decoded bytes) plus JSON
+# structural overhead and the unencoded paths.  Twice the decoded total is a
+# safe, still bounded ceiling that rejects an oversized body before parsing.
+MAX_SYNC_JSON_BODY_BYTES = 2 * MAX_WORK_TOTAL_BYTES
 
 # --- Server-owned tree layout ----------------------------------------------
 WORK_PREFIX = "work/"
@@ -111,6 +124,9 @@ REASON_PLAYGROUND_MISSING_MANIFEST = "playground_missing_manifest"
 REASON_PATH_OVERLAP = "path_overlap"
 REASON_WORK_MANIFEST_INVALID = "work_manifest_invalid"
 REASON_WORK_PLAYGROUND_MISMATCH = "work_playground_mismatch"
+REASON_INVALID_PAYLOAD = "invalid_payload"
+REASON_INVALID_FILES = "invalid_files"
+REASON_INVALID_BASE64 = "invalid_base64"
 
 REASON_CODES = frozenset(
     {
@@ -137,6 +153,9 @@ REASON_CODES = frozenset(
         REASON_PATH_OVERLAP,
         REASON_WORK_MANIFEST_INVALID,
         REASON_WORK_PLAYGROUND_MISMATCH,
+        REASON_INVALID_PAYLOAD,
+        REASON_INVALID_FILES,
+        REASON_INVALID_BASE64,
     }
 )
 
@@ -180,6 +199,20 @@ class WorkCommit:
     commit_id: str
     playground_commit_id: str
     base_commit_id: str | None
+
+
+@dataclass(frozen=True)
+class WorkSyncRequest:
+    """One decoded, fully validated Work sync request.
+
+    ``files`` is the immutable normalized mapping returned by
+    :func:`validate_work_files`, so nothing downstream re-decodes base64 or
+    trusts an unvalidated path.
+    """
+
+    playground_commit_id: str
+    base_commit_id: str | None
+    files: MappingProxyType
 
 
 def _normalize_work_path(path):
@@ -296,6 +329,63 @@ def _normalized_work_snapshot(files):
     )
 
 
+def decode_work_sync_request(payload):
+    """Decode and fully validate one Work sync JSON body.
+
+    ``payload`` must be the parsed JSON object with ``playgroundCommitId``, a
+    nullable ``baseCommitId`` and ``files``.  ``files`` is a list of
+    ``{"path": <str>, "data": <base64 str>}`` entries that together are the
+    complete ``work/**`` snapshot.  Base64 is decoded with strict validation
+    and the whole snapshot is checked by :func:`validate_work_files` before
+    anything is returned, so a malformed entry can never be applied
+    partially.  No Git object is read or written here.
+    """
+
+    if type(payload) is not dict:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+
+    try:
+        playground_commit_id = payload["playgroundCommitId"]
+        base_commit_id = payload["baseCommitId"]
+        raw_files = payload["files"]
+    except KeyError:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+
+    if type(playground_commit_id) is not str or not playground_commit_id:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+    if base_commit_id is not None and (
+        type(base_commit_id) is not str or not base_commit_id
+    ):
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+
+    if type(raw_files) is not list:
+        raise WorkValidationError(REASON_INVALID_FILES)
+    # Reject an over-long list before decoding any entry so a huge snapshot
+    # cannot make the Server allocate per-entry buffers first.
+    if len(raw_files) > MAX_WORK_ENTRY_COUNT:
+        raise WorkValidationError(REASON_TOO_MANY_ENTRIES)
+
+    entries = []
+    for entry in raw_files:
+        if type(entry) is not dict:
+            raise WorkValidationError(REASON_INVALID_ENTRY)
+        path = entry.get("path")
+        encoded = entry.get("data")
+        if type(encoded) is not str:
+            raise WorkValidationError(REASON_ENTRY_DATA_NOT_BYTES)
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except ValueError:
+            raise WorkValidationError(REASON_INVALID_BASE64)
+        entries.append(WorkEntry(path, data))
+
+    return WorkSyncRequest(
+        playground_commit_id=playground_commit_id,
+        base_commit_id=base_commit_id,
+        files=validate_work_files(entries),
+    )
+
+
 def _playground_path_is_allowed(path):
     if path == PICOPG_MANIFEST_PATH:
         return True
@@ -405,6 +495,19 @@ def _server_timestamp():
         datetime.now(timezone.utc)
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
+    )
+
+
+def current_work_head(repository, playground_id, student_id):
+    """Return the exact Work HEAD for one Student, or ``None``.
+
+    Callers use this only after ownership is established, so a conflict
+    response can name the caller's own canonical Work HEAD and never another
+    Student's.
+    """
+
+    return repository_module.resolve_work_head(
+        repository, playground_id, student_id
     )
 
 

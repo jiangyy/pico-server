@@ -6,6 +6,7 @@ tree, server-owned metadata, ownership, authorization, path rejection, limits,
 and the concurrent ref change guard.
 """
 
+import base64
 import os
 import subprocess
 import sys
@@ -921,6 +922,29 @@ class WorkCreationTest(WorkTestBase):
         ))
         self.assertIsNone(result.base_commit_id)
 
+    def test_current_work_head_tracks_the_owned_ref(self):
+        self.assertIsNone(
+            works.current_work_head(
+                self.repository, self.playground_id, self.student.id
+            )
+        )
+        result = self.create_work(
+            playground_id=self.playground_id,
+            playground_commit_id=self.first_playground.commit_id,
+        )
+        self.assertEqual(
+            works.current_work_head(
+                self.repository, self.playground_id, self.student.id
+            ),
+            result.commit_id,
+        )
+        # A different Student's absent ref stays ``None``.
+        self.assertIsNone(
+            works.current_work_head(
+                self.repository, self.playground_id, self.other_student.id
+            )
+        )
+
     def test_invalid_work_ref_identifiers_never_reach_git(self):
         with mock.patch.object(repository, "_run_git") as spy:
             for playground_id in ("..", "a/b", "a b", ""):
@@ -1067,6 +1091,199 @@ class WorkCreationTest(WorkTestBase):
         self.assertEqual(
             caught.exception.reason, works.REASON_PLAYGROUND_TREE_INVALID
         )
+
+
+class WorkSyncDecodeTest(WorkTestBase):
+    """Unit tests for the JSON Work sync decoder, independent of HTTP."""
+
+    COMMIT = "a" * 40
+    _DEFAULT_COMMIT = object()
+
+    def decode(self, files, playground_commit_id=_DEFAULT_COMMIT, base=None):
+        if playground_commit_id is self._DEFAULT_COMMIT:
+            playground_commit_id = self.COMMIT
+        payload = {
+            "playgroundCommitId": playground_commit_id,
+            "baseCommitId": base,
+            "files": files,
+        }
+        return works.decode_work_sync_request(payload)
+
+    @staticmethod
+    def encoded(mapping):
+        return [
+            {
+                "path": path,
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+            for path, data in mapping.items()
+        ]
+
+    def assert_reason(self, expected, files, **kwargs):
+        with self.assertRaises(works.WorkValidationError) as caught:
+            self.decode(files, **kwargs)
+        self.assertEqual(caught.exception.reason, expected)
+
+    def test_decodes_a_valid_request_to_a_bounded_mapping(self):
+        request = self.decode(
+            self.encoded(
+                {"work/main.py": b"print(1)", "work/pkg/util.py": b"u"}
+            ),
+            base="b" * 40,
+        )
+        self.assertEqual(request.playground_commit_id, self.COMMIT)
+        self.assertEqual(request.base_commit_id, "b" * 40)
+        self.assertEqual(
+            dict(request.files),
+            {"work/main.py": b"print(1)", "work/pkg/util.py": b"u"},
+        )
+        # The decoded files are the same immutable type the domain expects.
+        self.assertEqual(type(request.files), type(self.work_files({})))
+
+    def test_empty_snapshot_is_allowed(self):
+        request = self.decode([], base=None)
+        self.assertEqual(dict(request.files), {})
+        self.assertIsNone(request.base_commit_id)
+
+    def test_payload_must_be_a_mapping_with_all_three_keys(self):
+        for payload in ([], None, "x", 7):
+            with self.subTest(payload=payload):
+                with self.assertRaises(works.WorkValidationError) as caught:
+                    works.decode_work_sync_request(payload)
+                self.assertEqual(
+                    caught.exception.reason, works.REASON_INVALID_PAYLOAD
+                )
+
+        for missing in ("playgroundCommitId", "baseCommitId", "files"):
+            payload = {
+                "playgroundCommitId": self.COMMIT,
+                "baseCommitId": None,
+                "files": [],
+            }
+            del payload[missing]
+            with self.subTest(missing=missing):
+                with self.assertRaises(works.WorkValidationError) as caught:
+                    works.decode_work_sync_request(payload)
+                self.assertEqual(
+                    caught.exception.reason, works.REASON_INVALID_PAYLOAD
+                )
+
+    def test_commit_ids_must_be_non_empty_strings(self):
+        for value in (None, "", 0, [], {}):
+            with self.subTest(playground=value):
+                self.assert_reason(
+                    works.REASON_INVALID_PAYLOAD,
+                    [],
+                    playground_commit_id=value,
+                )
+        for value in ("", 0, [], {}):
+            with self.subTest(base=value):
+                self.assert_reason(
+                    works.REASON_INVALID_PAYLOAD, [], base=value
+                )
+
+    def test_files_must_be_a_list(self):
+        for value in (None, {}, "x", 0):
+            with self.subTest(files=value):
+                self.assert_reason(works.REASON_INVALID_FILES, value)
+
+    def test_entry_must_be_a_mapping_with_string_data(self):
+        self.assert_reason(works.REASON_INVALID_ENTRY, ["not-an-entry"])
+        self.assert_reason(
+            works.REASON_ENTRY_DATA_NOT_BYTES, [{"path": "work/a.py"}]
+        )
+        self.assert_reason(
+            works.REASON_ENTRY_DATA_NOT_BYTES,
+            [{"path": "work/a.py", "data": b"raw"}],
+        )
+
+    def test_malformed_base64_is_rejected(self):
+        for encoded in ("!!!!", "abc", "A" * 5, "x", "AB=C", "\u00e9"):
+            with self.subTest(encoded=encoded):
+                self.assert_reason(
+                    works.REASON_INVALID_BASE64,
+                    [{"path": "work/a.py", "data": encoded}],
+                )
+
+    def test_duplicate_paths_are_rejected(self):
+        self.assert_reason(
+            works.REASON_DUPLICATE_PATH,
+            [
+                {"path": "work/a.py", "data": "MQ=="},
+                {"path": "work/a.py", "data": "Mg=="},
+            ],
+        )
+
+        # Two distinct raw spellings that normalize to one NFC path collide.
+        nfc = "work/caf\u00e9.py"
+        nfd = "work/cafe\u0301.py"
+        self.assertNotEqual(nfc, nfd)
+        self.assert_reason(
+            works.REASON_DUPLICATE_PATH,
+            [
+                {"path": nfc, "data": "MQ=="},
+                {"path": nfd, "data": "Mg=="},
+            ],
+        )
+
+    def test_path_rules_reuse_the_work_validator(self):
+        cases = [
+            ("course/module/app.py", works.REASON_PATH_NOT_ALLOWED),
+            (".picopg/work.json", works.REASON_PATH_NOT_ALLOWED),
+            ("work/../escape.py", works.REASON_PATH_DOT_SEGMENT),
+            ("work//empty.py", works.REASON_PATH_EMPTY_SEGMENT),
+            ("work/a\x00b.py", works.REASON_PATH_NUL),
+        ]
+        for path, reason in cases:
+            with self.subTest(path=path):
+                self.assert_reason(
+                    reason, [{"path": path, "data": "MQ=="}]
+                )
+
+    def test_entry_count_is_checked_before_decoding(self):
+        with mock.patch.object(works, "MAX_WORK_ENTRY_COUNT", 1):
+            # The second entry has malformed base64, so this only passes if
+            # the count is rejected before any entry is decoded.
+            self.assert_reason(
+                works.REASON_TOO_MANY_ENTRIES,
+                [
+                    {"path": "work/a.py", "data": "MQ=="},
+                    {"path": "work/b.py", "data": "!!!!"},
+                ],
+            )
+
+    def test_file_and_total_limits_are_enforced(self):
+        with mock.patch.object(works, "MAX_WORK_FILE_BYTES", 2):
+            self.assert_reason(
+                works.REASON_FILE_TOO_LARGE,
+                [{"path": "work/a.py", "data": "YWJj"}],
+            )
+
+        with mock.patch.object(works, "MAX_WORK_TOTAL_BYTES", 2):
+            self.assert_reason(
+                works.REASON_WORK_TOO_LARGE,
+                [
+                    {"path": "work/a.py", "data": "YWI="},
+                    {"path": "work/b.py", "data": "Y2Q="},
+                ],
+            )
+
+    def test_sync_body_ceiling_covers_the_maximum_snapshot(self):
+        self.assertEqual(
+            works.MAX_SYNC_JSON_BODY_BYTES, 2 * works.MAX_WORK_TOTAL_BYTES
+        )
+        # Base64 of the largest allowed snapshot must fit inside the ceiling.
+        base64_size = 4 * ((works.MAX_WORK_TOTAL_BYTES + 2) // 3)
+        self.assertLess(base64_size, works.MAX_SYNC_JSON_BODY_BYTES)
+
+    def test_new_reason_codes_are_registered(self):
+        for reason in (
+            works.REASON_INVALID_PAYLOAD,
+            works.REASON_INVALID_FILES,
+            works.REASON_INVALID_BASE64,
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, works.REASON_CODES)
 
 
 if __name__ == "__main__":

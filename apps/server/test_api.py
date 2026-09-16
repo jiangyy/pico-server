@@ -1,5 +1,6 @@
 """HTTP tests for the account API."""
 
+import base64
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import accounts
 import bundles
 import generated
 import repository
+import works
 from database import open_database
 from server import MAX_JSON_BODY_BYTES, make_server
 
@@ -3188,6 +3190,591 @@ class GeneratedCacheApiTest(unittest.TestCase):
             f"/commits/{commit_id}/manifest",
         )
         self.assertEqual((status, body["code"]), (404, "not_found"))
+
+
+class WorkSyncApiTest(unittest.TestCase):
+    """HTTP contract for the bounded Work synchronization endpoint."""
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        base = Path(cls.temporary_directory.name)
+        cls.database_path = base / "app.db"
+        cls.repository_path = base / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def set_policy(self, token, playground_id, policy):
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": policy},
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        return body["playground"]
+
+    def publish(self, token, playground_id, course_data=b"print(1)"):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("picopg.json", self.MANIFEST)
+            archive.writestr("course/module/app.py", course_data)
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=buffer.getvalue(),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": self.unique("key")},
+        )
+        self.assertEqual(status, 201)
+        return body["commitId"]
+
+    def sync_path(self, playground_id):
+        return f"/api/v1/works/{playground_id}/sync"
+
+    @staticmethod
+    def files(mapping):
+        return [
+            {"path": path, "data": base64.b64encode(data).decode("ascii")}
+            for path, data in mapping.items()
+        ]
+
+    def sync(
+        self, token, playground_id, playground_commit_id, mapping, base=None
+    ):
+        return self.request(
+            "POST",
+            self.sync_path(playground_id),
+            {
+                "playgroundCommitId": playground_commit_id,
+                "baseCommitId": base,
+                "files": self.files(mapping),
+            },
+            token=token,
+        )
+
+    def public_playground_as_admin(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        student = self.seed_user("student")
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        commit_id = self.publish(admin_token, playground_id)
+        return (
+            admin_token,
+            student,
+            student_token,
+            playground_id,
+            commit_id,
+        )
+
+    def work_head(self, playground_id, student_id):
+        return repository.resolve_work_head(
+            self.server.repository, playground_id, student_id
+        )
+
+    # ----- success and CAS -------------------------------------------------
+
+    def test_initial_and_next_sync_status_and_shape(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"print('a')"}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["playgroundCommitId"], commit_id)
+        first = body["workCommitId"]
+        self.assertTrue(first)
+        self.assertEqual(
+            self.work_head(playground_id, student.id), first
+        )
+
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"print('b')", "work/pkg/util.py": b"u"},
+            base=first,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["playgroundCommitId"], commit_id)
+        second = body["workCommitId"]
+        self.assertNotEqual(second, first)
+        self.assertEqual(
+            self.work_head(playground_id, student.id), second
+        )
+
+        # The assembled tree keeps the pinned Playground content beside the
+        # submitted Work snapshot and the Server-owned Work manifest.
+        tree = {
+            entry.path
+            for entry in repository.list_commit_tree(
+                self.server.repository, second
+            )
+        }
+        self.assertEqual(
+            tree,
+            {
+                ".picopg/work.json",
+                "course/module/app.py",
+                "picopg.json",
+                "work/main.py",
+                "work/pkg/util.py",
+            },
+        )
+
+    def test_exact_retry_after_success_conflicts_with_canonical_head(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        self.assertEqual(status, 201)
+        first = body["workCommitId"]
+
+        # Resending the applied first request conflicts instead of being
+        # treated as an idempotent replay.
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "work_head_changed")
+        self.assertEqual(body["currentHeadCommitId"], first)
+
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"b"}, base=first
+        )
+        self.assertEqual(status, 200)
+        second = body["workCommitId"]
+
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"b"}, base=first
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "work_head_changed")
+        self.assertEqual(body["currentHeadCommitId"], second)
+
+    def test_two_clients_race_on_one_stale_base(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        self.assertEqual(status, 201)
+        base = body["workCommitId"]
+
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"client-a"},
+            base=base,
+        )
+        self.assertEqual(status, 200)
+        winner = body["workCommitId"]
+
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"client-b"},
+            base=base,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["currentHeadCommitId"], winner)
+
+        # The loser recovers by retrying against the reported HEAD.
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"client-b"},
+            base=winner,
+        )
+        self.assertEqual(status, 200)
+
+    # ----- rejected bodies -------------------------------------------------
+
+    def test_malformed_and_duplicate_files_are_rejected(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        path = self.sync_path(playground_id)
+        cases = [
+            (
+                {
+                    "playgroundCommitId": commit_id,
+                    "baseCommitId": None,
+                    "files": [{"path": "work/a.py", "data": "!!!!"}],
+                },
+                "invalid_base64",
+            ),
+            (
+                {
+                    "playgroundCommitId": commit_id,
+                    "baseCommitId": None,
+                    "files": [
+                        {"path": "work/a.py", "data": "MQ=="},
+                        {"path": "work/a.py", "data": "Mg=="},
+                    ],
+                },
+                "duplicate_path",
+            ),
+            (
+                {
+                    "playgroundCommitId": commit_id,
+                    "baseCommitId": None,
+                    "files": [{"path": "course/x.py", "data": "MQ=="}],
+                },
+                "path_not_allowed",
+            ),
+            (
+                {
+                    "playgroundCommitId": commit_id,
+                    "baseCommitId": None,
+                    "files": {"work/a.py": "MQ=="},
+                },
+                "invalid_files",
+            ),
+            (
+                {
+                    "playgroundCommitId": commit_id,
+                    "files": [{"path": "work/a.py", "data": "MQ=="}],
+                },
+                "invalid_payload",
+            ),
+            (
+                {
+                    "playgroundCommitId": commit_id,
+                    "baseCommitId": None,
+                    "files": ["not-an-entry"],
+                },
+                "invalid_entry",
+            ),
+        ]
+        for payload, reason in cases:
+            with self.subTest(reason=reason):
+                status, _, body = self.request(
+                    "POST", path, payload, token=token
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["code"], "invalid_request")
+                self.assertEqual(body["details"]["reason"], reason)
+
+        # No rejected request partially created a Work commit.
+        self.assertIsNone(self.work_head(playground_id, student.id))
+
+    def test_work_limits_are_rejected_without_writing_a_commit(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        with mock.patch.object(works, "MAX_WORK_ENTRY_COUNT", 1):
+            status, _, body = self.sync(
+                token,
+                playground_id,
+                commit_id,
+                {"work/a.py": b"1", "work/b.py": b"2"},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["details"]["reason"], "too_many_entries")
+
+        with mock.patch.object(works, "MAX_WORK_FILE_BYTES", 2):
+            status, _, body = self.sync(
+                token, playground_id, commit_id, {"work/a.py": b"abc"}
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["details"]["reason"], "file_too_large")
+
+        with mock.patch.object(works, "MAX_WORK_TOTAL_BYTES", 2):
+            status, _, body = self.sync(
+                token,
+                playground_id,
+                commit_id,
+                {"work/a.py": b"ab", "work/b.py": b"cd"},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["details"]["reason"], "work_too_large")
+
+        self.assertIsNone(self.work_head(playground_id, student.id))
+
+    def test_oversized_json_body_is_rejected_before_reading(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        # The declared length is over the ceiling while the sent body stays
+        # small, so the server must answer 413 without consuming the stream.
+        status, _, body = self.request(
+            "POST",
+            self.sync_path(playground_id),
+            raw_body=b"{}",
+            token=token,
+            extra_headers={
+                "Content-Length": str(works.MAX_SYNC_JSON_BODY_BYTES + 1),
+            },
+        )
+        self.assertEqual((status, body["code"]), (413, "request_too_large"))
+
+    def test_error_responses_never_echo_source_bytes(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        secret = b"TOP-SECRET-WORK-SOURCE-BYTES"
+        encoded = base64.b64encode(secret).decode("ascii")
+
+        # The data decodes successfully; the request fails on the path, so the
+        # error is produced after the source bytes were already in memory.
+        status, _, body = self.request(
+            "POST",
+            self.sync_path(playground_id),
+            {
+                "playgroundCommitId": commit_id,
+                "baseCommitId": None,
+                "files": [{"path": "course/leak.py", "data": encoded}],
+            },
+            token=token,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["details"]["reason"], "path_not_allowed")
+        rendered = json.dumps(body)
+        self.assertNotIn(encoded, rendered)
+        self.assertNotIn(secret.decode("ascii"), rendered)
+
+    # ----- authorization and conflict privacy -----------------------------
+
+    def test_authentication_and_student_ownership(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        teacher = self.seed_user("teacher")
+        teacher_token = self.login_token(teacher.username)
+        student = self.seed_user("student")
+        student_token = self.login_token(student.username)
+
+        public_id = self.unique("pg")
+        self.create_playground(admin_token, public_id)
+        self.set_policy(admin_token, public_id, "public")
+        public_commit = self.publish(admin_token, public_id)
+
+        private_id = self.unique("pg")
+        self.create_playground(admin_token, private_id)
+        private_commit = self.publish(admin_token, private_id)
+
+        public_body = {
+            "playgroundCommitId": public_commit,
+            "baseCommitId": None,
+            "files": self.files({"work/a.py": b"x"}),
+        }
+        private_body = {
+            "playgroundCommitId": private_commit,
+            "baseCommitId": None,
+            "files": self.files({"work/a.py": b"x"}),
+        }
+
+        for token in (None, "bogus"):
+            status, _, response = self.request(
+                "POST", self.sync_path(public_id), public_body, token=token
+            )
+            self.assertEqual(
+                (status, response["code"]), (401, "invalid_session")
+            )
+
+        # Only Students own Work; Admin and Teacher are forbidden.
+        for token in (admin_token, teacher_token):
+            status, _, response = self.request(
+                "POST", self.sync_path(public_id), public_body, token=token
+            )
+            self.assertEqual((status, response["code"]), (403, "forbidden"))
+            self.assertNotIn("currentHeadCommitId", response)
+
+        # A Student who cannot read the pinned commit is denied without
+        # learning whether a Work HEAD exists.
+        status, _, response = self.request(
+            "POST", self.sync_path(private_id), private_body,
+            token=student_token,
+        )
+        self.assertEqual((status, response["code"]), (403, "forbidden"))
+        self.assertNotIn("currentHeadCommitId", response)
+        self.assertIsNone(self.work_head(private_id, student.id))
+
+    def test_conflict_does_not_expose_another_students_head(self):
+        _, _, _, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        student_a = self.seed_user("student")
+        token_a = self.login_token(student_a.username)
+        student_b = self.seed_user("student")
+        token_b = self.login_token(student_b.username)
+
+        status, _, body = self.sync(
+            token_a, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        self.assertEqual(status, 201)
+        head_a = body["workCommitId"]
+
+        # B presents A's HEAD as its base while B has no Work ref yet, so the
+        # conflict must report B's own absent HEAD, never A's commit.
+        status, _, body = self.sync(
+            token_b, playground_id, commit_id, {"work/main.py": b"b"},
+            base=head_a,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "work_head_changed")
+        self.assertIsNone(body["currentHeadCommitId"])
+        self.assertNotIn(head_a, json.dumps(body))
+
+    def test_pinned_playground_cannot_be_changed(self):
+        admin_token, student, token, playground_id, first_commit = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, first_commit, {"work/main.py": b"a"}
+        )
+        self.assertEqual(status, 201)
+        work_head = body["workCommitId"]
+
+        second_commit = self.publish(
+            admin_token, playground_id, b"print(2)"
+        )
+        self.assertNotEqual(second_commit, first_commit)
+
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            second_commit,
+            {"work/main.py": b"b"},
+            base=work_head,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            body["details"]["reason"], "work_playground_mismatch"
+        )
+        # The Work ref did not move and no second commit was written.
+        self.assertEqual(
+            self.work_head(playground_id, student.id), work_head
+        )
+
+    # ----- routing ---------------------------------------------------------
+
+    def test_route_methods_and_paths(self):
+        playground_id = self.unique("pg")
+        path = self.sync_path(playground_id)
+        for method in ("GET", "PUT", "PATCH", "DELETE"):
+            status, headers, body = self.request(method, path)
+            self.assertEqual(status, 405, method)
+            self.assertEqual(headers.get("allow"), "POST", method)
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        for bad in (
+            f"/api/v1/works/{playground_id}/sync/extra",
+            f"/api/v1/works/{playground_id}/other",
+            "/api/v1/works//sync",
+            "/api/v1/works/sync",
+        ):
+            status, _, body = self.request("POST", bad)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), bad
+            )
 
 
 if __name__ == "__main__":

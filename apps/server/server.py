@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 import authorization
 import manifests
+import works
 from accounts import (
     ForbiddenActionError,
     InvalidRoleError,
@@ -71,6 +72,7 @@ from repository import (
     CommitMetadata,
     PlaygroundHeadChangedError,
     RepositoryError,
+    WorkHeadChangedError,
     open_repository,
 )
 from sessions import (
@@ -107,6 +109,8 @@ CLASSES_PATH = "/api/v1/classes"
 ADMIN_PUBLISHERS_PATH = "/api/v1/admin/publishers"
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
+WORKS_PATH = "/api/v1/works"
+WORK_SYNC_SUFFIX = "/sync"
 COMMITS_SEGMENT = "commits"
 FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
@@ -201,6 +205,18 @@ def _match_playground(path):
         return None
 
     playground_id = path[len(prefix):]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
+def _match_work_sync(path):
+    """Return the opaque playground ID in a Work sync path, else None."""
+    prefix = WORKS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(WORK_SYNC_SUFFIX):
+        return None
+
+    playground_id = path[len(prefix): -len(WORK_SYNC_SUFFIX)]
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
@@ -320,6 +336,8 @@ def _allowed_methods(path):
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
     if _match_playground_commit(path) is not None:
+        return ("POST",)
+    if _match_work_sync(path) is not None:
         return ("POST",)
     if _match_manifest(path) is not None:
         return ALLOWED_METHODS
@@ -449,6 +467,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_playground()
         elif _match_playground_commit(path) is not None:
             self._post_playground_commit(_match_playground_commit(path))
+        elif _match_work_sync(path) is not None:
+            self._post_work_sync(_match_work_sync(path))
         elif _match_class_releases(path) is not None:
             self._post_class_release(_match_class_releases(path))
         elif _allowed_methods(path) is not None:
@@ -1081,6 +1101,69 @@ class Handler(BaseHTTPRequestHandler):
 
         self._respond_json(status, body)
 
+    def _post_work_sync(self, playground_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json(max_bytes=works.MAX_SYNC_JSON_BODY_BYTES)
+        if payload is None:
+            return
+
+        try:
+            request = works.decode_work_sync_request(payload)
+        except works.WorkValidationError as error:
+            self._api_error(
+                400, "invalid_request", details={"reason": error.reason}
+            )
+            return
+
+        try:
+            with self._database() as connection:
+                result = works.create_work_commit(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    playground_id,
+                    request.playground_commit_id,
+                    request.files,
+                    base_commit_id=request.base_commit_id,
+                )
+        except works.WorkValidationError as error:
+            self._api_error(
+                400, "invalid_request", details={"reason": error.reason}
+            )
+            return
+        except WorkHeadChangedError:
+            # The caller's own canonical HEAD is reported; ownership was
+            # already established, so no other Student's HEAD is exposed.
+            current_head = works.current_work_head(
+                self.server.repository, playground_id, actor.id
+            )
+            self._respond_json(
+                409,
+                {
+                    "code": "work_head_changed",
+                    "currentHeadCommitId": current_head,
+                },
+            )
+            return
+        except authorization.ContentAccessDeniedError:
+            self._api_error(403, "forbidden")
+            return
+        except RepositoryError:
+            self._api_error(400, "invalid_request")
+            return
+
+        status = 201 if result.base_commit_id is None else 200
+        self._respond_json(
+            status,
+            {
+                "workCommitId": result.commit_id,
+                "playgroundCommitId": result.playground_commit_id,
+            },
+        )
+
     def _publish_bundle(self, connection, actor, playground_id, bundle):
         result = publish_playground(
             connection,
@@ -1278,7 +1361,7 @@ class Handler(BaseHTTPRequestHandler):
             revoke_session(connection, token)
         self._respond(204, "")
 
-    def _read_json(self):
+    def _read_json(self, max_bytes=MAX_JSON_BODY_BYTES):
         if self.headers.get_content_type() != "application/json":
             self._api_error(415, "unsupported_media_type")
             return None
@@ -1292,7 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
         if content_length < 0:
             self._api_error(400, "invalid_request")
             return None
-        if content_length > MAX_JSON_BODY_BYTES:
+        if content_length > max_bytes:
             self._api_error(413, "request_too_large")
             return None
 
