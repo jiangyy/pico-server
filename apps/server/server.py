@@ -108,6 +108,7 @@ PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
 WORKS_PATH = "/api/v1/works"
 WORK_SYNC_SUFFIX = "/sync"
+WORK_RESTORE_SUFFIX = "/restore"
 COMMITS_SEGMENT = "commits"
 FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
@@ -202,6 +203,18 @@ def _match_work_sync(path):
         return None
 
     playground_id = path[len(prefix): -len(WORK_SYNC_SUFFIX)]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
+def _match_work_restore(path):
+    """Return the opaque playground ID in a Work restore path, else None."""
+    prefix = WORKS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(WORK_RESTORE_SUFFIX):
+        return None
+
+    playground_id = path[len(prefix): -len(WORK_RESTORE_SUFFIX)]
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
@@ -321,6 +334,8 @@ def _allowed_methods(path):
     if _match_playground_commit(path) is not None:
         return ("POST",)
     if _match_work_sync(path) is not None:
+        return ("POST",)
+    if _match_work_restore(path) is not None:
         return ("POST",)
     if _match_manifest(path) is not None:
         return ALLOWED_METHODS
@@ -452,6 +467,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_playground_commit(_match_playground_commit(path))
         elif _match_work_sync(path) is not None:
             self._post_work_sync(_match_work_sync(path))
+        elif _match_work_restore(path) is not None:
+            self._post_work_restore(_match_work_restore(path))
         elif _match_class_releases(path) is not None:
             self._post_class_release(_match_class_releases(path))
         elif _allowed_methods(path) is not None:
@@ -1095,6 +1112,68 @@ class Handler(BaseHTTPRequestHandler):
         status = 201 if result.base_commit_id is None else 200
         self._respond_json(
             status,
+            {
+                "workCommitId": result.commit_id,
+                "playgroundCommitId": result.playground_commit_id,
+            },
+        )
+
+    def _post_work_restore(self, playground_id):
+        actor = self._authenticate()
+        if actor is None:
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        try:
+            request = works.decode_work_restore_request(payload)
+        except works.WorkValidationError as error:
+            self._api_error(
+                400, "invalid_request", details={"reason": error.reason}
+            )
+            return
+
+        try:
+            with self._database() as connection:
+                result = works.restore_work_commit(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    playground_id,
+                    request.base_commit_id,
+                    request.source_commit_id,
+                )
+        except works.WorkValidationError as error:
+            self._api_error(
+                400, "invalid_request", details={"reason": error.reason}
+            )
+            return
+        except WorkHeadChangedError:
+            # An appended restore never rewinds the ref.  The caller's own
+            # canonical HEAD is reported; ownership was already established,
+            # so no other Student's HEAD is exposed.
+            current_head = works.current_work_head(
+                self.server.repository, playground_id, actor.id
+            )
+            self._respond_json(
+                409,
+                {
+                    "code": "work_head_changed",
+                    "currentHeadCommitId": current_head,
+                },
+            )
+            return
+        except authorization.ContentAccessDeniedError:
+            self._api_error(403, "forbidden")
+            return
+        except RepositoryError:
+            self._api_error(400, "invalid_request")
+            return
+
+        self._respond_json(
+            201,
             {
                 "workCommitId": result.commit_id,
                 "playgroundCommitId": result.playground_commit_id,

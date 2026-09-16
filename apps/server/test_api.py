@@ -3648,5 +3648,527 @@ class WorkSyncApiTest(unittest.TestCase):
             )
 
 
+class WorkRestoreApiTest(unittest.TestCase):
+    """HTTP contract for the append-only Work restoration endpoint."""
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        base = Path(cls.temporary_directory.name)
+        cls.database_path = base / "app.db"
+        cls.repository_path = base / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    # ----- generic HTTP helpers -----------------------------------------
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def set_policy(self, token, playground_id, policy):
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": policy},
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        return body["playground"]
+
+    def publish(self, token, playground_id, course_data=b"print(1)"):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("picopg.json", self.MANIFEST)
+            archive.writestr("course/module/app.py", course_data)
+        status, _, body = self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=buffer.getvalue(),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": self.unique("key")},
+        )
+        self.assertEqual(status, 201)
+        return body["commitId"]
+
+    # ----- Work helpers --------------------------------------------------
+
+    @staticmethod
+    def files(mapping):
+        return [
+            {"path": path, "data": base64.b64encode(data).decode("ascii")}
+            for path, data in mapping.items()
+        ]
+
+    def sync(
+        self, token, playground_id, playground_commit_id, mapping, base=None
+    ):
+        return self.request(
+            "POST",
+            f"/api/v1/works/{playground_id}/sync",
+            {
+                "playgroundCommitId": playground_commit_id,
+                "baseCommitId": base,
+                "files": self.files(mapping),
+            },
+            token=token,
+        )
+
+    def restore(self, token, playground_id, base, source):
+        return self.request(
+            "POST",
+            f"/api/v1/works/{playground_id}/restore",
+            {"baseCommitId": base, "sourceCommitId": source},
+            token=token,
+        )
+
+    def work_head(self, playground_id, student_id):
+        return repository.resolve_work_head(
+            self.server.repository, playground_id, student_id
+        )
+
+    def work_ref(self, playground_id, student_id):
+        return self.server.repository.work_ref(playground_id, student_id)
+
+    def parents(self, commit_id):
+        return [
+            value.decode("ascii")
+            for value in self._git(
+                "rev-list", "--parents", "-n", "1", commit_id
+            ).split()[1:]
+        ]
+
+    def tree_id(self, commit_id):
+        return (
+            self._git("rev-parse", f"{commit_id}^{{tree}}")
+            .strip()
+            .decode("ascii")
+        )
+
+    # ----- direct Git helpers (for crafted histories) --------------------
+
+    def _git(self, *arguments, input=None):
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository_path), *arguments],
+            input=input,
+            capture_output=True,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8", "replace")
+        )
+        return completed.stdout
+
+    def _write_tree_node(self, node):
+        lines = []
+        for name in sorted(node):
+            value = node[name]
+            if isinstance(value, dict):
+                object_id = self._write_tree_node(value)
+                lines.append(f"040000 tree {object_id}\t{name}")
+            else:
+                blob = (
+                    self._git("hash-object", "-w", "--stdin", input=value)
+                    .strip()
+                    .decode("ascii")
+                )
+                lines.append(f"100644 blob {blob}\t{name}")
+        return (
+            self._git("mktree", input=("\n".join(lines) + "\n").encode())
+            .strip()
+            .decode("ascii")
+        )
+
+    def craft_commit(self, files, parent=None):
+        root = {}
+        for path, data in files.items():
+            node = root
+            for part in path.split("/")[:-1]:
+                node = node.setdefault(part, {})
+            node[path.split("/")[-1]] = data
+        tree = self._write_tree_node(root)
+        arguments = ["commit-tree", tree]
+        if parent is not None:
+            arguments += ["-p", parent]
+        return (
+            self._git(
+                "-c", "user.name=Test Author",
+                "-c", "user.email=author@example.test",
+                *arguments,
+                input=b"crafted\n",
+            )
+            .strip()
+            .decode("ascii")
+        )
+
+    def public_playground_as_admin(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        student = self.seed_user("student")
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        commit_id = self.publish(admin_token, playground_id)
+        return (
+            admin_token,
+            student,
+            student_token,
+            playground_id,
+            commit_id,
+        )
+
+    # ----- success -------------------------------------------------------
+
+    def test_restore_appends_and_returns_the_new_commit(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        self.assertEqual(status, 201)
+        a = body["workCommitId"]
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"b"},
+            base=a,
+        )
+        self.assertEqual(status, 200)
+        b = body["workCommitId"]
+        status, _, body = self.sync(
+            token,
+            playground_id,
+            commit_id,
+            {"work/main.py": b"c", "work/extra.py": b"e"},
+            base=b,
+        )
+        self.assertEqual(status, 200)
+        c = body["workCommitId"]
+
+        status, _, body = self.restore(token, playground_id, c, a)
+        self.assertEqual(status, 201)
+        new = body["workCommitId"]
+        self.assertNotEqual(new, c)
+        self.assertEqual(body["playgroundCommitId"], commit_id)
+        self.assertEqual(self.work_head(playground_id, student.id), new)
+        # New commit D has C as its sole parent and A's exact tree.
+        self.assertEqual(self.parents(new), [c])
+        self.assertEqual(self.tree_id(new), self.tree_id(a))
+        tree = {
+            entry.path
+            for entry in repository.list_commit_tree(
+                self.server.repository, new
+            )
+        }
+        self.assertNotIn("work/extra.py", tree)
+
+    # ----- conflict and privacy -----------------------------------------
+
+    def test_stale_base_conflicts_with_canonical_head(self):
+        _, _, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        a = body["workCommitId"]
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"b"}, base=a
+        )
+        b = body["workCommitId"]
+
+        status, _, body = self.restore(token, playground_id, a, a)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "work_head_changed")
+        self.assertEqual(body["currentHeadCommitId"], b)
+
+    def test_conflict_does_not_expose_another_students_head(self):
+        _, _, _, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        student_a = self.seed_user("student")
+        token_a = self.login_token(student_a.username)
+        student_b = self.seed_user("student")
+        token_b = self.login_token(student_b.username)
+
+        status, _, body = self.sync(
+            token_a, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        head_a = body["workCommitId"]
+
+        # B presents A's HEAD as its base while B has no Work ref, so the
+        # conflict must report B's own absent HEAD, never A's commit.
+        status, _, body = self.restore(
+            token_b, playground_id, head_a, head_a
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "work_head_changed")
+        self.assertIsNone(body["currentHeadCommitId"])
+        self.assertNotIn(head_a, json.dumps(body))
+
+    def test_restore_requires_an_existing_work(self):
+        _, _, token, playground_id, _ = self.public_playground_as_admin()
+        status, _, body = self.restore(
+            token, playground_id, "a" * 40, "a" * 40
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "work_head_changed")
+
+    # ----- rejection mapping --------------------------------------------
+
+    def test_authentication_and_student_ownership(self):
+        admin_token, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"a"}
+        )
+        head = body["workCommitId"]
+
+        for bad_token in (None, "bogus"):
+            status, _, body = self.restore(
+                bad_token, playground_id, head, head
+            )
+            self.assertEqual(
+                (status, body["code"]), (401, "invalid_session")
+            )
+
+        teacher = self.seed_user("teacher")
+        teacher_token = self.login_token(teacher.username)
+        for actor_token in (admin_token, teacher_token):
+            status, _, body = self.restore(
+                actor_token, playground_id, head, head
+            )
+            self.assertEqual((status, body["code"]), (403, "forbidden"))
+            self.assertNotIn("currentHeadCommitId", body)
+        self.assertEqual(self.work_head(playground_id, student.id), head)
+
+    def test_foreign_or_nonancestor_source_is_denied(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        status, _, body = self.sync(
+            token, playground_id, commit_id, {"work/main.py": b"mine"}
+        )
+        head = body["workCommitId"]
+
+        other = self.seed_user("student")
+        other_token = self.login_token(other.username)
+        status, _, body = self.sync(
+            other_token, playground_id, commit_id, {"work/main.py": b"theirs"}
+        )
+        self.assertEqual(status, 201)
+        other_head = body["workCommitId"]
+
+        # A commit from another Student's Work is not in this history.
+        status, _, body = self.restore(token, playground_id, head, other_head)
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+        # A valid commit from another Playground is not in this history.
+        other_playground = self.unique("pg")
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        self.create_playground(admin_token, other_playground)
+        self.set_policy(admin_token, other_playground, "public")
+        other_commit = self.publish(admin_token, other_playground)
+        status, _, body = self.sync(
+            token, other_playground, other_commit, {"work/main.py": b"x"}
+        )
+        elsewhere = body["workCommitId"]
+        status, _, body = self.restore(
+            token, playground_id, head, elsewhere
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+        self.assertEqual(self.work_head(playground_id, student.id), head)
+
+    def test_restore_rejects_invalid_payload(self):
+        _, _, token, playground_id, _ = self.public_playground_as_admin()
+        path = f"/api/v1/works/{playground_id}/restore"
+        for payload in (
+            {},
+            {"baseCommitId": "a" * 40},
+            {"sourceCommitId": "a" * 40},
+            {"baseCommitId": None, "sourceCommitId": "a" * 40},
+            {"baseCommitId": "a" * 40, "sourceCommitId": ""},
+        ):
+            with self.subTest(payload=payload):
+                status, _, body = self.request(
+                    "POST", path, payload, token=token
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["code"], "invalid_request")
+                self.assertEqual(
+                    body["details"]["reason"], "invalid_payload"
+                )
+
+    def test_corrupt_manifest_source_is_rejected(self):
+        _, student, token, playground_id, commit_id = (
+            self.public_playground_as_admin()
+        )
+        commit = self.craft_commit(
+            {
+                "work/main.py": b"x",
+                ".picopg/work.json": b"{",
+            }
+        )
+        self._git(
+            "update-ref",
+            self.work_ref(playground_id, student.id),
+            commit,
+        )
+        status, _, body = self.restore(token, playground_id, commit, commit)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "invalid_request")
+        self.assertEqual(
+            body["details"]["reason"], "work_manifest_invalid"
+        )
+        self.assertEqual(self.work_head(playground_id, student.id), commit)
+
+    def test_playground_pin_mismatch_is_rejected(self):
+        admin_token, student, token, playground_id, first_commit = (
+            self.public_playground_as_admin()
+        )
+        second_commit = self.publish(
+            admin_token, playground_id, b"print(2)"
+        )
+        pin = lambda value: (
+            '{"playgroundCommitId":"' + value + '"}'
+        ).encode("utf-8")
+        x = self.craft_commit(
+            {
+                "work/main.py": b"x",
+                ".picopg/work.json": pin(second_commit),
+            }
+        )
+        y = self.craft_commit(
+            {
+                "work/main.py": b"y",
+                ".picopg/work.json": pin(first_commit),
+            },
+            parent=x,
+        )
+        self._git(
+            "update-ref", self.work_ref(playground_id, student.id), y
+        )
+        status, _, body = self.restore(token, playground_id, y, x)
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            body["details"]["reason"], "work_playground_mismatch"
+        )
+        self.assertEqual(self.work_head(playground_id, student.id), y)
+
+    # ----- routing -------------------------------------------------------
+
+    def test_restore_route_methods_and_paths(self):
+        playground_id = self.unique("pg")
+        path = f"/api/v1/works/{playground_id}/restore"
+        for method in ("GET", "PUT", "PATCH", "DELETE"):
+            status, headers, body = self.request(method, path)
+            self.assertEqual(status, 405, method)
+            self.assertEqual(headers.get("allow"), "POST", method)
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        for bad in (
+            f"/api/v1/works/{playground_id}/restore/extra",
+            f"/api/v1/works/{playground_id}/other",
+            "/api/v1/works//restore",
+            "/api/v1/works/restore",
+        ):
+            status, _, body = self.request("POST", bad)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), bad
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

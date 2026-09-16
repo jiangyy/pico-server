@@ -1091,6 +1091,411 @@ class WorkCreationTest(WorkTestBase):
         )
 
 
+class WorkRestoreTest(WorkTestBase):
+    """Append-only Work restoration: history only ever grows."""
+
+    def setUp(self):
+        super().setUp()
+        self.playground_id = "pg-restore"
+        self.create_playground(self.teacher, self.playground_id)
+        self.first_playground = self.publish(
+            self.teacher, self.playground_id, b"print(1)"
+        )
+        self.assign_student(self.student)
+        self.release_for(
+            self.klass.id, self.playground_id, self.first_playground.commit_id
+        )
+
+    # ----- helpers -------------------------------------------------------
+
+    def create_history(self):
+        """Create A, B, C and return them in order."""
+
+        a = self.create_work(
+            files={"work/main.py": b"a"},
+            playground_id=self.playground_id,
+            playground_commit_id=self.first_playground.commit_id,
+        )
+        b = self.create_work(
+            base_commit_id=a.commit_id,
+            files={"work/main.py": b"b"},
+            playground_id=self.playground_id,
+            playground_commit_id=self.first_playground.commit_id,
+        )
+        c = self.create_work(
+            base_commit_id=b.commit_id,
+            files={"work/main.py": b"c", "work/extra.py": b"e"},
+            playground_id=self.playground_id,
+            playground_commit_id=self.first_playground.commit_id,
+        )
+        return a, b, c
+
+    def restore(self, base_commit_id, source_commit_id, actor=None):
+        actor = self.student if actor is None else actor
+        return works.restore_work_commit(
+            self.connection,
+            actor,
+            self.repository,
+            self.playground_id,
+            base_commit_id,
+            source_commit_id,
+        )
+
+    def ref(self):
+        return self.repository.work_ref(self.playground_id, self.student.id)
+
+    def tree_id(self, commit_id):
+        return (
+            self.git("rev-parse", f"{commit_id}^{{tree}}")
+            .strip()
+            .decode("ascii")
+        )
+
+    def current_ref(self):
+        return self.git("rev-parse", self.ref()).strip().decode("ascii")
+
+    def is_ancestor(self, commit_id):
+        completed = subprocess.run(
+            [
+                "git", "-C", str(self.repository_path),
+                "merge-base", "--is-ancestor", commit_id, self.ref(),
+            ],
+            capture_output=True,
+        )
+        return completed.returncode == 0
+
+    # ----- success -------------------------------------------------------
+
+    def test_restore_appends_source_tree_on_top_of_current_head(self):
+        a, b, c = self.create_history()
+        result = self.restore(c.commit_id, a.commit_id)
+
+        # New commit D has C as its sole parent and A's exact tree.
+        self.assertEqual(result.base_commit_id, c.commit_id)
+        self.assertEqual(result.playground_commit_id,
+                         self.first_playground.commit_id)
+        self.assertEqual(self.parents(result.commit_id), [c.commit_id])
+        self.assertEqual(
+            self.tree_id(result.commit_id), self.tree_id(a.commit_id)
+        )
+        self.assertEqual(self.current_ref(), result.commit_id)
+        self.assertEqual(
+            self.file_bytes(result.commit_id, "work/main.py"), b"a"
+        )
+        self.assertNotIn(
+            "work/extra.py", self.tree_paths(result.commit_id)
+        )
+        # The full history is still present: A, B, C, D.
+        self.assertEqual(
+            self.work_count(self.ref(), self.first_playground.commit_id),
+            b"4",
+        )
+        for commit in (a.commit_id, b.commit_id, c.commit_id):
+            self.assertTrue(self.is_ancestor(commit))
+
+    def test_restore_never_moves_the_ref_backward(self):
+        a, _, c = self.create_history()
+        result = self.restore(c.commit_id, a.commit_id)
+
+        # The old HEAD is an ancestor of the new one and still exists; the ref
+        # was only ever compare-and-swapped forward.
+        self.assertEqual(self.current_ref(), result.commit_id)
+        self.assertTrue(self.is_ancestor(c.commit_id))
+        self.assertNotEqual(self.current_ref(), a.commit_id)
+        self.assertEqual(
+            self.git("cat-file", "-t", a.commit_id).strip(), b"commit"
+        )
+
+    def test_restore_to_current_head_still_appends_one_commit(self):
+        a, _, c = self.create_history()
+        result = self.restore(c.commit_id, c.commit_id)
+
+        self.assertEqual(self.parents(result.commit_id), [c.commit_id])
+        self.assertEqual(
+            self.tree_id(result.commit_id), self.tree_id(c.commit_id)
+        )
+        self.assertEqual(
+            self.work_count(self.ref(), self.first_playground.commit_id),
+            b"4",
+        )
+
+    def test_restore_is_append_only_and_uses_no_rewriting_command(self):
+        a, _, c = self.create_history()
+        seen = []
+        original = repository._run_git
+
+        def spy(arguments, cwd=None, stdin=None, environment=None):
+            seen.append(tuple(arguments))
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(repository, "_run_git", side_effect=spy):
+            self.restore(c.commit_id, a.commit_id)
+
+        forbidden_verbs = {
+            "reset", "rebase", "merge", "cherry-pick", "checkout",
+            "read-tree", "symbolic-ref", "branch",
+        }
+        for arguments in seen:
+            self.assertNotIn(arguments[0], forbidden_verbs)
+            if arguments[0] == "update-ref":
+                # CAS only: ref new old, never a forced update.
+                self.assertEqual(len(arguments), 4)
+                self.assertNotIn("-f", arguments)
+                self.assertNotIn("--force", arguments)
+        work_ref = self.ref()
+        for arguments in seen:
+            for argument in arguments:
+                if "refs/" in argument:
+                    self.assertEqual(argument, work_ref)
+        # The appended commit has a single parent, so it is not a merge.
+        self.assertEqual(
+            len(self.parents(self.current_ref())), 1
+        )
+
+    # ----- rejected sources ---------------------------------------------
+
+    def test_foreign_work_source_is_denied(self):
+        self.create_history()
+        self.assign_student(self.other_student)
+        other = self.create_work(
+            actor=self.other_student,
+            files={"work/main.py": b"theirs"},
+            playground_id=self.playground_id,
+            playground_commit_id=self.first_playground.commit_id,
+        )
+        mine = self.current_ref()
+
+        with self.assertRaises(
+            authorization.ContentAccessDeniedError
+        ):
+            self.restore(mine, other.commit_id)
+        self.assertEqual(self.current_ref(), mine)
+
+    def test_source_from_another_playground_is_denied(self):
+        _, _, c = self.create_history()
+        other_playground = "pg-restore-other"
+        self.create_playground(self.teacher, other_playground)
+        self.make_public(other_playground)
+        other_commit = self.publish(
+            self.teacher, other_playground, b"other"
+        )
+        elsewhere = self.create_work(
+            files={"work/main.py": b"elsewhere"},
+            playground_id=other_playground,
+            playground_commit_id=other_commit.commit_id,
+        )
+
+        with self.assertRaises(
+            authorization.ContentAccessDeniedError
+        ):
+            self.restore(c.commit_id, elsewhere.commit_id)
+        self.assertEqual(self.current_ref(), c.commit_id)
+
+    def test_nonancestor_commit_is_denied(self):
+        _, _, c = self.create_history()
+        # A valid Work commit on this Playground but not in this Work's
+        # history (a divergent branch) must not be restorable.
+        divergent = self.commit_tree(
+            {"work/main.py": b"divergent"},
+            parent=self.first_playground.commit_id,
+        )
+        with self.assertRaises(
+            authorization.ContentAccessDeniedError
+        ):
+            self.restore(c.commit_id, divergent)
+        self.assertEqual(self.current_ref(), c.commit_id)
+
+    def test_wrong_actor_is_denied_before_any_content_read(self):
+        _, _, c = self.create_history()
+        self.assert_content_not_read()
+        for actor in (self.admin, self.teacher):
+            with self.subTest(role=actor.role):
+                with self.assertRaises(
+                    authorization.ContentAccessDeniedError
+                ):
+                    self.restore(c.commit_id, c.commit_id, actor=actor)
+
+    def test_missing_manifest_source_is_rejected(self):
+        # A source that is in history but has no Server metadata fails closed.
+        commit = self.commit_tree(
+            {"work/main.py": b"x"},
+            parent=self.first_playground.commit_id,
+        )
+        self.git("update-ref", self.ref(), commit)
+
+        with self.assertRaises(works.WorkValidationError) as caught:
+            self.restore(commit, commit)
+        self.assertEqual(
+            caught.exception.reason, works.REASON_WORK_MANIFEST_INVALID
+        )
+        self.assertEqual(self.current_ref(), commit)
+
+    def test_corrupt_manifest_source_is_rejected(self):
+        for manifest in (b"{", b"null", b'{"playgroundCommitId":42}'):
+            with self.subTest(manifest=manifest):
+                commit = self.commit_tree(
+                    {
+                        "work/main.py": b"x",
+                        ".picopg/work.json": manifest,
+                    },
+                    parent=self.first_playground.commit_id,
+                )
+                self.git("update-ref", self.ref(), commit)
+                with self.assertRaises(works.WorkValidationError) as caught:
+                    self.restore(commit, commit)
+                self.assertEqual(
+                    caught.exception.reason,
+                    works.REASON_WORK_MANIFEST_INVALID,
+                )
+                self.assertEqual(self.current_ref(), commit)
+
+    def test_source_with_a_different_playground_pin_is_rejected(self):
+        second = self.publish(
+            self.teacher, self.playground_id, b"print(2)"
+        )
+        manifest = lambda pinned: (
+            '{"playgroundCommitId":"' + pinned + '"}'
+        ).encode("utf-8")
+        # Crafted history: X pins another Playground commit, Y re-pins the
+        # real one.  Restoring X must not silently change the fixed pin.
+        x = self.commit_tree(
+            {
+                "work/main.py": b"x",
+                ".picopg/work.json": manifest(second.commit_id),
+            },
+            parent=self.first_playground.commit_id,
+        )
+        y = self.commit_tree(
+            {
+                "work/main.py": b"y",
+                ".picopg/work.json": manifest(
+                    self.first_playground.commit_id
+                ),
+            },
+            parent=x,
+        )
+        self.git("update-ref", self.ref(), y)
+
+        with self.assertRaises(works.WorkValidationError) as caught:
+            self.restore(y, x)
+        self.assertEqual(
+            caught.exception.reason, works.REASON_WORK_PLAYGROUND_MISMATCH
+        )
+        self.assertEqual(self.current_ref(), y)
+
+    def test_source_tree_with_a_non_file_entry_is_rejected(self):
+        manifest = (
+            '{"playgroundCommitId":"'
+            + self.first_playground.commit_id
+            + '"}'
+        ).encode("utf-8")
+        manifest_blob = (
+            self.git("hash-object", "-w", "--stdin", input=manifest)
+            .strip()
+            .decode("ascii")
+        )
+        picopg_tree = self.git(
+            "mktree",
+            input=(f"100644 blob {manifest_blob}\twork.json\n").encode(),
+        ).strip().decode("ascii")
+        root = self.git(
+            "mktree",
+            input=(
+                f"040000 tree {picopg_tree}\t.picopg\n"
+                f"160000 commit {self.first_playground.commit_id}\tsub\n"
+            ).encode(),
+        ).strip().decode("ascii")
+        commit = (
+            self.git(
+                "commit-tree",
+                root,
+                input=b"crafted\n",
+                environment={
+                    "GIT_AUTHOR_NAME": "Test Author",
+                    "GIT_AUTHOR_EMAIL": "author@example.test",
+                    "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+                    "GIT_COMMITTER_NAME": "Test Author",
+                    "GIT_COMMITTER_EMAIL": "author@example.test",
+                    "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+                },
+            )
+            .strip()
+            .decode("ascii")
+        )
+        self.git("update-ref", self.ref(), commit)
+
+        with self.assertRaises(works.WorkValidationError) as caught:
+            self.restore(commit, commit)
+        self.assertEqual(
+            caught.exception.reason, works.REASON_SOURCE_TREE_INVALID
+        )
+        self.assertEqual(self.current_ref(), commit)
+
+    # ----- stale base ----------------------------------------------------
+
+    def test_stale_or_missing_base_is_a_conflict(self):
+        a, b, c = self.create_history()
+        for base in (None, a.commit_id, b.commit_id,
+                     self.first_playground.commit_id, "a" * 40):
+            with self.subTest(base=base):
+                with self.assertRaises(repository.WorkHeadChangedError):
+                    self.restore(base, a.commit_id)
+                self.assertEqual(self.current_ref(), c.commit_id)
+        self.assertEqual(
+            self.work_count(self.ref(), self.first_playground.commit_id),
+            b"3",
+        )
+
+    def test_restore_requires_an_existing_history(self):
+        source = self.commit_tree(
+            {"work/main.py": b"x"},
+            parent=self.first_playground.commit_id,
+        )
+        with self.assertRaises(repository.WorkHeadChangedError):
+            self.restore(None, source)
+        self.assertFalse(self.ref_exists(self.ref()))
+
+
+class WorkRestoreDecodeTest(WorkTestBase):
+    """Unit tests for the Work restore JSON decoder, independent of HTTP."""
+
+    def test_decodes_valid_request(self):
+        request = works.decode_work_restore_request(
+            {"baseCommitId": "a" * 40, "sourceCommitId": "b" * 40}
+        )
+        self.assertEqual(request.base_commit_id, "a" * 40)
+        self.assertEqual(request.source_commit_id, "b" * 40)
+
+    def test_malformed_payloads_are_rejected(self):
+        cases = [
+            [],
+            None,
+            "x",
+            7,
+            {},
+            {"baseCommitId": "a" * 40},
+            {"sourceCommitId": "b" * 40},
+            {"baseCommitId": None, "sourceCommitId": "b" * 40},
+            {"baseCommitId": "a" * 40, "sourceCommitId": None},
+            {"baseCommitId": "", "sourceCommitId": "b" * 40},
+            {"baseCommitId": "a" * 40, "sourceCommitId": ""},
+            {"baseCommitId": 5, "sourceCommitId": "b" * 40},
+            {"baseCommitId": "a" * 40, "sourceCommitId": 5},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(works.WorkValidationError) as caught:
+                    works.decode_work_restore_request(payload)
+                self.assertEqual(
+                    caught.exception.reason, works.REASON_INVALID_PAYLOAD
+                )
+
+    def test_source_tree_reason_is_registered(self):
+        self.assertIn(works.REASON_SOURCE_TREE_INVALID, works.REASON_CODES)
+
+
 class WorkSyncDecodeTest(WorkTestBase):
     """Unit tests for the JSON Work sync decoder, independent of HTTP."""
 

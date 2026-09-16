@@ -31,10 +31,13 @@ __all__ = [
     "WorkValidationError",
     "WorkCommit",
     "WorkSyncRequest",
+    "WorkRestoreRequest",
     "validate_work_files",
     "decode_work_sync_request",
+    "decode_work_restore_request",
     "current_work_head",
     "create_work_commit",
+    "restore_work_commit",
     "MAX_WORK_ENTRY_COUNT",
     "MAX_WORK_FILE_BYTES",
     "MAX_WORK_TOTAL_BYTES",
@@ -73,6 +76,7 @@ __all__ = [
     "REASON_INVALID_PAYLOAD",
     "REASON_INVALID_FILES",
     "REASON_INVALID_BASE64",
+    "REASON_SOURCE_TREE_INVALID",
 ]
 
 
@@ -127,6 +131,7 @@ REASON_WORK_PLAYGROUND_MISMATCH = "work_playground_mismatch"
 REASON_INVALID_PAYLOAD = "invalid_payload"
 REASON_INVALID_FILES = "invalid_files"
 REASON_INVALID_BASE64 = "invalid_base64"
+REASON_SOURCE_TREE_INVALID = "source_tree_invalid"
 
 REASON_CODES = frozenset(
     {
@@ -156,6 +161,7 @@ REASON_CODES = frozenset(
         REASON_INVALID_PAYLOAD,
         REASON_INVALID_FILES,
         REASON_INVALID_BASE64,
+        REASON_SOURCE_TREE_INVALID,
     }
 )
 
@@ -213,6 +219,18 @@ class WorkSyncRequest:
     playground_commit_id: str
     base_commit_id: str | None
     files: MappingProxyType
+
+
+@dataclass(frozen=True)
+class WorkRestoreRequest:
+    """One decoded Work restore request.
+
+    ``base_commit_id`` is the Work HEAD the caller observed and
+    ``source_commit_id`` is the historical Work commit whose tree is restored.
+    """
+
+    base_commit_id: str
+    source_commit_id: str
 
 
 def _normalize_work_path(path):
@@ -383,6 +401,36 @@ def decode_work_sync_request(payload):
         playground_commit_id=playground_commit_id,
         base_commit_id=base_commit_id,
         files=validate_work_files(entries),
+    )
+
+
+def decode_work_restore_request(payload):
+    """Decode and validate one Work restore JSON body.
+
+    ``payload`` must carry a non-empty string ``baseCommitId`` (the Work HEAD
+    the caller observed) and a non-empty string ``sourceCommitId`` (the
+    historical Work commit to restore).  The object ids are only checked for
+    shape here; history and authorization are established when the request is
+    applied.  No Git object is read or written here.
+    """
+
+    if type(payload) is not dict:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+
+    try:
+        base_commit_id = payload["baseCommitId"]
+        source_commit_id = payload["sourceCommitId"]
+    except KeyError:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+
+    if type(base_commit_id) is not str or not base_commit_id:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+    if type(source_commit_id) is not str or not source_commit_id:
+        raise WorkValidationError(REASON_INVALID_PAYLOAD)
+
+    return WorkRestoreRequest(
+        base_commit_id=base_commit_id,
+        source_commit_id=source_commit_id,
     )
 
 
@@ -600,5 +648,128 @@ def create_work_commit(
         student_id=student_id,
         commit_id=commit_id,
         playground_commit_id=playground_commit_id,
+        base_commit_id=base_commit_id,
+    )
+
+
+def _read_work_tree(repository, commit_id):
+    """Read one Work commit's complete tree into a ``path -> bytes`` mapping.
+
+    Only plain blobs with the canonical Server mode are accepted.  A crafted
+    commit carrying a submodule, a non-file entry, or an unexpected mode is
+    rejected instead of being silently rewritten into a different tree.
+    """
+
+    entries = repository_module.list_commit_tree(repository, commit_id)
+    planned = []
+    for entry in entries:
+        if entry.kind != "blob" or entry.mode != "100644":
+            raise WorkValidationError(REASON_SOURCE_TREE_INVALID)
+        if entry.size is None:
+            raise WorkValidationError(REASON_SOURCE_TREE_INVALID)
+        planned.append(entry)
+
+    blobs = repository_module.read_blobs(
+        repository, [entry.object_id for entry in planned]
+    )
+    files = {}
+    for entry in planned:
+        data = blobs.get(entry.object_id)
+        if data is None or len(data) != entry.size:
+            raise WorkValidationError(REASON_SOURCE_TREE_INVALID)
+        if entry.path in files:
+            raise WorkValidationError(REASON_SOURCE_TREE_INVALID)
+        files[entry.path] = data
+    return MappingProxyType(dict(files))
+
+
+def restore_work_commit(
+    connection,
+    actor,
+    repository,
+    playground_id,
+    base_commit_id,
+    source_commit_id,
+    *,
+    now=None,
+):
+    """Append a new Work commit whose tree is an older Work commit's tree.
+
+    Restoring is append-only: the new commit has the current Work HEAD as its
+    sole parent and the ref is compare-and-swapped to it, so no history is
+    moved, reset, or merged.  ``base_commit_id`` must equal the current HEAD;
+    ``source_commit_id`` must be a commit already in that Work's history with
+    the same Server-pinned Playground commit.  A foreign or non-ancestor
+    source raises :class:`authorization.ContentAccessDeniedError`; a stale base
+    raises :class:`repository_module.WorkHeadChangedError` and never moves the
+    ref.
+    """
+
+    # A Work belongs to exactly one Student and only that Student may restore
+    # it.  The Work ref is derived from the actor, so another Student's Work
+    # can never be named here.
+    if not isinstance(actor, accounts.User) or actor.role != "student":
+        raise authorization.ContentAccessDeniedError(
+            "content is not readable"
+        )
+    student_id = actor.id
+
+    # Restore never rewinds the ref: it only appends to the exact HEAD the
+    # caller observed, so a missing or moved HEAD is a conflict.
+    head = repository_module.resolve_work_head(
+        repository, playground_id, student_id
+    )
+    if head is None or head != base_commit_id:
+        raise repository_module.WorkHeadChangedError()
+
+    # The source must already belong to this Student's Work history; a foreign
+    # or non-ancestor commit is denied through the one authorization error
+    # before any of its content is read.
+    authorization.authorize_content_read(
+        connection,
+        actor,
+        repository,
+        playground_id,
+        source_commit_id,
+        work_student_id=student_id,
+        now=now,
+    )
+
+    # The pinned Playground commit is Server-owned.  A source with a missing,
+    # malformed, or different pin fails closed before the ref can move.
+    source_playground_commit_id = _read_base_work_playground_commit_id(
+        repository, source_commit_id
+    )
+    head_playground_commit_id = _read_base_work_playground_commit_id(
+        repository, head
+    )
+    if source_playground_commit_id != head_playground_commit_id:
+        raise WorkValidationError(REASON_WORK_PLAYGROUND_MISMATCH)
+
+    # Rebuild the exact source tree and append it as a normal Work commit.
+    files = _read_work_tree(repository, source_commit_id)
+
+    metadata = repository_module.CommitMetadata(
+        name=SERVER_COMMIT_NAME,
+        email=SERVER_COMMIT_EMAIL,
+        timestamp=_server_timestamp(),
+        message=SERVER_COMMIT_MESSAGE,
+    )
+
+    commit_id = repository_module.write_work_commit(
+        repository,
+        playground_id,
+        student_id,
+        source_playground_commit_id,
+        base_commit_id,
+        files,
+        metadata,
+    )
+
+    return WorkCommit(
+        playground_id=playground_id,
+        student_id=student_id,
+        commit_id=commit_id,
+        playground_commit_id=source_playground_commit_id,
         base_commit_id=base_commit_id,
     )
