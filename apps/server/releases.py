@@ -21,6 +21,7 @@ import classes
 import idempotency
 import playgrounds
 import repository as repository_module
+from pagination import Page
 
 
 RELEASE_CREATE_ENDPOINT = "/api/v1/classes/{class_id}/releases"
@@ -328,41 +329,74 @@ def _normalize_now(now):
     return normalize_timestamp(now, "now")
 
 
-def list_releases(connection, actor, now=None):
-    """Return the actor-filtered Release list ordered by ``(open_at, id)``."""
+def list_releases(
+    connection, actor, *, class_id=None, limit=50, after=None, now=None
+):
+    """Return one bounded page of visible Releases ordered by ``(open_at, id)``.
+
+    ``class_id`` filters to one Class and is also the route binding for the
+    class-scoped endpoint.  The authorization predicate is part of the SQL so
+    a page is filled with visible rows.
+    """
+
     _require_actor(actor)
     visible_through = _normalize_now(now)
+    after_open = None
+    after_id = None
+    if after is not None:
+        if type(after) is not list or len(after) != 2:
+            raise ValueError("invalid cursor")
+        after_open, after_id = after
 
-    if actor.role == "admin":
-        rows = connection.execute(
-            "SELECT * FROM releases ORDER BY open_at, id"
-        ).fetchall()
-    elif actor.role == "teacher":
-        rows = connection.execute(
-            """
-            SELECT releases.* FROM releases
-            JOIN classes ON classes.id = releases.class_id
-            WHERE classes.teacher_id = ?
-            ORDER BY releases.open_at, releases.id
-            """,
-            (actor.id,),
-        ).fetchall()
+    conditions = []
+    parameters = []
+    if actor.role == "teacher":
+        joins = " JOIN classes ON classes.id = releases.class_id"
+        conditions.append("classes.teacher_id = ?")
+        parameters.append(actor.id)
     elif actor.role == "student":
-        rows = connection.execute(
-            """
-            SELECT releases.* FROM releases
-            JOIN class_memberships
-                ON class_memberships.class_id = releases.class_id
-            WHERE class_memberships.student_id = ?
-              AND releases.open_at <= ?
-            ORDER BY releases.open_at, releases.id
-            """,
-            (actor.id, visible_through),
-        ).fetchall()
+        joins = (
+            " JOIN class_memberships"
+            " ON class_memberships.class_id = releases.class_id"
+        )
+        conditions.append("class_memberships.student_id = ?")
+        parameters.append(actor.id)
+        conditions.append("releases.open_at <= ?")
+        parameters.append(visible_through)
+    elif actor.role == "admin":
+        joins = ""
     else:
         raise accounts.ForbiddenActionError("unknown role")
 
-    return [_release_from_row(row) for row in rows]
+    if class_id is not None:
+        conditions.append("releases.class_id = ?")
+        parameters.append(class_id)
+    if after_open is not None:
+        conditions.append(
+            "(releases.open_at > ? OR"
+            " (releases.open_at = ? AND releases.id > ?))"
+        )
+        parameters.extend([after_open, after_open, after_id])
+
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    parameters.append(limit + 1)
+    rows = connection.execute(
+        "SELECT releases.* FROM releases"
+        f"{joins}{where}"
+        " ORDER BY releases.open_at, releases.id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+    page_rows = rows[:limit]
+    next_key = (
+        [page_rows[-1]["open_at"], page_rows[-1]["id"]]
+        if len(rows) > limit
+        else None
+    )
+    return Page(
+        items=tuple(_release_from_row(row) for row in page_rows),
+        next_key=next_key,
+    )
 
 
 def _row_is_visible(connection, actor, row, visible_through):

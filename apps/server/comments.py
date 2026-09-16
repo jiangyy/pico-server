@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 import accounts
 import idempotency
 import submissions
+from pagination import Page
 
 
 __all__ = [
@@ -380,8 +381,10 @@ def create_internal_comment(
 # --- reads -----------------------------------------------------------------
 
 
-def list_comments(connection, actor, submission_id):
-    """Return one Submission's Comments ordered by ``(created_at, id)``.
+def list_comments(
+    connection, actor, submission_id, *, limit=50, after=None
+):
+    """Return one bounded page of a Submission's Comments.
 
     A Student may read only their own Submission and a Teacher only a
     Submission in a Class they currently own.  Admin is denied because feedback
@@ -392,6 +395,12 @@ def list_comments(connection, actor, submission_id):
 
     _require_actor(actor)
     submission_id = _require_identifier(submission_id, "submissionId")
+    after_created = None
+    after_id = None
+    if after is not None:
+        if type(after) is not list or len(after) != 2:
+            raise ValueError("invalid cursor")
+        after_created, after_id = after
 
     if actor.role == "admin":
         raise accounts.ForbiddenActionError(
@@ -408,12 +417,28 @@ def list_comments(connection, actor, submission_id):
     else:
         raise accounts.ForbiddenActionError("unknown role")
 
+    conditions = ["submission_id = ?"]
+    parameters = [submission_id]
+    if after_created is not None:
+        conditions.append(
+            "(created_at > ? OR (created_at = ? AND id > ?))"
+        )
+        parameters.extend([after_created, after_created, after_id])
+    parameters.append(limit + 1)
     rows = connection.execute(
-        """
-        SELECT * FROM comments
-        WHERE submission_id = ?
-        ORDER BY created_at, id
-        """,
-        (submission_id,),
+        "SELECT * FROM comments"
+        " WHERE " + " AND ".join(conditions)
+        + " ORDER BY created_at, id LIMIT ?",
+        parameters,
     ).fetchall()
-    return [_comment_from_row(row) for row in rows]
+
+    page_rows = rows[:limit]
+    next_key = (
+        [page_rows[-1]["created_at"], page_rows[-1]["id"]]
+        if len(rows) > limit
+        else None
+    )
+    return Page(
+        items=tuple(_comment_from_row(row) for row in page_rows),
+        next_key=next_key,
+    )

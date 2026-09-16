@@ -21,11 +21,15 @@ from unittest import mock
 
 import accounts
 import bundles
+import classes
+import comments
 import generated
 import pagination
 import playgrounds
+import releases
 import repository
 import server
+import submissions
 import works
 from comments import MAX_COMMENT_BODY_BYTES
 from database import open_database
@@ -2257,10 +2261,21 @@ class ReleaseApiTest(unittest.TestCase):
     def test_release_route_methods_and_allow_headers(self):
         _, _, klass, _, _ = self.teacher_class_playground()
         method_not_allowed = (
-            ("GET", f"/api/v1/classes/{klass['id']}/releases", "POST"),
-            ("PUT", f"/api/v1/classes/{klass['id']}/releases", "POST"),
-            ("PATCH", f"/api/v1/classes/{klass['id']}/releases", "POST"),
-            ("DELETE", f"/api/v1/classes/{klass['id']}/releases", "POST"),
+            (
+                "PUT",
+                f"/api/v1/classes/{klass['id']}/releases",
+                "GET, HEAD, POST",
+            ),
+            (
+                "PATCH",
+                f"/api/v1/classes/{klass['id']}/releases",
+                "GET, HEAD, POST",
+            ),
+            (
+                "DELETE",
+                f"/api/v1/classes/{klass['id']}/releases",
+                "GET, HEAD, POST",
+            ),
             ("POST", "/api/v1/releases", "GET, HEAD"),
             ("PUT", "/api/v1/releases", "GET, HEAD"),
             ("PATCH", "/api/v1/releases", "GET, HEAD"),
@@ -7785,6 +7800,317 @@ class AuditApiTest(unittest.TestCase):
                 return match
             time.sleep(0.005)
         return []
+
+
+class ListPaginationApiTest(unittest.TestCase):
+    """Keyset pagination contract for every list route in scope."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        base = Path(self.temporary_directory.name)
+        self.database_path = base / "app.db"
+        self.repository_path = base / "picopg.git"
+        self.artifacts_path = base / "artifacts"
+        self.generated_path = base / "generated"
+        self.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=self.database_path,
+            repository_path=self.repository_path,
+            artifacts_path=self.artifacts_path,
+            generated_path=self.generated_path,
+            audit_output=io.StringIO(),
+        )
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+        connection = open_database(self.database_path)
+        try:
+            self.admin = accounts.create_user(
+                connection,
+                accounts.User(
+                    id="seed-actor",
+                    username="seed-actor",
+                    role="admin",
+                    created_at="2026-01-01T00:00:00Z",
+                ),
+                "admin-list",
+                "secret",
+                "admin",
+            )
+            self.teacher = accounts.create_user(
+                connection, self.admin, "teacher-list", "secret", "teacher"
+            )
+            self.student = accounts.create_user(
+                connection, self.admin, "student-list", "secret", "student"
+            )
+            self.classes = []
+            for index in range(3):
+                self.classes.append(
+                    classes.create_class(
+                        connection,
+                        self.admin,
+                        f"Class {index}",
+                        self.teacher.id,
+                    )
+                )
+            classes.assign_student(
+                connection,
+                self.admin,
+                self.student.id,
+                self.classes[0].id,
+            )
+            bundle = bundles.validate_bundle(
+                [
+                    bundles.BundleEntry(
+                        "picopg.json",
+                        b'{"schemaVersion":1,"runtime":"python"}',
+                    ),
+                    bundles.BundleEntry("course/a.py", b"print(1)"),
+                ]
+            )
+            metadata = repository.CommitMetadata(
+                name="Tester",
+                email="tester@example.test",
+                timestamp="2026-01-01T00:00:00+00:00",
+                message="publish",
+            )
+            playgrounds.create_playground(
+                connection, self.admin, "pg-lists"
+            )
+            playgrounds.update_playground(
+                connection,
+                self.admin,
+                "pg-lists",
+                {"policy": playgrounds.PUBLIC_POLICY},
+            )
+            published = playgrounds.publish_playground(
+                connection,
+                self.admin,
+                "pg-lists",
+                self.server.repository,
+                bundle,
+                metadata,
+            )
+            self.releases = []
+            for index in range(3):
+                _, body = releases.create_release(
+                    connection,
+                    self.teacher,
+                    self.server.repository,
+                    self.classes[0].id,
+                    "pg-lists",
+                    published.commit_id,
+                    datetime(2020, 1, 1, tzinfo=timezone.utc),
+                    False,
+                    f"release-key-{index}",
+                )
+                self.releases.append(body["release"])
+            work = works.create_work_commit(
+                connection,
+                self.student,
+                self.server.repository,
+                "pg-lists",
+                published.commit_id,
+                works.validate_work_files(
+                    [works.WorkEntry("work/main.py", b"x")]
+                ),
+            )
+            self.submissions = []
+            for index in range(2):
+                _, body = submissions.create_submission(
+                    connection,
+                    self.student,
+                    self.server.repository,
+                    self.releases[0]["id"],
+                    work.commit_id,
+                    f"submission-key-{index}",
+                )
+                self.submissions.append(body["submission"])
+            for index in range(2):
+                comments.create_comment(
+                    connection,
+                    self.teacher,
+                    self.submissions[0]["id"],
+                    f"note {index}",
+                    f"comment-key-{index}",
+                )
+        finally:
+            connection.close()
+
+        self.admin_token = self.login("admin-list")
+        self.teacher_token = self.login("teacher-list")
+        self.student_token = self.login("student-list")
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def request(self, method, path, token=None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+        return status, response_headers, body
+
+    def login(self, username):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(
+            {"username": username, "password": "secret"}
+        ).encode("utf-8")
+        connection.request(
+            "POST",
+            "/api/v1/login",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 200)
+        return body["sessionToken"]
+
+    def traverse(self, path, token, plural, key):
+        seen = []
+        cursor = None
+        while True:
+            url = path + "?limit=1"
+            if cursor is not None:
+                url += f"&cursor={cursor}"
+            status, _, body = self.request("GET", url, token=token)
+            self.assertEqual(status, 200, body)
+            page = json.loads(body)
+            self.assertIn("nextCursor", page)
+            seen.extend(key(item) for item in page[plural])
+            cursor = page["nextCursor"]
+            if cursor is None:
+                break
+        self.assertEqual(len(seen), len(set(seen)), path)
+        return seen
+
+    def test_every_list_route_paginates_without_duplicates(self):
+        by_id = lambda item: item["id"]
+        self.assertGreaterEqual(
+            len(self.traverse("/api/v1/classes", self.admin_token, "classes", by_id)),
+            3,
+        )
+        self.assertGreaterEqual(
+            len(
+                self.traverse(
+                    "/api/v1/releases", self.teacher_token, "releases", by_id
+                )
+            ),
+            3,
+        )
+        self.assertGreaterEqual(
+            len(
+                self.traverse(
+                    f"/api/v1/classes/{self.classes[0].id}/releases",
+                    self.teacher_token,
+                    "releases",
+                    by_id,
+                )
+            ),
+            3,
+        )
+        self.assertGreaterEqual(
+            len(
+                self.traverse(
+                    "/api/v1/submissions", self.admin_token, "submissions", by_id
+                )
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            len(
+                self.traverse(
+                    f"/api/v1/releases/{self.releases[0]['id']}/submissions",
+                    self.admin_token,
+                    "submissions",
+                    by_id,
+                )
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            len(
+                self.traverse(
+                    f"/api/v1/submissions/{self.submissions[0]['id']}/comments",
+                    self.teacher_token,
+                    "comments",
+                    by_id,
+                )
+            ),
+            2,
+        )
+        catalog_key = lambda item: (item["playgroundId"], item["commitId"])
+        self.assertGreaterEqual(
+            len(
+                self.traverse(
+                    "/api/v1/catalog", None, "catalog", catalog_key
+                )
+            ),
+            0,
+        )
+
+    def test_cursor_replay_across_route_and_parent_is_rejected(self):
+        status, _, body = self.request(
+            "GET", "/api/v1/classes?limit=1", self.admin_token
+        )
+        cursor = json.loads(body)["nextCursor"]
+        self.assertIsNotNone(cursor)
+        status, _, body = self.request(
+            "GET", f"/api/v1/releases?cursor={cursor}", self.teacher_token
+        )
+        self.assertEqual((status, json.loads(body)["code"]), (400, "invalid_request"))
+
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/classes/{self.classes[0].id}/releases?limit=1",
+            self.teacher_token,
+        )
+        parent_cursor = json.loads(body)["nextCursor"]
+        self.assertIsNotNone(parent_cursor)
+        status, _, body = self.request(
+            "GET",
+            f"/api/v1/classes/{self.classes[1].id}/releases"
+            f"?cursor={parent_cursor}",
+            self.teacher_token,
+        )
+        self.assertEqual((status, json.loads(body)["code"]), (400, "invalid_request"))
+
+    def test_head_matches_get_and_item_fields_are_preserved(self):
+        status, _, body = self.request(
+            "GET", "/api/v1/classes?limit=1", self.admin_token
+        )
+        page = json.loads(body)
+        self.assertEqual(
+            set(page["classes"][0]),
+            {"id", "name", "teacherId", "createdAt", "archivedAt"},
+        )
+        status_head, head_headers, head_body = self.request(
+            "HEAD", "/api/v1/classes?limit=1", self.admin_token
+        )
+        self.assertEqual((status, status_head), (200, 200))
+        self.assertEqual(head_body, b"")
+        self.assertEqual(
+            head_headers["content-length"],
+            str(len(body)),
+        )
 
 
 if __name__ == "__main__":

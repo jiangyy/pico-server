@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import accounts
 import idempotency
 import repository as repository_module
+from pagination import Page
 
 
 # One logical create scope: the request body names the Release and the Work
@@ -392,53 +393,75 @@ def create_submission(
 # --- reads -----------------------------------------------------------------
 
 
-def list_submissions(connection, actor):
-    """Return the actor-filtered list ordered by ``(created_at, id)``.
+def list_submissions(
+    connection, actor, *, release_id=None, limit=50, after=None
+):
+    """Return one bounded page ordered by ``(created_at, id)``.
 
     A Student sees only their own records, a Teacher sees only records under
     Releases in Classes they own, and an Admin sees all Submission metadata.
-    No role reveals Work source content.
+    ``release_id`` filters to one Release and is the route binding for the
+    release-scoped endpoint.  No role reveals Work source content.
     """
 
     _require_actor(actor)
+    after_created = None
+    after_id = None
+    if after is not None:
+        if type(after) is not list or len(after) != 2:
+            raise ValueError("invalid cursor")
+        after_created, after_id = after
 
-    if actor.role == "admin":
-        rows = connection.execute(
-            """
-            SELECT submissions.*, users.username AS username
-            FROM submissions
-            JOIN users ON users.id = submissions.student_id
-            ORDER BY submissions.created_at, submissions.id
-            """
-        ).fetchall()
-    elif actor.role == "teacher":
-        rows = connection.execute(
-            """
-            SELECT submissions.*, users.username AS username
-            FROM submissions
-            JOIN users ON users.id = submissions.student_id
-            JOIN releases ON releases.id = submissions.release_id
-            JOIN classes ON classes.id = releases.class_id
-            WHERE classes.teacher_id = ?
-            ORDER BY submissions.created_at, submissions.id
-            """,
-            (actor.id,),
-        ).fetchall()
+    conditions = []
+    parameters = []
+    joins = (
+        " JOIN users ON users.id = submissions.student_id"
+    )
+    if actor.role == "teacher":
+        joins += (
+            " JOIN releases ON releases.id = submissions.release_id"
+            " JOIN classes ON classes.id = releases.class_id"
+        )
+        conditions.append("classes.teacher_id = ?")
+        parameters.append(actor.id)
     elif actor.role == "student":
-        rows = connection.execute(
-            """
-            SELECT submissions.*, users.username AS username
-            FROM submissions
-            JOIN users ON users.id = submissions.student_id
-            WHERE submissions.student_id = ?
-            ORDER BY submissions.created_at, submissions.id
-            """,
-            (actor.id,),
-        ).fetchall()
+        conditions.append("submissions.student_id = ?")
+        parameters.append(actor.id)
+    elif actor.role == "admin":
+        pass
     else:
         raise accounts.ForbiddenActionError("unknown role")
 
-    return [_submission_from_row(row) for row in rows]
+    if release_id is not None:
+        conditions.append("submissions.release_id = ?")
+        parameters.append(release_id)
+    if after_created is not None:
+        conditions.append(
+            "(submissions.created_at > ? OR"
+            " (submissions.created_at = ? AND submissions.id > ?))"
+        )
+        parameters.extend([after_created, after_created, after_id])
+
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    parameters.append(limit + 1)
+    rows = connection.execute(
+        "SELECT submissions.*, users.username AS username"
+        " FROM submissions"
+        f"{joins}{where}"
+        " ORDER BY submissions.created_at, submissions.id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+    page_rows = rows[:limit]
+    next_key = (
+        [page_rows[-1]["created_at"], page_rows[-1]["id"]]
+        if len(rows) > limit
+        else None
+    )
+    return Page(
+        items=tuple(_submission_from_row(row) for row in page_rows),
+        next_key=next_key,
+    )
 
 
 def _row_is_visible(connection, actor, row):

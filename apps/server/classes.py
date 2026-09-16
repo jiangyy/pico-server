@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from accounts import ForbiddenActionError, MissingUserError, User
+from pagination import Page
 
 
 class MissingClassError(Exception):
@@ -329,31 +330,63 @@ def list_memberships(connection, actor, class_id):
     return [_membership_from_row(row) for row in rows]
 
 
-def list_classes(connection, actor):
-    """Return readable Classes ordered by ID."""
-    _require_user_actor(actor)
+def list_classes(connection, actor, *, limit=50, after=None):
+    """Return one bounded page of readable Classes ordered by id.
 
+    The keyset predicate and the authorization predicate are both part of the
+    authoritative SQL, so a page is filled with visible rows.  ``after`` is
+    the exclusive ``[id]`` cursor key.
+    """
+
+    _require_user_actor(actor)
+    after_id = _cursor_id(after)
+
+    parameters = []
     if actor.role == "admin":
-        rows = connection.execute(
-            "SELECT * FROM classes ORDER BY id"
-        ).fetchall()
+        where = ""
+        if after_id is not None:
+            where = "WHERE id > ?"
+            parameters.append(after_id)
     elif actor.role == "teacher":
-        rows = connection.execute(
-            "SELECT * FROM classes WHERE teacher_id = ? ORDER BY id",
-            (actor.id,),
-        ).fetchall()
+        where = "WHERE teacher_id = ?"
+        parameters.append(actor.id)
+        if after_id is not None:
+            where += " AND id > ?"
+            parameters.append(after_id)
     elif actor.role == "student":
-        rows = connection.execute(
-            """
-            SELECT classes.* FROM classes
-            JOIN class_memberships
-                ON class_memberships.class_id = classes.id
-            WHERE class_memberships.student_id = ?
-            ORDER BY classes.id
-            """,
-            (actor.id,),
-        ).fetchall()
+        where = (
+            "JOIN class_memberships"
+            " ON class_memberships.class_id = classes.id"
+            " WHERE class_memberships.student_id = ?"
+        )
+        parameters.append(actor.id)
+        if after_id is not None:
+            where += " AND classes.id > ?"
+            parameters.append(after_id)
     else:
         raise ForbiddenActionError("unknown role")
 
-    return [_class_from_row(row) for row in rows]
+    parameters.append(limit + 1)
+    rows = connection.execute(
+        "SELECT classes.* FROM classes "
+        f"{where} ORDER BY classes.id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+    page_rows = rows[:limit]
+    next_key = [page_rows[-1]["id"]] if len(rows) > limit else None
+    return Page(
+        items=tuple(_class_from_row(row) for row in page_rows),
+        next_key=next_key,
+    )
+
+
+def _cursor_id(after):
+    if after is None:
+        return None
+    if type(after) is not list or len(after) != 1:
+        raise ValueError("invalid cursor")
+    value = after[0]
+    if type(value) is not str or not value:
+        raise ValueError("invalid cursor")
+    return value

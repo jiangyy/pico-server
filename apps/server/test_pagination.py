@@ -124,6 +124,28 @@ class ParsePaginationTest(unittest.TestCase):
         with self.assertRaises(pagination.PaginationError):
             pagination.parse_pagination(f"cursor={cursor}", self.ROUTE)
 
+    def test_list_keys_and_parent_scoped_routes(self):
+        route = pagination.scoped_route(
+            pagination.RELEASES_ROUTE, "class-1"
+        )
+        key = ["2020-01-01T00:00:00.000000Z", "release-1"]
+        cursor = pagination.encode_cursor(route, key)
+        self.assertEqual(pagination.decode_cursor(cursor, route), key)
+
+        other = pagination.scoped_route(
+            pagination.RELEASES_ROUTE, "class-2"
+        )
+        with self.assertRaises(pagination.PaginationError):
+            pagination.decode_cursor(cursor, other)
+
+    def test_page_is_sequence_like(self):
+        page = pagination.Page(items=("a", "b"), next_key=["b"])
+        self.assertEqual(len(page), 2)
+        self.assertEqual(list(page), ["a", "b"])
+        self.assertEqual(page[1], "b")
+        self.assertEqual(page, ["a", "b"])
+        self.assertEqual(page.next_key, ["b"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

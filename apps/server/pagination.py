@@ -3,31 +3,38 @@
 A cursor is the base64url encoding (without padding) of one canonical JSON
 object::
 
-    {"key": "<last sort key>", "route": "<route name>", "v": 1}
+    {"key": "<value>" | ["<value>", ...], "route": "<route name>", "v": 1}
 
 The decoded fields are validated exactly, and the cursor is bound to one route
-name and one format version.  A cursor from another route, a non-canonical
-encoding, an extra field, or a changed version is rejected instead of being
-interpreted.  Untrusted cursor text only ever becomes a bound SQL parameter;
-it is never interpolated into SQL.
+name and one format version.  A cursor from another route or another parent
+filter is therefore rejected: filtered routes embed the parent id in the route
+name (for example ``class.releases:<classId>``).  Untrusted cursor text only
+ever becomes a bound SQL parameter; it is never interpolated into SQL.
 """
 
 import base64
 import binascii
 import json
+from dataclasses import dataclass
 from urllib.parse import parse_qs
 
 
 __all__ = [
     "ADMIN_PLAYGROUNDS_ROUTE",
     "ADMIN_USERS_ROUTE",
+    "CATALOG_ROUTE",
+    "CLASSES_ROUTE",
     "CURSOR_VERSION",
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
+    "Page",
     "PaginationError",
+    "RELEASES_ROUTE",
+    "SUBMISSIONS_ROUTE",
     "decode_cursor",
     "encode_cursor",
     "parse_pagination",
+    "scoped_route",
 ]
 
 
@@ -37,6 +44,10 @@ MAX_LIMIT = 100
 
 ADMIN_USERS_ROUTE = "admin.users"
 ADMIN_PLAYGROUNDS_ROUTE = "admin.playgrounds"
+CLASSES_ROUTE = "classes"
+RELEASES_ROUTE = "releases"
+SUBMISSIONS_ROUTE = "submissions"
+CATALOG_ROUTE = "catalog"
 
 _BASE64URL_ALPHABET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -47,9 +58,67 @@ class PaginationError(ValueError):
     """A list query or cursor is malformed or bound to another route."""
 
 
+@dataclass(frozen=True, eq=False)
+class Page:
+    """One keyset page: the visible items and the exclusive next key.
+
+    The page is sequence-like so existing callers can iterate, index, compare
+    to a list, or take its length without unwrapping ``items`` by hand.
+    """
+
+    items: tuple
+    next_key: object | None
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    def __eq__(self, other):
+        if isinstance(other, Page):
+            return (
+                self.items == other.items
+                and self.next_key == other.next_key
+            )
+        if isinstance(other, (list, tuple)):
+            return list(self.items) == list(other)
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((self.items, tuple(self.next_key) if isinstance(self.next_key, list) else self.next_key))
+
+
+def scoped_route(base, parent_id):
+    """Return the route name for one parent-filtered list endpoint."""
+
+    return f"{base}:{parent_id}"
+
+
+def _canonical_key(key):
+    """Return the canonical cursor key, or raise ``PaginationError``."""
+
+    if type(key) is str:
+        if not key:
+            raise PaginationError("cursor key is empty")
+        return key
+    if type(key) in (list, tuple):
+        values = list(key)
+        if not values:
+            raise PaginationError("cursor key is empty")
+        for value in values:
+            if type(value) is not str or not value:
+                raise PaginationError("cursor key field is invalid")
+        return values
+    raise PaginationError("cursor key has an unsupported type")
+
+
 def _canonical_payload(route, key):
     return json.dumps(
-        {"key": key, "route": route, "v": CURSOR_VERSION},
+        {"key": _canonical_key(key), "route": route, "v": CURSOR_VERSION},
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -66,7 +135,7 @@ def encode_cursor(route, key):
 
 
 def decode_cursor(cursor, route):
-    """Return the last sort key from ``cursor``, or raise ``PaginationError``."""
+    """Return the last cursor key from ``cursor``, or raise ``PaginationError``."""
 
     if type(cursor) is not str or not cursor:
         raise PaginationError("cursor must be a non-empty string")
@@ -88,9 +157,7 @@ def decode_cursor(cursor, route):
         raise PaginationError("cursor version is not supported")
     if payload["route"] != route:
         raise PaginationError("cursor is bound to another route")
-    key = payload["key"]
-    if type(key) is not str or not key:
-        raise PaginationError("cursor key is not a non-empty string")
+    key = _canonical_key(payload.get("key"))
     if encode_cursor(route, key) != cursor:
         raise PaginationError("cursor is not canonical")
     return key

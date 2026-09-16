@@ -592,7 +592,7 @@ def _allowed_methods(path):
     if _match_playground(path) is not None:
         return ("PATCH",)
     if _match_class_releases(path) is not None:
-        return ("POST",)
+        return ("GET", "HEAD", "POST")
     if path == CATALOG_PATH:
         return ALLOWED_METHODS
     if path == SUBMISSIONS_PATH:
@@ -865,6 +865,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_me(head_only=head_only)
         elif path == CLASSES_PATH:
             self._get_classes(head_only=head_only)
+        elif _match_class_releases(path) is not None:
+            self._get_class_releases(
+                _match_class_releases(path), head_only=head_only
+            )
         elif _match_class(path) is not None:
             self._get_class(_match_class(path), head_only=head_only)
         elif _match_class_members(path) is not None:
@@ -1060,16 +1064,30 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
 
+        parsed = self._list_query(pagination.CLASSES_ROUTE, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
         try:
             with self._database() as connection:
-                classes = list_classes(connection, actor)
+                page = list_classes(
+                    connection, actor, limit=limit, after=after
+                )
         except ForbiddenActionError:
             self._api_error(403, "forbidden", head_only=head_only)
             return
 
         self._respond_json(
             200,
-            {"classes": [self._class_payload(item) for item in classes]},
+            {
+                "classes": [
+                    self._class_payload(item) for item in page.items
+                ],
+                "nextCursor": self._next_cursor(
+                    pagination.CLASSES_ROUTE, page.next_key
+                ),
+            },
             head_only=head_only,
         )
 
@@ -1279,64 +1297,154 @@ class Handler(BaseHTTPRequestHandler):
         if actor is _AUTH_FAILED:
             return
 
+        parsed = self._list_query(pagination.CATALOG_ROUTE, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
         try:
             with self._database() as connection:
-                entries = self._build_catalog(connection, actor)
+                page = self._build_catalog_page(
+                    connection, actor, limit, after
+                )
         except ForbiddenActionError:
             self._api_error(403, "forbidden", head_only=head_only)
             return
+        except RepositoryError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
 
         self._respond_json(
-            200, {"catalog": entries}, head_only=head_only
+            200,
+            {
+                "catalog": list(page.items),
+                "nextCursor": self._next_cursor(
+                    pagination.CATALOG_ROUTE, page.next_key
+                ),
+            },
+            head_only=head_only,
         )
 
-    def _build_catalog(self, connection, actor):
-        """Return the deduplicated, stably ordered catalog for ``actor``.
+    def _build_catalog_page(self, connection, actor, limit, after):
+        """Return one bounded, deduplicated catalog page.
 
-        Public unarchived Playgrounds contribute their current commit, and an
-        authenticated actor additionally contributes the commits of every
-        Release it is currently authorized to read.  An item is identified by
-        the exact ``(playgroundId, commitId)`` pair, so a commit reachable both
+        The public-current-head stream and the visible Release-pinned stream
+        are each read as bounded, ordered batches, merged, and deduplicated by
+        the exact ``(playgroundId, commitId)`` pair so a commit reachable both
         publicly and through a Release appears once with all its Release ids.
         """
 
-        entries = {}
-        rows = connection.execute(
-            "SELECT id FROM playgrounds"
-            " WHERE policy = ? AND archived_at IS NULL"
-            " ORDER BY id",
-            (PUBLIC_POLICY,),
-        ).fetchall()
-        for row in rows:
-            playground_id = row["id"]
-            if not valid_playground_id(playground_id):
-                raise RepositoryError(
-                    "stored playground identifier is invalid"
+        after_playground = after[0] if after is not None else None
+        after_commit = after[1] if after is not None else None
+
+        public_keys = []
+        cursor = after_playground
+        while len(public_keys) < limit + 1:
+            parameters = [PUBLIC_POLICY]
+            where = "WHERE policy = ? AND archived_at IS NULL"
+            if cursor is not None:
+                where += " AND id > ?"
+                parameters.append(cursor)
+            parameters.append(limit + 1 - len(public_keys))
+            rows = connection.execute(
+                "SELECT id FROM playgrounds "
+                f"{where} ORDER BY id LIMIT ?",
+                parameters,
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                cursor = row["id"]
+                if not valid_playground_id(row["id"]):
+                    raise RepositoryError(
+                        "stored playground identifier is invalid"
+                    )
+                commit_id = manifests.current_playground_commit(
+                    self.server.repository, row["id"]
                 )
-            commit_id = manifests.current_playground_commit(
-                self.server.repository, row["id"]
-            )
-            if commit_id is None:
-                continue
-            entries[(row["id"], commit_id)] = []
+                if commit_id is None:
+                    continue
+                key = (row["id"], commit_id)
+                if after is not None and key <= (
+                    after_playground,
+                    after_commit,
+                ):
+                    continue
+                public_keys.append(key)
+                if len(public_keys) >= limit + 1:
+                    break
 
-        if actor is not None:
-            for release in list_releases(connection, actor):
-                key = (release.playground_id, release.playground_commit_id)
-                entries.setdefault(key, []).append(release.id)
+        entries = {}
+        for key in public_keys:
+            entries.setdefault(key, [])
+        for key, release_id in self._release_catalog_rows(
+            connection, actor, limit, after
+        ):
+            entries.setdefault(key, []).append(release_id)
 
-        catalog = []
-        for playground_id, commit_id in sorted(entries):
-            catalog.append(
-                {
-                    "playgroundId": playground_id,
-                    "commitId": commit_id,
-                    "releaseIds": sorted(
-                        set(entries[(playground_id, commit_id)])
-                    ),
-                }
+        ordered = sorted(entries)[: limit + 1]
+        next_key = list(ordered[limit - 1]) if len(ordered) > limit else None
+        items = tuple(
+            {
+                "playgroundId": key[0],
+                "commitId": key[1],
+                "releaseIds": sorted(set(entries[key])),
+            }
+            for key in ordered[:limit]
+        )
+        return pagination.Page(items=items, next_key=next_key)
+
+    def _release_catalog_rows(self, connection, actor, limit, after):
+        """Return bounded ``((playground_id, commit_id), release_id)`` rows."""
+
+        if actor is None:
+            return []
+        joins = ""
+        conditions = []
+        parameters = []
+        if actor.role == "teacher":
+            joins = " JOIN classes ON classes.id = releases.class_id"
+            conditions.append("classes.teacher_id = ?")
+            parameters.append(actor.id)
+        elif actor.role == "student":
+            joins = (
+                " JOIN class_memberships"
+                " ON class_memberships.class_id = releases.class_id"
             )
-        return catalog
+            conditions.append("class_memberships.student_id = ?")
+            parameters.append(actor.id)
+            conditions.append("releases.open_at <= ?")
+            parameters.append(
+                datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
+            )
+        elif actor.role == "admin":
+            pass
+        else:
+            return []
+
+        if after is not None:
+            conditions.append(
+                "(releases.playground_id, releases.playground_commit_id)"
+                " > (?, ?)"
+            )
+            parameters.extend([after[0], after[1]])
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        parameters.append(limit + 1)
+        rows = connection.execute(
+            "SELECT releases.playground_id AS playground_id,"
+            " releases.playground_commit_id AS commit_id,"
+            " releases.id AS release_id"
+            " FROM releases" + joins + where
+            + " ORDER BY releases.playground_id,"
+            " releases.playground_commit_id, releases.id LIMIT ?",
+            parameters,
+        ).fetchall()
+        return [
+            ((row["playground_id"], row["commit_id"]), row["release_id"])
+            for row in rows
+        ]
 
     def _get_manifest(self, playground_id, commit_id, head_only=False):
         actor = self._optional_actor(head_only=head_only)
@@ -2223,16 +2331,65 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
 
+        parsed = self._list_query(pagination.RELEASES_ROUTE, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
         try:
             with self._database() as connection:
-                releases = list_releases(connection, actor)
+                page = list_releases(
+                    connection, actor, limit=limit, after=after
+                )
         except ForbiddenActionError:
             self._api_error(403, "forbidden", head_only=head_only)
             return
 
         self._respond_json(
             200,
-            {"releases": [release_to_mapping(item) for item in releases]},
+            {
+                "releases": [
+                    release_to_mapping(item) for item in page.items
+                ],
+                "nextCursor": self._next_cursor(
+                    pagination.RELEASES_ROUTE, page.next_key
+                ),
+            },
+            head_only=head_only,
+        )
+
+    def _get_class_releases(self, class_id, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+
+        route = pagination.scoped_route(pagination.RELEASES_ROUTE, class_id)
+        parsed = self._list_query(route, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
+        try:
+            with self._database() as connection:
+                page = list_releases(
+                    connection,
+                    actor,
+                    class_id=class_id,
+                    limit=limit,
+                    after=after,
+                )
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {
+                "releases": [
+                    release_to_mapping(item) for item in page.items
+                ],
+                "nextCursor": self._next_cursor(route, page.next_key),
+            },
             head_only=head_only,
         )
 
@@ -2262,9 +2419,16 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
 
+        parsed = self._list_query(pagination.SUBMISSIONS_ROUTE, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
         try:
             with self._database() as connection:
-                records = list_submissions(connection, actor)
+                page = list_submissions(
+                    connection, actor, limit=limit, after=after
+                )
         except ForbiddenActionError:
             self._api_error(403, "forbidden", head_only=head_only)
             return
@@ -2273,8 +2437,11 @@ class Handler(BaseHTTPRequestHandler):
             200,
             {
                 "submissions": [
-                    submission_to_mapping(item) for item in records
-                ]
+                    submission_to_mapping(item) for item in page.items
+                ],
+                "nextCursor": self._next_cursor(
+                    pagination.SUBMISSIONS_ROUTE, page.next_key
+                ),
             },
             head_only=head_only,
         )
@@ -2284,10 +2451,24 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
 
+        route = pagination.scoped_route(
+            pagination.SUBMISSIONS_ROUTE, release_id
+        )
+        parsed = self._list_query(route, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
         try:
             with self._database() as connection:
                 release = get_release(connection, actor, release_id)
-                records = list_submissions(connection, actor)
+                page = list_submissions(
+                    connection,
+                    actor,
+                    release_id=release.id,
+                    limit=limit,
+                    after=after,
+                )
         except MissingReleaseError:
             self._deny_hidden_read("release.read", release_id, head_only)
             return
@@ -2295,12 +2476,14 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(403, "forbidden", head_only=head_only)
             return
 
-        listed = [
-            record for record in records if record.release_id == release.id
-        ]
         self._respond_json(
             200,
-            {"submissions": [submission_to_mapping(item) for item in listed]},
+            {
+                "submissions": [
+                    submission_to_mapping(item) for item in page.items
+                ],
+                "nextCursor": self._next_cursor(route, page.next_key),
+            },
             head_only=head_only,
         )
 
@@ -2333,9 +2516,21 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             return
 
+        route = pagination.scoped_route("submission.comments", submission_id)
+        parsed = self._list_query(route, head_only)
+        if parsed is None:
+            return
+        limit, after = parsed
+
         try:
             with self._database() as connection:
-                records = list_comments(connection, actor, submission_id)
+                page = list_comments(
+                    connection,
+                    actor,
+                    submission_id,
+                    limit=limit,
+                    after=after,
+                )
         except MissingSubmissionError:
             self._deny_hidden_read("comment.read", submission_id, head_only)
             return
@@ -2348,7 +2543,12 @@ class Handler(BaseHTTPRequestHandler):
 
         self._respond_json(
             200,
-            {"comments": [comment_to_mapping(item) for item in records]},
+            {
+                "comments": [
+                    comment_to_mapping(item) for item in page.items
+                ],
+                "nextCursor": self._next_cursor(route, page.next_key),
+            },
             head_only=head_only,
         )
 
@@ -2824,6 +3024,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _database(self):
         return closing(open_database(self.server.database_path))
+
+    def _list_query(self, route, head_only=False):
+        """Parse the common ``limit``/``cursor`` query or answer 400."""
+
+        try:
+            return pagination.parse_pagination(
+                urlsplit(self.path).query, route
+            )
+        except pagination.PaginationError:
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return None
+
+    @staticmethod
+    def _next_cursor(route, next_key):
+        if next_key is None:
+            return None
+        return pagination.encode_cursor(route, next_key)
 
     def _not_found(self, head_only=False):
         if urlsplit(self.path).path.startswith("/api/"):
