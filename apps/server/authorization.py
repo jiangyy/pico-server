@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import accounts
 import playgrounds
 import repository as repository_module
+import submissions
 
 
 __all__ = [
@@ -255,21 +256,18 @@ def _teacher_owns_class_with_release(
 
 
 def _teacher_can_read_submitted_work(
-    connection,
-    teacher_id,
-    playground_id,
-    student_id,
-    commit_id,
-    submission_lookup,
+    connection, teacher_id, playground_id, student_id, commit_id
 ):
-    if submission_lookup is None:
-        return False
+    # The lookup reads the real ``submissions`` table.  An unknown actor or
+    # commit yields no rows, and a lookup failure fails closed, so a Teacher is
+    # authorized only by a real Submission of this exact Work commit.
     try:
-        release_ids = submission_lookup(connection, student_id, commit_id)
+        release_ids = submissions.release_ids_for_work_commit(
+            connection, student_id, commit_id
+        )
     except Exception:
-        # Authorization fails closed if the injected lookup misbehaves.
         return False
-    if release_ids is None:
+    if not release_ids:
         return False
     for release_id in release_ids:
         if not isinstance(release_id, str) or not release_id:
@@ -348,7 +346,6 @@ def _authorize_work_read(
     playground_id,
     student_id,
     commit_id,
-    submission_lookup,
 ):
     # The commit must belong to the named student's Work history; an arbitrary
     # commit ID never authorizes anything on its own.
@@ -364,12 +361,7 @@ def _authorize_work_read(
 
     if actor.role == "teacher":
         if _teacher_can_read_submitted_work(
-            connection,
-            actor.id,
-            playground_id,
-            student_id,
-            commit_id,
-            submission_lookup,
+            connection, actor.id, playground_id, student_id, commit_id
         ):
             return
         raise _deny()
@@ -387,15 +379,14 @@ def authorize_content_read(
     *,
     work_student_id=None,
     now=None,
-    submission_lookup=None,
 ):
     """Decide whether ``actor`` may read one content commit.
 
     ``work_student_id`` selects a student Work owned by that Student; when it
     is ``None`` the target is a Playground commit.  ``now`` is only used for
-    Playground open-time checks and defaults to the current UTC time.
-    ``submission_lookup`` is the narrow hook for Teacher Work access until the
-    Submission domain exists; when omitted, Teacher Work access is denied.
+    Playground open-time checks and defaults to the current UTC time.  A
+    Teacher's Work access is decided by the real Submission lookup in
+    :mod:`submissions`; there is no injected or default-deny hook.
 
     Returns ``None`` when access is allowed.  Every missing, unknown, or
     unauthorized target raises :class:`ContentAccessDeniedError`.
@@ -415,7 +406,6 @@ def authorize_content_read(
             playground_id,
             student_id,
             commit_id,
-            submission_lookup,
         )
     else:
         _authorize_playground_commit_read(

@@ -20,6 +20,7 @@ import classes
 import playgrounds
 import releases
 import repository
+import submissions
 from database import open_database
 
 
@@ -164,16 +165,6 @@ class AuthorizationTestBase(unittest.TestCase):
                 ),
             )
         return submission_id
-
-    def submission_lookup(self, connection, student_id, work_commit_id):
-        rows = connection.execute(
-            """
-            SELECT release_id FROM submissions
-            WHERE student_id = ? AND work_commit_id = ?
-            """,
-            (student_id, work_commit_id),
-        ).fetchall()
-        return [row["release_id"] for row in rows]
 
     # ----- Git fixtures ---------------------------------------------------
 
@@ -651,7 +642,6 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
 
     def test_teacher_without_submission_is_denied(self):
@@ -660,15 +650,22 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
 
-    def test_teacher_without_lookup_hook_is_denied(self):
-        self.insert_submission(
-            self.release["id"], self.student.id, self.second_work
+    def test_teacher_uses_the_real_submission_lookup_without_a_hook(self):
+        # No lookup is injected: the default decision reads the real
+        # ``submissions`` row written by the Submission domain itself.
+        status, _ = submissions.create_submission(
+            self.connection,
+            self.student,
+            self.repository,
+            self.release["id"],
+            self.second_work,
+            uuid.uuid4().hex,
         )
+        self.assertEqual(status, 201)
 
-        self.assert_denied(
+        self.assert_allowed(
             self.teacher,
             self.playground_id,
             self.second_work,
@@ -685,14 +682,12 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.first_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
         self.assert_denied(
             self.teacher,
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
 
     def test_submission_under_another_class_is_denied(self):
@@ -713,14 +708,36 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
         self.assert_allowed(
             other_teacher,
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
+        )
+
+    def test_submission_for_another_playground_does_not_authorize(self):
+        _, _, other_playground, other_commit = (
+            self.teacher_class_playground("pg-elsewhere")
+        )
+        other_release = self.release_for(
+            self.teacher,
+            self.klass.id,
+            other_playground,
+            other_commit,
+        )
+        # A real Submission row for this Student's Work commit, but under a
+        # Release that fixes a different Playground, must not authorize the
+        # Teacher to read the Work commit under this Playground.
+        self.insert_submission(
+            other_release["id"], self.student.id, self.second_work
+        )
+
+        self.assert_denied(
+            self.teacher,
+            self.playground_id,
+            self.second_work,
+            work_student_id=self.student.id,
         )
 
     def test_teacher_access_is_rechecked_every_call(self):
@@ -732,7 +749,6 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
 
         with self.connection:
@@ -745,7 +761,6 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
 
     def test_admin_work_read_is_denied(self):
@@ -758,7 +773,6 @@ class WorkReadTest(AuthorizationTestBase):
             self.playground_id,
             self.second_work,
             work_student_id=self.student.id,
-            submission_lookup=self.submission_lookup,
         )
 
     def test_commit_outside_student_work_history_is_denied(self):
