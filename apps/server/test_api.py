@@ -1207,6 +1207,16 @@ class PlaygroundApiTest(unittest.TestCase):
                 bundles.REASON_PATH_DOT_SEGMENT,
             ),
             (
+                self.build_zip(
+                    (
+                        ("picopg.json", self.MANIFEST),
+                        ("course/a", b"file"),
+                        ("course/a/b.py", b"nested"),
+                    )
+                ),
+                bundles.REASON_PATH_FILE_DIRECTORY,
+            ),
+            (
                 self.build_zip_with_info(((symlink, b"../../outside"),)),
                 bundles.REASON_ARCHIVE_LINK,
             ),

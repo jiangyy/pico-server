@@ -47,6 +47,9 @@ __all__ = [
     "REASON_INVALID_ENTRY",
     "REASON_PATH_NOT_STR",
     "REASON_PATH_NUL",
+    "REASON_PATH_CONTROL",
+    "REASON_PATH_INVALID_UNICODE",
+    "REASON_PATH_FILE_DIRECTORY",
     "REASON_PATH_BACKSLASH",
     "REASON_PATH_ABSOLUTE",
     "REASON_PATH_EMPTY_SEGMENT",
@@ -117,6 +120,9 @@ REASON_BUNDLE_NOT_ITERABLE = "bundle_not_iterable"
 REASON_INVALID_ENTRY = "invalid_entry"
 REASON_PATH_NOT_STR = "path_not_str"
 REASON_PATH_NUL = "path_nul"
+REASON_PATH_CONTROL = "path_control"
+REASON_PATH_INVALID_UNICODE = "path_invalid_unicode"
+REASON_PATH_FILE_DIRECTORY = "path_file_directory"
 REASON_PATH_BACKSLASH = "path_backslash"
 REASON_PATH_ABSOLUTE = "path_absolute"
 REASON_PATH_EMPTY_SEGMENT = "path_empty_segment"
@@ -161,6 +167,9 @@ REASON_CODES: frozenset[str] = frozenset(
         REASON_INVALID_ENTRY,
         REASON_PATH_NOT_STR,
         REASON_PATH_NUL,
+        REASON_PATH_CONTROL,
+        REASON_PATH_INVALID_UNICODE,
+        REASON_PATH_FILE_DIRECTORY,
         REASON_PATH_BACKSLASH,
         REASON_PATH_ABSOLUTE,
         REASON_PATH_EMPTY_SEGMENT,
@@ -227,6 +236,25 @@ class BundleArchiveError(BundleValidationError):
     """
 
 
+def _has_control_character(path: str) -> bool:
+    """Return whether ``path`` contains a C0 control or DEL character."""
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in path)
+
+
+def _has_surrogate(path: str) -> bool:
+    """Return whether ``path`` contains a lone surrogate code point."""
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in path)
+
+
+def _reject_file_directory_collision(normalized: Mapping[str, bytes]) -> None:
+    """Reject trees where one path is a prefix (directory) of another."""
+    for path in normalized:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            if "/".join(parts[:index]) in normalized:
+                raise BundleValidationError(REASON_PATH_FILE_DIRECTORY)
+
+
 def _normalize_path(path: object) -> str:
     """Validate and return the single normalized form of a bundle path."""
 
@@ -236,6 +264,10 @@ def _normalize_path(path: object) -> str:
         raise BundleValidationError(REASON_PATH_NOT_STR)
     if "\x00" in path:
         raise BundleValidationError(REASON_PATH_NUL)
+    if _has_control_character(path):
+        raise BundleValidationError(REASON_PATH_CONTROL)
+    if _has_surrogate(path):
+        raise BundleValidationError(REASON_PATH_INVALID_UNICODE)
     if "\\" in path:
         raise BundleValidationError(REASON_PATH_BACKSLASH)
 
@@ -392,6 +424,7 @@ def validate_bundle(bundle: Iterable[BundleEntry]) -> Mapping[str, bytes]:
     if MANIFEST_PATH not in normalized:
         raise BundleValidationError(REASON_MISSING_MANIFEST)
 
+    _reject_file_directory_collision(normalized)
     _validate_manifest(normalized[MANIFEST_PATH])
 
     # Sorted for a deterministic view that does not depend on input order.

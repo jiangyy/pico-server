@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from bundles import ALLOWED_PREFIXES, MANIFEST_PATH
+from bundles import BundleEntry, BundleValidationError, validate_bundle
 
 
 DEFAULT_REPOSITORY_PATH = Path("data/picopg.git")
@@ -258,50 +258,58 @@ def _validate_commit_metadata(metadata):
             )
 
 
-def _is_allowed_bundle_path(path):
-    if type(path) is not str or not path:
-        return False
-    if "\\" in path or _CONTROL_CHARACTERS.search(path):
-        return False
-    if path.startswith("/"):
-        return False
-    segments = path.split("/")
-    if any(segment in ("", ".", "..") for segment in segments):
-        return False
-    if path == MANIFEST_PATH:
-        return True
-    for prefix in ALLOWED_PREFIXES:
-        if path.startswith(prefix) and len(path) > len(prefix):
-            return True
-    return False
-
-
 def _snapshot_bundle(bundle):
-    """Defensively copy a validated bundle into a sorted plain list.
+    """Revalidate a bundle mapping and return a sorted ``(path, data)`` list.
 
-    Only the exact read-only mapping type produced by
-    :func:`bundles.validate_bundle` is accepted.  Paths and values are
-    re-checked as exact plain ``str`` / ``bytes`` and against the task-7
-    allowlist before any Git object is written.
+    The exact read-only mapping type produced by ``validate_bundle`` is
+    required, but its contents are not trusted: entries are copied into fresh
+    plain values, rebuilt as exact :class:`BundleEntry` objects, and passed
+    back through the pure validator.  A caller-crafted mapping proxy cannot
+    smuggle in invalid JSON, a different schema/runtime, controls, non-
+    normalized paths, or a file/directory collision.  Any failure becomes a
+    bounded ``RepositoryError`` before a Git object is written.
     """
 
     if type(bundle) is not MappingProxyType:
         raise RepositoryError(
             "bundle must be the normalized read-only mapping"
         )
-    files = []
-    for path, data in bundle.items():
+
+    items = _snapshot_mapping_items(bundle)
+    if items is None:
+        raise RepositoryError("bundle could not be read")
+
+    entries = []
+    for path, data in items:
         if type(path) is not str or type(data) is not bytes:
             raise RepositoryError(
                 "bundle entries must be plain str paths and bytes values"
             )
-        if not _is_allowed_bundle_path(path):
-            raise RepositoryError("bundle path is not allowed")
-        files.append((path, data))
-    if not any(path == MANIFEST_PATH for path, _ in files):
-        raise RepositoryError("bundle is missing its manifest")
+        entries.append(BundleEntry(path, data))
+
+    normalized = _revalidate_bundle(entries)
+    if normalized is None:
+        raise RepositoryError("bundle failed validation")
+
+    files = list(normalized.items())
     files.sort(key=lambda item: item[0])
     return files
+
+
+def _snapshot_mapping_items(bundle):
+    """Return the mapping's items, or ``None`` with the error dropped."""
+    try:
+        return list(bundle.items())
+    except Exception:
+        return None
+
+
+def _revalidate_bundle(entries):
+    """Return the normalized mapping, or ``None`` with the error dropped."""
+    try:
+        return validate_bundle(entries)
+    except BundleValidationError:
+        return None
 
 
 def _bundle_tree(files):

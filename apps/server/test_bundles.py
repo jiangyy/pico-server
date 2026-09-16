@@ -217,6 +217,39 @@ class PathRejectionTests(BundleTestCase):
             [manifest_entry(), manifest_entry()],
         )
 
+    def test_control_and_del_characters(self):
+        for path in (
+            "course/\x01a.py",
+            "course/a\x1fb.py",
+            "course/a\x7fb.py",
+            "course/a\tb.py",
+            "course/a\nb.py",
+        ):
+            self.assert_reason_for_path(bundles.REASON_PATH_CONTROL, path)
+
+    def test_lone_surrogates(self):
+        for path in ("course/\ud800a.py", "course/a\udfff.py", "\ud800"):
+            self.assert_reason_for_path(
+                bundles.REASON_PATH_INVALID_UNICODE, path
+            )
+
+    def test_file_directory_collision_either_order(self):
+        for entries in (
+            (
+                BundleEntry("course/a", b"file"),
+                BundleEntry("course/a/b.py", b"nested"),
+            ),
+            (
+                BundleEntry("course/a/b.py", b"nested"),
+                BundleEntry("course/a", b"file"),
+            ),
+        ):
+            with self.subTest(entries=entries):
+                self.assert_reason(
+                    bundles.REASON_PATH_FILE_DIRECTORY,
+                    valid_bundle(*entries),
+                )
+
 
 class EntryKindTests(BundleTestCase):
     def test_only_file_kind_is_allowed(self):

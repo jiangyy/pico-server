@@ -507,6 +507,64 @@ class PlaygroundPublishingTest(unittest.TestCase):
             )
         self.assertFalse(self.ref_exists(self.repository.playground_ref("pg-bundle")))
 
+    def test_forged_mapping_proxy_is_revalidated_before_any_write(self):
+        metadata = self.metadata()
+        manifest = b'{"schemaVersion":1,"runtime":"python"}'
+        forged = {
+            "invalid json": MappingProxyType(
+                {"picopg.json": b"{", "course/a.py": b"x"}
+            ),
+            "schema 99": MappingProxyType(
+                {
+                    "picopg.json": b'{"schemaVersion":99,"runtime":"python"}',
+                    "course/a.py": b"x",
+                }
+            ),
+            "runtime python3": MappingProxyType(
+                {
+                    "picopg.json": b'{"schemaVersion":1,"runtime":"python3"}',
+                    "course/a.py": b"x",
+                }
+            ),
+            "duplicate normalized path": MappingProxyType(
+                {
+                    "picopg.json": manifest,
+                    "course/caf\u00e9.py": b"1",
+                    "course/cafe\u0301.py": b"2",
+                }
+            ),
+            "control character": MappingProxyType(
+                {"picopg.json": manifest, "course/a\x01.py": b"x"}
+            ),
+            "lone surrogate": MappingProxyType(
+                {"picopg.json": manifest, "course/\ud800.py": b"x"}
+            ),
+            "file directory collision": MappingProxyType(
+                {
+                    "picopg.json": manifest,
+                    "course/a": b"x",
+                    "course/a/b.py": b"y",
+                }
+            ),
+        }
+
+        for label, bundle in forged.items():
+            with self.subTest(label=label):
+                with mock.patch.object(
+                    repository, "_write_bundle_tree"
+                ) as writer:
+                    with self.assertRaises(RepositoryError) as ctx:
+                        repository.publish_playground(
+                            self.repository, "pg-forged", bundle, metadata
+                        )
+                writer.assert_not_called()
+                self.assertIsNone(ctx.exception.__cause__)
+                self.assertIsNone(ctx.exception.__context__)
+                self.assertNotIn("course/", str(ctx.exception))
+        self.assertFalse(
+            self.ref_exists(self.repository.playground_ref("pg-forged"))
+        )
+
     def test_nested_and_unusual_legal_filenames(self):
         entries = [
             (
