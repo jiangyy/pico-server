@@ -34,6 +34,30 @@
 - 元数据来自**该条目的那个 commit** 的 `picopg.json`（Release 固定旧 commit 时展示旧元数据）。
 - 旧 commit 缺字段 → **省略字段**（不是空串、不是 id）。
 - 缓存仍是可重建投影：删除 `generated/` 后 rebuild 结果一致。
+- 同一份 catalog 也通过 `GET /api/v1/bootstrap` 提供（`7d91281` 已实现，带 ETag/304）；
+  两处必须同时带上新增元数据。
+
+## 1b. 教师可见的「可发布内容」列表（阻塞教师发 Release）
+
+**现状**：`POST /api/v1/classes/{classId}/releases` 允许任何教师发布任何未归档 Playground
+（`_authorize_playground` 只查存在 + 未归档，不要求 public），但客户端没有列表来源，
+教师端「资源池」恒为空（`resources: []`）——**教师在界面上发现不了新内容，Release 写入没有入口**。
+
+**请求**：`GET /api/v1/playgrounds`（Teacher/Admin）→ 未归档 Playground 列表：
+
+```json
+{"playgrounds": [
+  {"id": "hanoi", "commitId": "…", "title": "汉诺塔", "summary": "…", "requiresSubmission": true}
+]}
+```
+
+- `commitId` 是当前 ref 的 commit（教师发布时固定它；旧版本需要 id 的话可另议）。
+- `title`/`summary` 来自该 commit 的 `picopg.json`（与 §1 同一投影）。
+- `requiresSubmission` 目前没有来源，二选一（请确认）：`picopg.json` 增加声明（例 `"kind": "assignment" | "exercise"`），
+  或客户端在发布抽屉里让教师选（默认作业）。
+- 授权：Teacher/Admin 可读。这是一个「可发布内容列表」，不改变内容读取授权——教师仍必须拥有班级
+  才能创建 Release，学生仍只能通过 Release/public 看到内容。
+- 排序稳定；已归档默认不返回。
 
 ## 2. `toy/**` bundle 前缀与玩具声明
 
@@ -93,7 +117,7 @@ Authorization: Bearer <admin>
 ## 7. 兼容、顺序与部署
 
 - 全部为**新增可选字段或新增端点**：旧客户端忽略，新客户端对缺失回退（客户端已实现）。
-- 建议顺序：§4（Admin 表）→ §1（少 N 次请求）→ §5（点评作者）→ §2（玩具）→ §3/§6（决策项）。
+- 建议顺序：**§1b（教师资源池，当前唯一阻塞「发布→上课」闭环的项）** → §4（Admin 表） → §1（少 N 次请求）→ §5（点评作者）→ §2（玩具）→ §3/§6（决策项）。
 - Web 端 `toy.entry` 必须部署在**独立 origin**（如 `courses.picopg.cn`）：同源 iframe 里的课程页
   能读写宿主 localStorage，这是部署要求，不是 server 代码改动。
 - Web 课程 origin 还必须提供 `../pyodide/`（课程页用 `libs/**`、`../pyodide/` 引用运行时），
@@ -104,4 +128,5 @@ Authorization: Bearer <admin>
 - bundle：`toy` 非法形状、路径越界/缺失、超限 → 各自 400 + reason；旧 bundle 不回归。
 - catalog：有/无元数据两种 commit；Release 固定旧 commit 时展示旧元数据；`generated.rebuild` 后一致。
 - admin users / members / comments：结构与现有授权矩阵一致（Admin 全量、教师仅自己班、学生仅自己）。
+- `GET /api/v1/playgrounds`：教师/Admin 可读、学生 403、已归档不返回、稳定排序。
 - 端到端：发布带 `toy/**` 的 bundle → catalog 投影带元数据 → 客户端卡片显示名称/封面。
