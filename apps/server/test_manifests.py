@@ -602,5 +602,272 @@ class ManifestGenerationTest(ManifestTestBase):
         )
 
 
+class CommitFileReadTest(ManifestTestBase):
+    def setUp(self):
+        super().setUp()
+        self.playground_id = "pg-file"
+        self.create_playground(self.admin, self.playground_id)
+
+    def read(self, playground_id, commit_id, path, actor="admin", **kwargs):
+        return manifests.read_commit_file(
+            self.connection,
+            self.admin if actor == "admin" else actor,
+            self.repository,
+            playground_id,
+            commit_id,
+            path,
+            **kwargs,
+        )
+
+    def publish_entries(self, playground_id, entries):
+        return playgrounds.publish_playground(
+            self.connection,
+            self.admin,
+            playground_id,
+            self.repository,
+            self.make_bundle(entries),
+            self.metadata(),
+        )
+
+    def test_normalize_content_path_uses_bundle_rules(self):
+        self.assertEqual(
+            manifests.normalize_content_path("course/module/app.py"),
+            "course/module/app.py",
+        )
+        self.assertEqual(
+            manifests.normalize_content_path("picopg.json"),
+            "picopg.json",
+        )
+        # The bundle rules apply Unicode NFC normalization exactly once.
+        self.assertEqual(
+            manifests.normalize_content_path("course/cafe\u0301.py"),
+            "course/caf\u00e9.py",
+        )
+
+        for path in (
+            "../course/app.py",
+            "course/../app.py",
+            "/course/app.py",
+            "course\\app.py",
+            "work/app.py",
+            ".picopg/work.json",
+            "other.txt",
+            "course/",
+            "",
+            "course/\x00app.py",
+            None,
+            7,
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(manifests.ManifestError) as caught:
+                    manifests.normalize_content_path(path)
+                self.assertEqual(
+                    caught.exception.reason,
+                    manifests.REASON_PATH_NOT_ALLOWED,
+                )
+
+    def test_read_returns_exact_bytes_and_hash(self):
+        result = self.publish(self.playground_id)
+        content = self.read(
+            self.playground_id, result.commit_id, "course/module/app.py"
+        )
+
+        self.assertIsInstance(content, manifests.CommitFile)
+        self.assertEqual(content.path, "course/module/app.py")
+        self.assertEqual(content.data, b"print(1)")
+        self.assertEqual(
+            content.sha256, hashlib.sha256(b"print(1)").hexdigest()
+        )
+
+    def test_binary_and_empty_files_round_trip(self):
+        binary = bytes(range(256))
+        entries = [
+            ("picopg.json", MANIFEST_BYTES),
+            ("course/empty.txt", b""),
+            ("course/data.bin", binary),
+        ]
+        result = self.publish_entries(self.playground_id, entries)
+
+        empty = self.read(
+            self.playground_id, result.commit_id, "course/empty.txt"
+        )
+        self.assertEqual(empty.data, b"")
+        self.assertEqual(empty.sha256, hashlib.sha256(b"").hexdigest())
+
+        data = self.read(
+            self.playground_id, result.commit_id, "course/data.bin"
+        )
+        self.assertEqual(data.data, binary)
+        self.assertEqual(data.sha256, hashlib.sha256(binary).hexdigest())
+
+    def test_nfc_request_resolves_nfc_tree_path(self):
+        entries = [
+            ("picopg.json", MANIFEST_BYTES),
+            ("course/caf\u00e9.py", b"nfc"),
+        ]
+        result = self.publish_entries(self.playground_id, entries)
+        content = self.read(
+            self.playground_id, result.commit_id, "course/cafe\u0301.py"
+        )
+        self.assertEqual(content.path, "course/caf\u00e9.py")
+        self.assertEqual(content.data, b"nfc")
+
+    def test_anonymous_reads_only_public_unarchived_content(self):
+        result = self.publish(self.playground_id)
+        with self.assertRaises(authorization.ContentAccessDeniedError):
+            self.read(
+                self.playground_id,
+                result.commit_id,
+                "course/module/app.py",
+                actor=None,
+            )
+
+        self.make_public(self.admin, self.playground_id)
+        content = self.read(
+            self.playground_id,
+            result.commit_id,
+            "course/module/app.py",
+            actor=None,
+        )
+        self.assertEqual(content.data, b"print(1)")
+
+        playgrounds.update_playground(
+            self.connection,
+            self.admin,
+            self.playground_id,
+            {"archived": True},
+        )
+        with self.assertRaises(authorization.ContentAccessDeniedError):
+            self.read(
+                self.playground_id,
+                result.commit_id,
+                "course/module/app.py",
+                actor=None,
+            )
+
+    def test_denied_actor_is_denied_before_any_content_read(self):
+        result = self.publish(self.playground_id)
+        student = self.create_user("student")
+        self.assert_read_not_attempted()
+
+        with self.assertRaises(authorization.ContentAccessDeniedError):
+            self.read(
+                self.playground_id,
+                result.commit_id,
+                "course/module/app.py",
+                actor=student,
+            )
+
+    def test_commit_from_another_playground_is_denied(self):
+        self.create_playground(self.admin, "pg-other-file")
+        other = self.publish("pg-other-file")
+        self.make_public(self.admin, self.playground_id)
+        self.assert_read_not_attempted()
+
+        with self.assertRaises(authorization.ContentAccessDeniedError):
+            self.read(
+                self.playground_id, other.commit_id, "course/module/app.py"
+            )
+
+    def test_missing_path_is_not_found(self):
+        result = self.publish(self.playground_id)
+        with self.assertRaises(manifests.ManifestError) as caught:
+            self.read(
+                self.playground_id, result.commit_id, "course/missing.py"
+            )
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_PATH_NOT_FOUND
+        )
+
+    def test_path_is_resolved_in_the_requested_commit_only(self):
+        first = self.publish_entries(
+            self.playground_id,
+            [
+                ("picopg.json", MANIFEST_BYTES),
+                ("course/first.py", b"first"),
+            ],
+        )
+        second = self.publish_entries(
+            self.playground_id,
+            [
+                ("picopg.json", MANIFEST_BYTES),
+                ("course/second.py", b"second"),
+            ],
+        )
+
+        self.assertEqual(
+            self.read(
+                self.playground_id, first.commit_id, "course/first.py"
+            ).data,
+            b"first",
+        )
+        # The path exists historically but not in the exact requested commit.
+        with self.assertRaises(manifests.ManifestError) as caught:
+            self.read(
+                self.playground_id, second.commit_id, "course/first.py"
+            )
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_PATH_NOT_FOUND
+        )
+
+    def test_non_file_entry_at_allowed_path_is_rejected(self):
+        manifest_blob = self.hash_blob(MANIFEST_BYTES)
+        link_blob = self.hash_blob(b"target")
+        starter_tree = self.raw_tree([f"120000 blob {link_blob}\tlink"])
+        tree = self.raw_tree(
+            [
+                f"100644 blob {manifest_blob}\tpicopg.json",
+                f"040000 tree {starter_tree}\tstarter",
+            ]
+        )
+        commit = self.commit_tree(tree)
+        self.set_ref(self.playground_id, commit)
+
+        with self.assertRaises(manifests.ManifestError) as caught:
+            self.read(self.playground_id, commit, "starter/link")
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_ENTRY_MODE_NOT_FILE
+        )
+
+    def test_current_playground_commit_tracks_published_head(self):
+        empty_id = "pg-empty-file"
+        self.create_playground(self.admin, empty_id)
+        self.assertIsNone(
+            manifests.current_playground_commit(self.repository, empty_id)
+        )
+
+        result = self.publish(self.playground_id)
+        self.assertEqual(
+            manifests.current_playground_commit(
+                self.repository, self.playground_id
+            ),
+            result.commit_id,
+        )
+        self.assertIsNone(
+            manifests.current_playground_commit(self.repository, "pg-missing")
+        )
+
+    def test_generate_manifest_supports_anonymous_public_read(self):
+        result = self.publish(self.playground_id)
+        with self.assertRaises(authorization.ContentAccessDeniedError):
+            manifests.generate_manifest(
+                self.connection,
+                None,
+                self.repository,
+                self.playground_id,
+                result.commit_id,
+            )
+
+        self.make_public(self.admin, self.playground_id)
+        manifest = manifests.generate_manifest(
+            self.connection,
+            None,
+            self.repository,
+            self.playground_id,
+            result.commit_id,
+        )
+        self.assertEqual(manifest.commit_id, result.commit_id)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

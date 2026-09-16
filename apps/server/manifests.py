@@ -13,19 +13,25 @@ path-ordered file list and the same deterministic JSON bytes.
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 
+import accounts
 import authorization
 import bundles
 import repository as repository_module
 
 
 __all__ = [
+    "CommitFile",
     "CommitManifest",
     "ManifestError",
     "ManifestFile",
+    "current_playground_commit",
     "generate_manifest",
     "manifest_to_mapping",
+    "normalize_content_path",
+    "read_commit_file",
     "serialize_manifest",
 ]
 
@@ -53,6 +59,7 @@ REASON_BUNDLE_TOO_LARGE = "bundle_too_large"
 REASON_ENTRY_NOT_BLOB = "entry_not_blob"
 REASON_ENTRY_MODE_NOT_FILE = "entry_mode_not_file"
 REASON_PATH_NOT_ALLOWED = "path_not_allowed"
+REASON_PATH_NOT_FOUND = "path_not_found"
 REASON_DUPLICATE_PATH = "duplicate_path"
 REASON_MISSING_BLOB = "missing_blob"
 REASON_BLOB_SIZE_MISMATCH = "blob_size_mismatch"
@@ -65,6 +72,7 @@ REASON_CODES = frozenset(
         REASON_ENTRY_NOT_BLOB,
         REASON_ENTRY_MODE_NOT_FILE,
         REASON_PATH_NOT_ALLOWED,
+        REASON_PATH_NOT_FOUND,
         REASON_DUPLICATE_PATH,
         REASON_MISSING_BLOB,
         REASON_BLOB_SIZE_MISMATCH,
@@ -84,6 +92,18 @@ class ManifestError(Exception):
         super().__init__(reason)
 
 
+# Unauthenticated content requests are evaluated with an explicit anonymous
+# actor.  The centralized authorization rules therefore still make the
+# public/private decision instead of the HTTP layer duplicating policy: only a
+# public, unarchived Playground commit is reachable without an account.
+_ANONYMOUS_ACTOR = accounts.User(
+    id="anonymous",
+    username="anonymous",
+    role="anonymous",
+    created_at="",
+)
+
+
 @dataclass(frozen=True)
 class ManifestFile:
     """One file in a commit manifest."""
@@ -92,6 +112,15 @@ class ManifestFile:
     size: int
     sha256: str
     blob_id: str
+
+
+@dataclass(frozen=True)
+class CommitFile:
+    """One exact downloadable file from an authorized commit."""
+
+    path: str
+    data: bytes
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -195,13 +224,114 @@ def generate_manifest(
 
     authorization.authorize_content_read(
         connection,
-        actor,
+        _resolve_actor(actor),
         repository,
         playground_id,
         commit_id,
         now=now,
     )
     return _build_manifest(repository, commit_id)
+
+
+def _resolve_actor(actor):
+    """Return the actor to authorize, or the anonymous public-only actor."""
+
+    return _ANONYMOUS_ACTOR if actor is None else actor
+
+
+def normalize_content_path(path):
+    """Return the canonical allowed path for a download request.
+
+    The caller's already-decoded path is Unicode-normalized exactly as the
+    publishing bundle rules do, then checked against the same allowlist.  A
+    path outside that allowlist raises :class:`ManifestError` with
+    :data:`REASON_PATH_NOT_ALLOWED`.
+    """
+
+    if type(path) is not str or not path:
+        raise ManifestError(REASON_PATH_NOT_ALLOWED)
+    normalized = unicodedata.normalize("NFC", path)
+    if not _path_is_allowed(normalized):
+        raise ManifestError(REASON_PATH_NOT_ALLOWED)
+    return normalized
+
+
+def current_playground_commit(repository, playground_id):
+    """Return the current commit of an existing Playground, else ``None``.
+
+    Only the namespaced Playground ref is used, so a caller can never supply a
+    ref name.  A missing or unreadable ref yields ``None`` instead of an error.
+    """
+
+    try:
+        ref = repository.playground_ref(playground_id)
+    except repository_module.RepositoryError:
+        return None
+    try:
+        return repository_module._resolve_head(repository, ref)
+    except repository_module.RepositoryError:
+        return None
+
+
+def read_commit_file(
+    connection,
+    actor,
+    repository,
+    playground_id,
+    commit_id,
+    path,
+    *,
+    now=None,
+):
+    """Return one exact file from an authorized Playground commit.
+
+    The exact ``(playground_id, commit_id)`` pair is authorized before any
+    commit tree or blob is read.  The requested path is then resolved inside
+    that commit's own tree; a caller-supplied blob id is never accepted.  A
+    path that is not allowed or not present raises :class:`ManifestError`.
+    """
+
+    authorization.authorize_content_read(
+        connection,
+        _resolve_actor(actor),
+        repository,
+        playground_id,
+        commit_id,
+        now=now,
+    )
+
+    normalized_path = normalize_content_path(path)
+    entries = repository_module.list_commit_tree(repository, commit_id)
+
+    target = None
+    for entry in entries:
+        if entry.path == normalized_path:
+            target = entry
+            break
+    if target is None:
+        raise ManifestError(REASON_PATH_NOT_FOUND)
+
+    if target.kind != "blob":
+        raise ManifestError(REASON_ENTRY_NOT_BLOB)
+    if target.mode not in ALLOWED_FILE_MODES:
+        raise ManifestError(REASON_ENTRY_MODE_NOT_FILE)
+    if target.size is None:
+        raise ManifestError(REASON_ENTRY_NOT_BLOB)
+    if target.size > MAX_FILE_BYTES:
+        raise ManifestError(REASON_FILE_TOO_LARGE)
+
+    blobs = repository_module.read_blobs(repository, [target.object_id])
+    data = blobs.get(target.object_id)
+    if data is None:
+        raise ManifestError(REASON_MISSING_BLOB)
+    if len(data) != target.size:
+        raise ManifestError(REASON_BLOB_SIZE_MISMATCH)
+
+    return CommitFile(
+        path=target.path,
+        data=data,
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
 
 
 def manifest_to_mapping(manifest):

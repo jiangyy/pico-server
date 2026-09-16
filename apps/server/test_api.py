@@ -1,5 +1,6 @@
 """HTTP tests for the account API."""
 
+import hashlib
 import io
 import json
 import subprocess
@@ -2272,6 +2273,760 @@ class ReleaseApiTest(unittest.TestCase):
             status, _, body = self.request(method, path)
             self.assertEqual(
                 (status, body["code"]), (404, "not_found"), (method, path)
+            )
+
+
+class ContentApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        cls.database_path = Path(cls.temporary_directory.name) / "app.db"
+        cls.repository_path = Path(cls.temporary_directory.name) / "picopg.git"
+        cls.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=cls.database_path,
+            repository_path=cls.repository_path,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.temporary_directory.cleanup()
+
+    MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
+    BINARY = bytes(range(256))
+
+    def request(
+        self,
+        method,
+        path,
+        payload=None,
+        token=None,
+        raw_body=None,
+        content_type="application/json",
+        extra_headers=None,
+    ):
+        headers = {}
+        body = raw_body
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif raw_body is not None:
+            headers["Content-Type"] = content_type
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if extra_headers is not None:
+            headers.update(extra_headers)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+
+        decoded = json.loads(response_body) if response_body else None
+        return status, response_headers, decoded
+
+    def unique(self, prefix):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def seed_user(self, role):
+        username = self.unique(role)
+        connection = open_database(self.database_path)
+        try:
+            with connection:
+                return accounts.create_user(
+                    connection,
+                    accounts.User(
+                        id="seed-actor",
+                        username="seed-actor",
+                        role="admin",
+                        created_at="2026-01-01T00:00:00Z",
+                    ),
+                    username,
+                    "secret",
+                    role,
+                )
+        finally:
+            connection.close()
+
+    def login_token(self, username):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/login",
+            {"username": username, "password": "secret"},
+        )
+        self.assertEqual(status, 200)
+        return body["sessionToken"]
+
+    def grant_publisher(self, token, user_id):
+        status, _, _ = self.request(
+            "PUT", f"/api/v1/admin/publishers/{user_id}", token=token
+        )
+        self.assertEqual(status, 204)
+
+    def create_class(self, admin_token, teacher_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/admin/classes",
+            {"name": self.unique("Class"), "teacherId": teacher_id},
+            token=admin_token,
+        )
+        self.assertEqual(status, 201)
+        return body["class"]
+
+    def create_playground(self, token, playground_id):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/playgrounds",
+            {"id": playground_id},
+            token=token,
+        )
+        self.assertEqual(status, 201)
+        return body["playground"]
+
+    def set_policy(self, token, playground_id, policy):
+        status, _, body = self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{playground_id}",
+            {"policy": policy},
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        return body["playground"]
+
+    def assign_student(self, admin_token, class_id, student_id):
+        status, _, _ = self.request(
+            "PUT",
+            f"/api/v1/admin/classes/{class_id}/members/{student_id}",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200)
+
+    def build_zip(self, entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def default_entries(self):
+        return (
+            ("picopg.json", self.MANIFEST),
+            ("course/module/app.py", b"print(1)"),
+            ("course/data.bin", self.BINARY),
+        )
+
+    def publish(self, token, playground_id, entries=None, key=None):
+        if entries is None:
+            entries = self.default_entries()
+        return self.request(
+            "POST",
+            f"/api/v1/playgrounds/{playground_id}/commits",
+            raw_body=self.build_zip(entries),
+            token=token,
+            content_type="application/zip",
+            extra_headers={"Idempotency-Key": key or self.unique("key")},
+        )
+
+    def post_release(
+        self, token, class_id, playground_id, commit_id, open_at
+    ):
+        return self.request(
+            "POST",
+            f"/api/v1/classes/{class_id}/releases",
+            {
+                "playgroundId": playground_id,
+                "playgroundCommitId": commit_id,
+                "openAt": open_at,
+                "requiresSubmission": False,
+            },
+            token=token,
+            extra_headers={"Idempotency-Key": self.unique("key")},
+        )
+
+    def release(self, token, class_id, playground_id, commit_id, open_at):
+        status, _, body = self.post_release(
+            token, class_id, playground_id, commit_id, open_at
+        )
+        self.assertEqual(status, 201)
+        return body["release"]
+
+    def manifest_path(self, playground_id, commit_id):
+        return (
+            f"/api/v1/playgrounds/{playground_id}/commits/{commit_id}/manifest"
+        )
+
+    def file_path(self, playground_id, commit_id, path):
+        return (
+            f"/api/v1/playgrounds/{playground_id}"
+            f"/commits/{commit_id}/files/{path}"
+        )
+
+    # ----- public downloads ----------------------------------------------
+
+    def test_anonymous_public_manifest_and_file_download(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        _, _, published = self.publish(admin_token, playground_id)
+        commit_id = published["commitId"]
+
+        status, _, body = self.request(
+            "GET", self.manifest_path(playground_id, commit_id)
+        )
+        self.assertEqual(status, 200)
+        manifest = body["manifest"]
+        self.assertEqual(manifest["commitId"], commit_id)
+        files = {item["path"]: item for item in manifest["files"]}
+        self.assertEqual(
+            sorted(files),
+            ["course/data.bin", "course/module/app.py", "picopg.json"],
+        )
+        expected = {
+            "course/module/app.py": b"print(1)",
+            "course/data.bin": self.BINARY,
+            "picopg.json": self.MANIFEST,
+        }
+        for path, data in expected.items():
+            self.assertEqual(files[path]["size"], len(data))
+            self.assertEqual(
+                files[path]["sha256"], hashlib.sha256(data).hexdigest()
+            )
+
+        status, headers, raw = self._raw(
+            "GET", self.file_path(playground_id, commit_id, "course/data.bin")
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, self.BINARY)
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(headers["content-length"], str(len(self.BINARY)))
+        self.assertEqual(
+            headers["etag"], f'"{hashlib.sha256(self.BINARY).hexdigest()}"'
+        )
+        self.assertEqual(headers["x-content-type-options"], "nosniff")
+
+        status, headers, raw = self._raw(
+            "GET",
+            self.file_path(playground_id, commit_id, "course/module/app.py"),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b"print(1)")
+        self.assertEqual(
+            headers["etag"],
+            f'"{hashlib.sha256(b"print(1)").hexdigest()}"',
+        )
+
+    def test_file_bytes_and_head_headers_match(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        _, _, published = self.publish(admin_token, playground_id)
+        commit_id = published["commitId"]
+        path = self.file_path(playground_id, commit_id, "course/data.bin")
+
+        get_status, get_headers, get_body = self._raw("GET", path)
+        head_status, head_headers, head_body = self._raw("HEAD", path)
+
+        self.assertEqual(get_status, 200)
+        self.assertEqual(head_status, 200)
+        self.assertEqual(head_body, b"")
+        self.assertEqual(get_body, self.BINARY)
+        for name in (
+            "content-type",
+            "content-length",
+            "etag",
+            "x-content-type-options",
+        ):
+            self.assertEqual(get_headers[name], head_headers[name], name)
+        self.assertEqual(
+            get_headers["etag"],
+            f'"{hashlib.sha256(self.BINARY).hexdigest()}"',
+        )
+        self.assertEqual(
+            head_headers["content-length"], str(len(self.BINARY))
+        )
+
+        manifest = self.manifest_path(playground_id, commit_id)
+        get_status, get_headers, get_body = self._raw("GET", manifest)
+        head_status, head_headers, head_body = self._raw("HEAD", manifest)
+        self.assertEqual((get_status, head_status), (200, 200))
+        self.assertEqual(head_body, b"")
+        self.assertEqual(
+            get_headers["content-length"],
+            head_headers["content-length"],
+        )
+
+    def _raw(self, method, path, token=None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        connection.close()
+        return status, response_headers, body
+
+    # ----- catalog -------------------------------------------------------
+
+    def test_catalog_public_release_dedup_and_order(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        student_token = self.login_token(student.username)
+        self.grant_publisher(admin_token, teacher.id)
+
+        public_id = self.unique("pg")
+        released_id = self.unique("pg")
+        self.create_playground(teacher_token, public_id)
+        self.create_playground(teacher_token, released_id)
+        self.set_policy(admin_token, public_id, "public")
+        public_commit = self.publish(teacher_token, public_id)[2][
+            "commitId"
+        ]
+        released_commit = self.publish(teacher_token, released_id)[2][
+            "commitId"
+        ]
+
+        klass = self.create_class(admin_token, teacher.id)
+        self.assign_student(admin_token, klass["id"], student.id)
+        release_status, _, release_body = self.post_release(
+            teacher_token,
+            klass["id"],
+            released_id,
+            released_commit,
+            "2020-01-01T00:00:00Z",
+        )
+        self.assertEqual(release_status, 201)
+        release_id = release_body["release"]["id"]
+
+        # The released Playground is also public, so the student's catalog
+        # must merge the two sources into one deduplicated item.
+        self.set_policy(admin_token, released_id, "public")
+
+        status, _, body = self.request(
+            "GET", "/api/v1/catalog", token=student_token
+        )
+        self.assertEqual(status, 200)
+        entries = body["catalog"]
+        keys = [(item["playgroundId"], item["commitId"]) for item in entries]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(len(keys), len(set(keys)))
+        merged = [
+            item
+            for item in entries
+            if item["playgroundId"] == released_id
+        ]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["commitId"], released_commit)
+        self.assertEqual(merged[0]["releaseIds"], [release_id])
+        self.assertIn((public_id, public_commit), keys)
+
+        # An anonymous catalog still lists public items, but no Release ids.
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        anonymous_entries = {
+            (item["playgroundId"], item["commitId"]): item["releaseIds"]
+            for item in body["catalog"]
+        }
+        self.assertEqual(anonymous_entries[(released_id, released_commit)], [])
+        self.assertIn((public_id, public_commit), anonymous_entries)
+
+    def test_catalog_excludes_archived_foreign_and_future(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        student_token = self.login_token(student.username)
+        self.grant_publisher(admin_token, teacher.id)
+
+        archived_id = self.unique("pg")
+        self.create_playground(teacher_token, archived_id)
+        self.set_policy(admin_token, archived_id, "public")
+        archived_commit = self.publish(teacher_token, archived_id)[2][
+            "commitId"
+        ]
+        self.request(
+            "PATCH",
+            f"/api/v1/playgrounds/{archived_id}",
+            {"archived": True},
+            token=admin_token,
+        )
+
+        future_id = self.unique("pg")
+        self.create_playground(teacher_token, future_id)
+        future_commit = self.publish(teacher_token, future_id)[2]["commitId"]
+        klass = self.create_class(admin_token, teacher.id)
+        self.assign_student(admin_token, klass["id"], student.id)
+        self.release(
+            teacher_token,
+            klass["id"],
+            future_id,
+            future_commit,
+            "2999-01-01T00:00:00Z",
+        )
+
+        # Archived public content is never in an anonymous catalog.
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        public_keys = {
+            (item["playgroundId"], item["commitId"])
+            for item in body["catalog"]
+        }
+        self.assertNotIn((archived_id, archived_commit), public_keys)
+
+        # A future Release is not yet authorized for the student.
+        status, _, body = self.request(
+            "GET", "/api/v1/catalog", token=student_token
+        )
+        self.assertEqual(status, 200)
+        student_keys = {
+            (item["playgroundId"], item["commitId"])
+            for item in body["catalog"]
+        }
+        self.assertNotIn((future_id, future_commit), student_keys)
+
+        # Admin may read every Release, including a future one.
+        status, _, body = self.request(
+            "GET", "/api/v1/catalog", token=admin_token
+        )
+        self.assertEqual(status, 200)
+        admin_keys = {
+            (item["playgroundId"], item["commitId"])
+            for item in body["catalog"]
+        }
+        self.assertIn((future_id, future_commit), admin_keys)
+
+        # A transferred student loses the old Class Release from the catalog.
+        other_teacher = self.seed_user("teacher")
+        other_class = self.create_class(admin_token, other_teacher.id)
+        open_id = self.unique("pg")
+        self.create_playground(teacher_token, open_id)
+        open_commit = self.publish(teacher_token, open_id)[2]["commitId"]
+        self.release(
+            teacher_token,
+            klass["id"],
+            open_id,
+            open_commit,
+            "2020-01-01T00:00:00Z",
+        )
+        status, _, body = self.request(
+            "GET", "/api/v1/catalog", token=student_token
+        )
+        self.assertIn(
+            (open_id, open_commit),
+            {
+                (item["playgroundId"], item["commitId"])
+                for item in body["catalog"]
+            },
+        )
+        self.assign_student(admin_token, other_class["id"], student.id)
+        status, _, body = self.request(
+            "GET", "/api/v1/catalog", token=student_token
+        )
+        self.assertNotIn(
+            (open_id, open_commit),
+            {
+                (item["playgroundId"], item["commitId"])
+                for item in body["catalog"]
+            },
+        )
+
+    # ----- authorization -------------------------------------------------
+
+    def test_manifest_and_file_authorization_by_role(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        other_teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        outsider = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        other_token = self.login_token(other_teacher.username)
+        student_token = self.login_token(student.username)
+        outsider_token = self.login_token(outsider.username)
+        self.grant_publisher(admin_token, teacher.id)
+
+        playground_id = self.unique("pg")
+        self.create_playground(teacher_token, playground_id)
+        first_commit = self.publish(teacher_token, playground_id)[2][
+            "commitId"
+        ]
+        second_commit = self.publish(
+            teacher_token,
+            playground_id,
+            entries=(
+                ("picopg.json", self.MANIFEST),
+                ("course/module/app.py", b"print(2)"),
+                ("course/data.bin", self.BINARY),
+            ),
+        )[2]["commitId"]
+        self.assertNotEqual(first_commit, second_commit)
+        klass = self.create_class(admin_token, teacher.id)
+        self.assign_student(admin_token, klass["id"], student.id)
+        self.release(
+            teacher_token,
+            klass["id"],
+            playground_id,
+            first_commit,
+            "2020-01-01T00:00:00Z",
+        )
+
+        manifest = self.manifest_path(playground_id, first_commit)
+        file_url = self.file_path(
+            playground_id, first_commit, "course/module/app.py"
+        )
+
+        allowed = (teacher_token, student_token, admin_token)
+        for token in allowed:
+            status, _, _ = self.request("GET", manifest, token=token)
+            self.assertEqual(status, 200)
+            status, _, body = self._raw("GET", file_url, token=token)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"print(1)")
+
+        denied = (None, outsider_token, other_token)
+        for token in denied:
+            status, _, body = self.request("GET", manifest, token=token)
+            self.assertEqual((status, body["code"]), (404, "not_found"))
+            status, _, body = self.request("GET", file_url, token=token)
+            self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        # The Release pins the first commit: HEAD must not substitute for it.
+        status, _, _ = self.request("GET", manifest, token=student_token)
+        self.assertEqual(status, 200)
+        status, _, body = self.request(
+            "GET",
+            self.manifest_path(playground_id, second_commit),
+            token=student_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+        # A foreign commit id and a nonexistent commit are both not found.
+        status, _, body = self.request(
+            "GET",
+            self.manifest_path(playground_id, "a" * 40),
+            token=student_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.request(
+            "GET",
+            self.manifest_path(playground_id, "not-a-commit"),
+            token=student_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_future_release_denies_until_open(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        student_token = self.login_token(student.username)
+        self.grant_publisher(admin_token, teacher.id)
+
+        playground_id = self.unique("pg")
+        self.create_playground(teacher_token, playground_id)
+        commit_id = self.publish(teacher_token, playground_id)[2]["commitId"]
+        klass = self.create_class(admin_token, teacher.id)
+        self.assign_student(admin_token, klass["id"], student.id)
+        self.release(
+            teacher_token,
+            klass["id"],
+            playground_id,
+            commit_id,
+            "2999-01-01T00:00:00Z",
+        )
+
+        status, _, body = self.request(
+            "GET", self.manifest_path(playground_id, commit_id),
+            token=student_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+        status, _, body = self.request(
+            "GET",
+            self.file_path(playground_id, commit_id, "picopg.json"),
+            token=student_token,
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_missing_and_denied_private_are_identical(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        self.grant_publisher(admin_token, teacher.id)
+
+        private_id = self.unique("pg")
+        self.create_playground(teacher_token, private_id)
+        commit_id = self.publish(teacher_token, private_id)[2]["commitId"]
+
+        denied = self.request(
+            "GET", self.manifest_path(private_id, commit_id)
+        )
+        missing = self.request(
+            "GET", self.manifest_path("pg-does-not-exist", "a" * 40)
+        )
+        self.assertEqual(denied[0], 404)
+        self.assertEqual(missing[0], 404)
+        self.assertEqual(denied[2], missing[2])
+
+        denied = self.request(
+            "GET", self.file_path(private_id, commit_id, "picopg.json")
+        )
+        missing = self.request(
+            "GET",
+            self.file_path("pg-does-not-exist", "a" * 40, "picopg.json"),
+        )
+        self.assertEqual(denied[0], 404)
+        self.assertEqual(missing[0], 404)
+        self.assertEqual(denied[2], missing[2])
+
+    def test_invalid_supplied_token_returns_401(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        commit_id = self.publish(admin_token, playground_id)[2]["commitId"]
+
+        paths = (
+            "/api/v1/catalog",
+            self.manifest_path(playground_id, commit_id),
+            self.file_path(playground_id, commit_id, "picopg.json"),
+        )
+        for path in paths:
+            status, _, body = self.request("GET", path, token="bogus")
+            self.assertEqual((status, body["code"]), (401, "invalid_session"))
+
+            connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+            connection.request(
+                "GET", path, headers={"Authorization": "Basic abc"}
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 401, path)
+            connection.close()
+
+    # ----- paths ---------------------------------------------------------
+
+    def test_path_resolution_rejects_traversal_and_foreign_paths(self):
+        admin = self.seed_user("admin")
+        admin_token = self.login_token(admin.username)
+        playground_id = self.unique("pg")
+        self.create_playground(admin_token, playground_id)
+        self.set_policy(admin_token, playground_id, "public")
+        first = self.publish(
+            admin_token,
+            playground_id,
+            entries=(
+                ("picopg.json", self.MANIFEST),
+                ("course/first.py", b"first"),
+            ),
+        )[2]["commitId"]
+        second = self.publish(
+            admin_token,
+            playground_id,
+            entries=(
+                ("picopg.json", self.MANIFEST),
+                ("course/second.py", b"second"),
+            ),
+        )[2]["commitId"]
+
+        bad_paths = (
+            "course/missing.py",
+            "course/../picopg.json",
+            "course/%2e%2e/picopg.json",
+            "%2e%2e/picopg.json",
+            "%252e%252e%252fpicopg.json",
+            "course%2Fsecond.py",
+            "course%5Csecond.py",
+            "%2Fetc%2Fpasswd",
+            "secret.txt",
+            "work/picopg.json",
+            ".picopg/work.json",
+            "%FF",
+        )
+        for path in bad_paths:
+            with self.subTest(path=path):
+                status, _, body = self.request(
+                    "GET", self.file_path(playground_id, second, path)
+                )
+                self.assertEqual(
+                    (status, body.get("code")), (404, "not_found"), path
+                )
+
+        # A path that existed only in the first commit is not found in the
+        # exact second commit, even though the first is still reachable.
+        status, _, body = self._raw(
+            "GET", self.file_path(playground_id, first, "course/first.py")
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"first")
+        status, _, body = self.request(
+            "GET", self.file_path(playground_id, second, "course/first.py")
+        )
+        self.assertEqual((status, body["code"]), (404, "not_found"))
+
+    def test_route_methods_and_paths(self):
+        method_not_allowed = (
+            ("POST", "/api/v1/catalog", "GET, HEAD"),
+            ("PUT", "/api/v1/catalog", "GET, HEAD"),
+            ("PATCH", "/api/v1/catalog", "GET, HEAD"),
+            ("DELETE", "/api/v1/catalog", "GET, HEAD"),
+            (
+                "POST",
+                "/api/v1/playgrounds/p/commits/" + "a" * 40 + "/manifest",
+                "GET, HEAD",
+            ),
+            (
+                "DELETE",
+                "/api/v1/playgrounds/p/commits/" + "a" * 40 + "/files/x",
+                "GET, HEAD",
+            ),
+        )
+        for method, path, allow in method_not_allowed:
+            status, headers, body = self.request(method, path)
+            self.assertEqual(status, 405, (method, path))
+            self.assertEqual(headers.get("allow"), allow, (method, path))
+            self.assertEqual(body["code"], "method_not_allowed")
+
+        for path in (
+            "/api/v1/catalog/",
+            "/api/v1/catalog/extra",
+            "/api/v1/playgrounds/p/commits/c/files",
+            "/api/v1/playgrounds/p/commits/c/files/",
+            "/api/v1/playgrounds/p/commits/c/manifest/extra",
+            "/api/v1/playgrounds/p/commits/c/other",
+            "/api/v1/playgrounds//commits/c/manifest",
+        ):
+            status, _, body = self.request("GET", path)
+            self.assertEqual(
+                (status, body["code"]), (404, "not_found"), path
             )
 
 

@@ -6,8 +6,10 @@ from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
+import authorization
+import manifests
 from accounts import (
     ForbiddenActionError,
     InvalidRoleError,
@@ -44,6 +46,7 @@ from idempotency import (
     execute as execute_idempotent,
 )
 from playgrounds import (
+    PUBLIC_POLICY,
     InvalidPolicyError,
     InvalidRequestError,
     MissingPlaygroundError,
@@ -102,9 +105,24 @@ CLASSES_PATH = "/api/v1/classes"
 ADMIN_PUBLISHERS_PATH = "/api/v1/admin/publishers"
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
+COMMITS_SEGMENT = "commits"
+FILES_SEGMENT = "files"
+MANIFEST_SEGMENT = "manifest"
+CATALOG_PATH = "/api/v1/catalog"
 RELEASES_PATH = "/api/v1/releases"
 CLASS_RELEASES_SUFFIX = "/releases"
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
+
+# Returned by optional authentication when an Authorization header was present
+# but did not carry a valid session, so the caller can stop without confusing
+# the failure with an anonymous request.
+_AUTH_FAILED = object()
+
+# The denials a content read route reports as an indistinguishable not-found.
+_CONTENT_READ_ERRORS = (
+    authorization.ContentAccessDeniedError,
+    manifests.ManifestError,
+)
 
 
 def _match_admin_user_role(path):
@@ -200,6 +218,56 @@ def _match_playground_commit(path):
     return playground_id
 
 
+def _commit_route_parts(path):
+    """Split ``.../<playground>/commits/<commit>/<tail>`` for read routes.
+
+    Returns ``(playground_id, commit_id, tail)`` where ``tail`` is
+    everything after ``<commit>/`` and may still contain literal slashes.
+    Returns ``None`` for any other shape, so a missing or extra segment never
+    matches.
+    """
+
+    prefix = PLAYGROUNDS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    parts = path[len(prefix):].split("/", 3)
+    if len(parts) != 4:
+        return None
+    playground_id, segment, commit_id, tail = parts
+    if segment != COMMITS_SEGMENT or not playground_id or not commit_id:
+        return None
+    return playground_id, commit_id, tail
+
+
+def _match_manifest(path):
+    """Return ``(playground_id, commit_id)`` for a manifest read path."""
+
+    parts = _commit_route_parts(path)
+    if parts is None:
+        return None
+    playground_id, commit_id, tail = parts
+    if tail != MANIFEST_SEGMENT:
+        return None
+    return playground_id, commit_id
+
+
+def _match_commit_files(path):
+    """Return ``(playground_id, commit_id, encoded_path)`` for a file path."""
+
+    parts = _commit_route_parts(path)
+    if parts is None:
+        return None
+    playground_id, commit_id, tail = parts
+    prefix = FILES_SEGMENT + "/"
+    if not tail.startswith(prefix):
+        return None
+    encoded_path = tail[len(prefix):]
+    if not encoded_path:
+        return None
+    return playground_id, commit_id, encoded_path
+
+
 def _match_class_releases(path):
     """Return the opaque class ID in a class release creation path."""
     prefix = CLASSES_PATH + "/"
@@ -251,10 +319,16 @@ def _allowed_methods(path):
         return ("POST",)
     if _match_playground_commit(path) is not None:
         return ("POST",)
+    if _match_manifest(path) is not None:
+        return ALLOWED_METHODS
+    if _match_commit_files(path) is not None:
+        return ALLOWED_METHODS
     if _match_playground(path) is not None:
         return ("PATCH",)
     if _match_class_releases(path) is not None:
         return ("POST",)
+    if path == CATALOG_PATH:
+        return ALLOWED_METHODS
     if path == RELEASES_PATH:
         return ALLOWED_METHODS
     if _match_release(path) is not None:
@@ -281,6 +355,23 @@ def _bundle_request(playground_id, bundle):
             for path, data in bundle.items()
         ],
     }
+
+
+def _decode_content_path(encoded_path):
+    """Decode one URL path exactly once, rejecting encoded separators.
+
+    Encoded slashes and backslashes are rejected instead of being decoded into
+    ambiguous path separators; ``%2e%2e`` and similar traversals are left for
+    the bundle path rules to reject after the single decode.
+    """
+
+    lowered = encoded_path.lower()
+    if "%2f" in lowered or "%5c" in lowered:
+        return None
+    try:
+        return unquote(encoded_path, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
 
 
 def _commit_metadata(actor):
@@ -322,6 +413,14 @@ class Handler(BaseHTTPRequestHandler):
             self._get_classes(head_only=head_only)
         elif _match_class(path) is not None:
             self._get_class(_match_class(path), head_only=head_only)
+        elif path == CATALOG_PATH:
+            self._get_catalog(head_only=head_only)
+        elif _match_manifest(path) is not None:
+            self._get_manifest(*_match_manifest(path), head_only=head_only)
+        elif _match_commit_files(path) is not None:
+            self._get_commit_file(
+                *_match_commit_files(path), head_only=head_only
+            )
         elif path == RELEASES_PATH:
             self._get_releases(head_only=head_only)
         elif _match_release(path) is not None:
@@ -498,6 +597,123 @@ class Handler(BaseHTTPRequestHandler):
             {"class": self._class_payload(class_record)},
             head_only=head_only,
         )
+
+    def _get_catalog(self, head_only=False):
+        actor = self._optional_actor(head_only=head_only)
+        if actor is _AUTH_FAILED:
+            return
+
+        try:
+            with self._database() as connection:
+                entries = self._build_catalog(connection, actor)
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+
+        self._respond_json(
+            200, {"catalog": entries}, head_only=head_only
+        )
+
+    def _build_catalog(self, connection, actor):
+        """Return the deduplicated, stably ordered catalog for ``actor``.
+
+        Public unarchived Playgrounds contribute their current commit, and an
+        authenticated actor additionally contributes the commits of every
+        Release it is currently authorized to read.  An item is identified by
+        the exact ``(playgroundId, commitId)`` pair, so a commit reachable both
+        publicly and through a Release appears once with all its Release ids.
+        """
+
+        entries = {}
+        rows = connection.execute(
+            "SELECT id FROM playgrounds"
+            " WHERE policy = ? AND archived_at IS NULL"
+            " ORDER BY id",
+            (PUBLIC_POLICY,),
+        ).fetchall()
+        for row in rows:
+            commit_id = manifests.current_playground_commit(
+                self.server.repository, row["id"]
+            )
+            if commit_id is None:
+                continue
+            entries[(row["id"], commit_id)] = []
+
+        if actor is not None:
+            for release in list_releases(connection, actor):
+                key = (release.playground_id, release.playground_commit_id)
+                entries.setdefault(key, []).append(release.id)
+
+        catalog = []
+        for playground_id, commit_id in sorted(entries):
+            catalog.append(
+                {
+                    "playgroundId": playground_id,
+                    "commitId": commit_id,
+                    "releaseIds": sorted(
+                        set(entries[(playground_id, commit_id)])
+                    ),
+                }
+            )
+        return catalog
+
+    def _get_manifest(self, playground_id, commit_id, head_only=False):
+        actor = self._optional_actor(head_only=head_only)
+        if actor is _AUTH_FAILED:
+            return
+
+        try:
+            with self._database() as connection:
+                manifest = manifests.generate_manifest(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    playground_id,
+                    commit_id,
+                )
+        except _CONTENT_READ_ERRORS:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except RepositoryError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        self._respond_json(
+            200,
+            {"manifest": manifests.manifest_to_mapping(manifest)},
+            head_only=head_only,
+        )
+
+    def _get_commit_file(
+        self, playground_id, commit_id, encoded_path, head_only=False
+    ):
+        actor = self._optional_actor(head_only=head_only)
+        if actor is _AUTH_FAILED:
+            return
+
+        path = _decode_content_path(encoded_path)
+        if path is None:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        try:
+            with self._database() as connection:
+                content = manifests.read_commit_file(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    playground_id,
+                    commit_id,
+                    path,
+                )
+        except _CONTENT_READ_ERRORS:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+        except RepositoryError:
+            self._api_error(404, "not_found", head_only=head_only)
+            return
+
+        self._respond_file(content.data, content.sha256, head_only=head_only)
 
     def _post_admin_user(self):
         actor = self._authenticate()
@@ -1026,6 +1242,30 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(401, "invalid_session", head_only=head_only)
             return None
 
+    def _optional_actor(self, head_only=False):
+        """Resolve an optional session for a public-capable read route.
+
+        Returns ``None`` when no ``Authorization`` header was supplied, the
+        authenticated account when a valid session was supplied, and the
+        :data:`_AUTH_FAILED` sentinel after answering 401 when a header was
+        supplied but carried no valid session.
+        """
+
+        if self.headers.get("Authorization") is None:
+            return None
+
+        token = self._bearer_token()
+        if token is None:
+            self._api_error(401, "invalid_session", head_only=head_only)
+            return _AUTH_FAILED
+
+        try:
+            with self._database() as connection:
+                return authenticate_session(connection, token)
+        except InvalidSessionError:
+            self._api_error(401, "invalid_session", head_only=head_only)
+            return _AUTH_FAILED
+
     def _post_logout(self):
         token = self._bearer_token()
         if token is None:
@@ -1156,6 +1396,19 @@ class Handler(BaseHTTPRequestHandler):
             extra_headers=extra_headers,
             content_type="application/json; charset=utf-8",
         )
+
+    def _respond_file(self, data, sha256, head_only=False):
+        """Answer a content download with exact bytes and a SHA-256 ETag."""
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", f'"{sha256}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(data)
 
     def _respond(
         self,
