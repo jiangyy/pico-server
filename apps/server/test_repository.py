@@ -21,6 +21,7 @@ from repository import (  # noqa: E402
     PublishResult,
     Repository,
     RepositoryError,
+    WorkHeadChangedError,
     _check_ref_format,
     open_repository,
 )
@@ -788,6 +789,472 @@ class CommitTreeReadTest(unittest.TestCase):
         self.assertEqual(by_path["sub"].kind, "commit")
         self.assertIsNone(by_path["sub"].size)
         self.assertEqual(by_path["picopg.json"].size, len(b"manifest"))
+
+
+class WorkCommitWriteTest(unittest.TestCase):
+    """Low-level Server-owned Work commit and ref CAS tests."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "picopg.git"
+        self.repository = open_repository(self.path)
+
+    # -- helpers ---------------------------------------------------------
+
+    def make_bundle(self, entries):
+        return bundles.validate_bundle(
+            [bundles.BundleEntry(path, data) for path, data in entries]
+        )
+
+    def metadata(self, message="work"):
+        return CommitMetadata(
+            name="PicoPG Server",
+            email="server@picopg.invalid",
+            timestamp="2026-01-01T00:00:00+00:00",
+            message=message,
+        )
+
+    def publish_playground(self, playground_id, course_data=b"print(1)"):
+        return repository.publish_playground(
+            self.repository,
+            playground_id,
+            self.make_bundle(
+                [
+                    (
+                        "picopg.json",
+                        b'{"schemaVersion":1,"runtime":"python"}',
+                    ),
+                    ("course/module/app.py", course_data),
+                    ("starter/setup.py", b"setup"),
+                ]
+            ),
+            self.metadata("publish playground"),
+        )
+
+    def full_tree(self, playground_commit_id, work=None, course=b"print(1)"):
+        files = {
+            "picopg.json": b'{"schemaVersion":1,"runtime":"python"}',
+            "course/module/app.py": course,
+            "starter/setup.py": b"setup",
+            ".picopg/work.json": (
+                '{"playgroundCommitId":"' + playground_commit_id + '"}'
+            ).encode("utf-8"),
+        }
+        if work:
+            files.update(work)
+        return MappingProxyType(files)
+
+    def git(self, *arguments, input=None, environment=None, check=True):
+        effective = dict(os.environ)
+        if environment is not None:
+            effective.update(environment)
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), *arguments],
+            input=input,
+            capture_output=True,
+            env=effective,
+        )
+        if check:
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", "replace"),
+            )
+        return completed.stdout
+
+    def commit_tree(self, tree_id, message=b"decoy\n"):
+        environment = {
+            "GIT_AUTHOR_NAME": "Decoy",
+            "GIT_AUTHOR_EMAIL": "decoy@example.test",
+            "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+            "GIT_COMMITTER_NAME": "Decoy",
+            "GIT_COMMITTER_EMAIL": "decoy@example.test",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+        }
+        return (
+            self.git(
+                "commit-tree", tree_id, input=message, environment=environment
+            )
+            .strip()
+            .decode("ascii")
+        )
+
+    def ref_exists(self, ref):
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True,
+        )
+        return completed.returncode == 0
+
+    def parents(self, commit_id):
+        return [
+            value.decode("ascii")
+            for value in self.git(
+                "rev-list", "--parents", "-n", "1", commit_id
+            ).split()[1:]
+        ]
+
+    def write(self, playground_id, student_id, playground_commit_id,
+              base_commit_id=None, files=None, metadata=None):
+        if files is None:
+            files = self.full_tree(playground_commit_id)
+        return repository.write_work_commit(
+            self.repository,
+            playground_id,
+            student_id,
+            playground_commit_id,
+            base_commit_id,
+            files,
+            self.metadata() if metadata is None else metadata,
+        )
+
+    # -- parent and ref rules --------------------------------------------
+
+    def test_first_work_commit_parent_is_exact_playground_commit(self):
+        playground_id = "pg-work"
+        playground = self.publish_playground(playground_id)
+        commit_id = self.write(
+            playground_id, "student-1", playground.commit_id
+        )
+        ref = self.repository.work_ref(playground_id, "student-1")
+        self.assertEqual(
+            self.git("rev-parse", ref).strip().decode("ascii"), commit_id
+        )
+        self.assertEqual(
+            self.parents(commit_id), [playground.commit_id]
+        )
+        # Only the Work ref moved; the Playground ref is untouched.
+        self.assertEqual(
+            self.git("rev-parse", self.repository.playground_ref(playground_id))
+            .strip()
+            .decode("ascii"),
+            playground.commit_id,
+        )
+
+    def test_later_work_commit_parent_is_current_work_head(self):
+        playground_id = "pg-linear"
+        playground = self.publish_playground(playground_id)
+        first = self.write(
+            playground_id, "student-1", playground.commit_id
+        )
+        second = self.write(
+            playground_id,
+            "student-1",
+            playground.commit_id,
+            base_commit_id=first,
+            files=self.full_tree(playground.commit_id, work={"work/a.py": b"a"}),
+        )
+        self.assertEqual(self.parents(second), [first])
+        self.assertEqual(
+            self.git(
+                "rev-list", "--count", f"{second}", f"^{playground.commit_id}"
+            ).strip(),
+            b"2",
+        )
+
+    def test_students_get_separate_refs(self):
+        playground_id = "pg-multi"
+        playground = self.publish_playground(playground_id)
+        a = self.write(playground_id, "student-a", playground.commit_id)
+        b = self.write(playground_id, "student-b", playground.commit_id)
+        self.assertTrue(
+            self.ref_exists(self.repository.work_ref(playground_id, "student-a"))
+        )
+        self.assertTrue(
+            self.ref_exists(self.repository.work_ref(playground_id, "student-b"))
+        )
+        self.assertEqual(
+            self.parents(a), [playground.commit_id]
+        )
+        self.assertEqual(
+            self.parents(b), [playground.commit_id]
+        )
+
+    def test_missing_ref_with_base_is_rejected(self):
+        playground_id = "pg-missing"
+        playground = self.publish_playground(playground_id)
+        with self.assertRaises(WorkHeadChangedError):
+            self.write(
+                playground_id,
+                "student-1",
+                playground.commit_id,
+                base_commit_id="a" * 40,
+            )
+        self.assertFalse(
+            self.ref_exists(
+                self.repository.work_ref(playground_id, "student-1")
+            )
+        )
+
+    def test_existing_ref_without_base_is_rejected(self):
+        playground_id = "pg-exists"
+        playground = self.publish_playground(playground_id)
+        first = self.write(playground_id, "student-1", playground.commit_id)
+        with self.assertRaises(WorkHeadChangedError):
+            self.write(playground_id, "student-1", playground.commit_id)
+        self.assertEqual(
+            self.git(
+                "rev-parse", self.repository.work_ref(playground_id, "student-1")
+            )
+            .strip()
+            .decode("ascii"),
+            first,
+        )
+
+    def test_base_must_equal_current_head(self):
+        playground_id = "pg-stale"
+        playground = self.publish_playground(playground_id)
+        first = self.write(playground_id, "student-1", playground.commit_id)
+        second = self.write(
+            playground_id,
+            "student-1",
+            playground.commit_id,
+            base_commit_id=first,
+        )
+        for base in (first, "a" * 40):
+            with self.subTest(base=base):
+                with self.assertRaises(WorkHeadChangedError):
+                    self.write(
+                        playground_id,
+                        "student-1",
+                        playground.commit_id,
+                        base_commit_id=base,
+                    )
+        self.assertEqual(
+            self.git(
+                "rev-parse", self.repository.work_ref(playground_id, "student-1")
+            )
+            .strip()
+            .decode("ascii"),
+            second,
+        )
+
+    def test_resolve_work_head_returns_exact_commit_or_none(self):
+        playground_id = "pg-head"
+        playground = self.publish_playground(playground_id)
+        self.assertIsNone(
+            repository.resolve_work_head(
+                self.repository, playground_id, "student-1"
+            )
+        )
+        first = self.write(playground_id, "student-1", playground.commit_id)
+        self.assertEqual(
+            repository.resolve_work_head(
+                self.repository, playground_id, "student-1"
+            ),
+            first,
+        )
+
+    def test_concurrent_ref_change_is_never_overwritten(self):
+        playground_id = "pg-race"
+        playground = self.publish_playground(playground_id)
+        first = self.write(playground_id, "student-1", playground.commit_id)
+        ref = self.repository.work_ref(playground_id, "student-1")
+        tree_id = (
+            self.git("rev-parse", f"{playground.commit_id}^{{tree}}")
+            .strip()
+            .decode("ascii")
+        )
+        decoy = self.commit_tree(tree_id)
+
+        original = repository._run_git
+        moved = {"done": False}
+
+        def racing(arguments, cwd=None, stdin=None, environment=None):
+            completed = original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+            if not moved["done"] and arguments and arguments[0] == "commit-tree":
+                moved["done"] = True
+                self.git("update-ref", ref, decoy)
+            return completed
+
+        with mock.patch.object(repository, "_run_git", side_effect=racing):
+            with self.assertRaises(WorkHeadChangedError) as context:
+                self.write(
+                    playground_id,
+                    "student-1",
+                    playground.commit_id,
+                    base_commit_id=first,
+                )
+        self.assertEqual(context.exception.reason, "work_head_changed")
+        self.assertEqual(
+            self.git("rev-parse", ref).strip().decode("ascii"), decoy
+        )
+
+    # -- tree exactness --------------------------------------------------
+
+    def test_tree_is_exactly_the_supplied_mapping(self):
+        playground_id = "pg-tree"
+        playground = self.publish_playground(playground_id)
+        files = self.full_tree(
+            playground.commit_id, work={"work/main.py": b"print('work')"}
+        )
+        commit_id = self.write(
+            playground_id, "student-1", playground.commit_id, files=files
+        )
+        paths = sorted(
+            name.decode("utf-8")
+            for name in self.git(
+                "ls-tree", "-r", "-z", "--name-only", commit_id
+            ).split(b"\x00")
+            if name
+        )
+        self.assertEqual(paths, sorted(files))
+        for path, data in files.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    self.git("show", f"{commit_id}:{path}"), data
+                )
+
+    def test_cas_update_ref_never_forces(self):
+        playground_id = "pg-cas"
+        playground = self.publish_playground(playground_id)
+        observed = []
+        original = repository._run_git
+
+        def spy(arguments, cwd=None, stdin=None, environment=None):
+            if arguments and arguments[0] == "update-ref":
+                observed.append(tuple(arguments))
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(repository, "_run_git", side_effect=spy):
+            self.write(playground_id, "student-1", playground.commit_id)
+
+        self.assertEqual(len(observed), 1)
+        arguments = observed[0]
+        self.assertEqual(arguments[0], "update-ref")
+        self.assertNotIn("-f", arguments)
+        self.assertEqual(
+            arguments[1],
+            self.repository.work_ref(playground_id, "student-1"),
+        )
+        self.assertEqual(arguments[3], "0" * 40)
+
+    # -- validation before writes ---------------------------------------
+
+    def test_invalid_tree_paths_are_rejected_before_object_writes(self):
+        playground = self.publish_playground("pg-bad-tree")
+        base = self.full_tree(playground.commit_id)
+        rejected = [
+            MappingProxyType({**base, "/absolute": b"x"}),
+            MappingProxyType({**base, "a/../b": b"x"}),
+            MappingProxyType({**base, "a//b": b"x"}),
+            MappingProxyType({**base, "a\\b": b"x"}),
+            MappingProxyType({**base, 1: b"x"}),
+            MappingProxyType({**base, "work/data": "text"}),
+            MappingProxyType({**base, "work/a": b"x", "work/a/b": b"y"}),
+            {key: value for key, value in base.items()},
+        ]
+        write_commands = {"hash-object", "mktree", "commit-tree"}
+        for files in rejected:
+            with self.subTest(files=type(files)):
+                observed = []
+                original = repository._run_git
+
+                def spy(arguments, cwd=None, stdin=None, environment=None):
+                    observed.append(arguments[0] if arguments else "")
+                    return original(
+                        arguments, cwd=cwd, stdin=stdin, environment=environment
+                    )
+
+                with mock.patch.object(repository, "_run_git", side_effect=spy):
+                    with self.assertRaises(RepositoryError):
+                        self.write(
+                            "pg-bad-tree",
+                            "student-1",
+                            playground.commit_id,
+                            files=files,
+                        )
+                self.assertTrue(write_commands.isdisjoint(observed))
+        self.assertFalse(
+            self.ref_exists(
+                self.repository.work_ref("pg-bad-tree", "student-1")
+            )
+        )
+
+    def test_non_utf8_encodable_tree_name_raises_repository_error(self):
+        playground = self.publish_playground("pg-bad-utf8")
+        files = MappingProxyType(
+            {
+                **self.full_tree(playground.commit_id),
+                "work/a\ud800b": b"x",
+            }
+        )
+        # The tree writer must surface a domain error, never an unhandled
+        # UnicodeEncodeError, and must leave the ref uncreated.
+        with self.assertRaises(RepositoryError):
+            self.write(
+                "pg-bad-utf8",
+                "student-1",
+                playground.commit_id,
+                files=files,
+            )
+        self.assertFalse(
+            self.ref_exists(
+                self.repository.work_ref("pg-bad-utf8", "student-1")
+            )
+        )
+
+    def test_invalid_metadata_and_identifiers_never_reach_git(self):
+        valid = self.full_tree("a" * 40)
+        bad_metadata = [
+            None,
+            "metadata",
+            CommitMetadata("", "a@b", "2026-01-01T00:00:00+00:00", "m"),
+            CommitMetadata("n", "a@b", "", "m"),
+            CommitMetadata("bad\nname", "a@b", "2026-01-01T00:00:00+00:00", "m"),
+        ]
+        with mock.patch.object(repository, "_run_git") as spy:
+            for metadata in bad_metadata:
+                with self.subTest(metadata=metadata):
+                    with self.assertRaises(RepositoryError):
+                        repository.write_work_commit(
+                            self.repository,
+                            "pg-meta",
+                            "student-1",
+                            "a" * 40,
+                            None,
+                            valid,
+                            metadata,
+                        )
+            for playground_id, student_id in (("..", "s"), ("pg", "a/b"), ("pg", "")):
+                with self.subTest(playground_id=playground_id, student_id=student_id):
+                    with self.assertRaises(RepositoryError):
+                        repository.write_work_commit(
+                            self.repository,
+                            playground_id,
+                            student_id,
+                            "a" * 40,
+                            None,
+                            valid,
+                            self.metadata(),
+                        )
+            spy.assert_not_called()
+
+    def test_caller_never_chooses_the_ref_or_force(self):
+        playground = self.publish_playground("pg-ref")
+        seen = []
+        original = repository._run_git
+
+        def spy(arguments, cwd=None, stdin=None, environment=None):
+            seen.append(tuple(arguments))
+            return original(
+                arguments, cwd=cwd, stdin=stdin, environment=environment
+            )
+
+        with mock.patch.object(repository, "_run_git", side_effect=spy):
+            self.write("pg-ref", "student-1", playground.commit_id)
+
+        expected_ref = self.repository.work_ref("pg-ref", "student-1")
+        for arguments in seen:
+            for argument in arguments:
+                if "refs/" in argument:
+                    self.assertEqual(argument, expected_ref)
+                self.assertNotIn("checkout", argument)
 
 
 if __name__ == "__main__":

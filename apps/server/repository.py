@@ -238,6 +238,19 @@ class PlaygroundHeadChangedError(RepositoryError):
         super().__init__(message)
 
 
+class WorkHeadChangedError(RepositoryError):
+    """The Work ref is missing, moved, or not the expected base.
+
+    The comparison-and-swap never overwrites the ref; a concurrent writer or
+    a caller that supplied a stale base sees this error instead.
+    """
+
+    reason = "work_head_changed"
+
+    def __init__(self, message="work head changed"):
+        super().__init__(message)
+
+
 def _validate_commit_metadata(metadata):
     if type(metadata) is not CommitMetadata:
         raise RepositoryError("commit metadata must be CommitMetadata")
@@ -339,7 +352,27 @@ def _write_bundle_blob(repository, data):
     return completed.stdout.strip().decode("ascii")
 
 
+def _encode_tree_name(name):
+    """Return the UTF-8 bytes of one tree entry name.
+
+    A client value containing a lone surrogate cannot be encoded and would
+    otherwise crash the tree writer.  It is surfaced as the module's domain
+    error so no caller (publish or Work) ever sees an unhandled
+    :class:`UnicodeEncodeError`.
+    """
+
+    try:
+        return name.encode("utf-8")
+    except (UnicodeEncodeError, AttributeError):
+        raise RepositoryError("tree entry name cannot be encoded as UTF-8")
+
+
 def _write_bundle_tree(repository, node):
+    # Encode every name before writing any blob so a bad name is rejected
+    # before any object write (apart from already written siblings).
+    encoded_names = {
+        name: _encode_tree_name(name) for name in sorted(node)
+    }
     payload = bytearray()
     for name in sorted(node):
         value = node[name]
@@ -355,7 +388,7 @@ def _write_bundle_tree(repository, node):
             mode,
             kind,
             object_id.encode("ascii"),
-            name.encode("utf-8"),
+            encoded_names[name],
         )
     completed = _run_git(
         ("mktree", "-z"), cwd=repository.path, stdin=bytes(payload)
@@ -397,7 +430,10 @@ def _zero_object_id(repository):
     return "0" * width
 
 
-def _create_commit(repository, tree_id, parent, metadata):
+def _create_commit(
+    repository, tree_id, parent, metadata,
+    error_message="could not create playground commit",
+):
     arguments = ["commit-tree", tree_id]
     if parent is not None:
         arguments += ["-p", parent]
@@ -416,16 +452,18 @@ def _create_commit(repository, tree_id, parent, metadata):
         environment=environment,
     )
     if completed.returncode != 0:
-        raise RepositoryError("could not create playground commit")
+        raise RepositoryError(error_message)
     return completed.stdout.strip().decode("ascii")
 
 
-def _compare_and_swap(repository, ref, new_id, old_id):
+def _compare_and_swap(
+    repository, ref, new_id, old_id, error=PlaygroundHeadChangedError
+):
     completed = _run_git(
         ("update-ref", ref, new_id, old_id), cwd=repository.path
     )
     if completed.returncode != 0:
-        raise PlaygroundHeadChangedError()
+        raise error()
 
 
 def publish_playground(repository, playground_id, bundle, metadata):
@@ -465,6 +503,111 @@ def publish_playground(repository, playground_id, bundle, metadata):
     return PublishResult(
         playground_id=playground_id, commit_id=commit_id, no_op=False
     )
+
+
+# --- Server-owned Work commits ---------------------------------------------
+#
+# A Work commit is assembled by the Work domain from the exact Playground tree
+# plus the normalized ``work/**`` snapshot.  This layer only turns that complete
+# server-built tree into one commit and compare-and-swaps the single Work ref;
+# no caller value chooses the ref, the parent, or a force update.
+
+
+def _is_safe_tree_path(path):
+    if type(path) is not str or not path:
+        return False
+    if "\\" in path or _CONTROL_CHARACTERS.search(path):
+        return False
+    if path.startswith("/"):
+        return False
+    segments = path.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        return False
+    return True
+
+
+def _snapshot_tree_files(files):
+    """Defensively copy a complete server-built tree into a sorted list.
+
+    Only plain ``str`` paths and ``bytes`` values are accepted, and every path
+    is re-checked as a safe relative tree path before any Git object is
+    written.  The Work domain owns the path allowlist; this only rejects the
+    shapes that could corrupt a Git tree.
+    """
+
+    if type(files) is not MappingProxyType:
+        raise RepositoryError(
+            "work tree must be the normalized read-only mapping"
+        )
+    collected = []
+    for path, data in files.items():
+        if type(path) is not str or type(data) is not bytes:
+            raise RepositoryError(
+                "work tree entries must be plain str paths and bytes values"
+            )
+        if not _is_safe_tree_path(path):
+            raise RepositoryError("work tree path is not allowed")
+        collected.append((path, data))
+    collected.sort(key=lambda item: item[0])
+    return collected
+
+
+def write_work_commit(
+    repository,
+    playground_id,
+    student_id,
+    playground_commit_id,
+    base_commit_id,
+    files,
+    metadata,
+):
+    """Create or append one Server-owned Work commit and CAS the Work ref.
+
+    ``files`` must be the complete, server-assembled read-only mapping of the
+    Playground content plus the submitted ``work/**`` snapshot and the
+    Server-created ``.picopg/work.json``.  The ref is always derived from
+    ``playground_id`` and ``student_id`` and can never be chosen by a caller.
+
+    When ``base_commit_id`` is ``None`` the ref must not exist yet and the
+    commit's parent is exactly ``playground_commit_id``.  Otherwise
+    ``base_commit_id`` must equal the current Work HEAD, which becomes the
+    parent.  A missing, moved, or mismatched ref surfaces as
+    :class:`WorkHeadChangedError` and is never overwritten.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    _validate_commit_metadata(metadata)
+    playground_commit_id = _require_object_id(playground_commit_id)
+    if base_commit_id is not None:
+        base_commit_id = _require_object_id(base_commit_id)
+
+    ref = repository.work_ref(playground_id, student_id)
+    head = _resolve_head(repository, ref)
+
+    if base_commit_id is None:
+        if head is not None:
+            raise WorkHeadChangedError()
+        parent = playground_commit_id
+        old_id = _zero_object_id(repository)
+    else:
+        if head != base_commit_id:
+            raise WorkHeadChangedError()
+        parent = base_commit_id
+        old_id = base_commit_id
+
+    tree_id = _write_bundle_tree(
+        repository, _bundle_tree(_snapshot_tree_files(files))
+    )
+    commit_id = _create_commit(
+        repository,
+        tree_id,
+        parent,
+        metadata,
+        error_message="could not create work commit",
+    )
+    _compare_and_swap(repository, ref, commit_id, old_id, WorkHeadChangedError)
+    return commit_id
 
 
 # --- Read-only commit tree access ------------------------------------------
@@ -509,6 +652,22 @@ def resolve_commit(repository, commit_id):
     if resolved != commit_id:
         return None
     return resolved
+
+
+def resolve_work_head(repository, playground_id, student_id):
+    """Return the exact commit at the derived Work ref, or ``None``.
+
+    The ref is always derived from ``playground_id`` and ``student_id``, so a
+    caller can never name an arbitrary ref.  A missing ref yields ``None``; a
+    ref that does not point at a commit also yields ``None``.
+    """
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    ref = repository.work_ref(playground_id, student_id)
+    head = _resolve_head(repository, ref)
+    if head is None:
+        return None
+    return resolve_commit(repository, head)
 
 
 def list_commit_tree(repository, commit_id):
