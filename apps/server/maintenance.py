@@ -44,10 +44,12 @@ import permissions
 import repository as repository_module
 import works
 import database
+import accounts
 
 
 __all__ = [
     "MaintenanceError",
+    "REASON_ADMIN_EXISTS",
     "REASON_ALTERNATES_PRESENT",
     "REASON_COMMIT_MISSING",
     "REASON_DATA_DIR_INVALID",
@@ -63,6 +65,7 @@ __all__ = [
     "REASON_SERVICE_RUNNING",
     "REASON_UNEXPECTED_FILE",
     "create_backup",
+    "create_first_admin",
     "compact_repository",
     "restore_backup",
     "validate_backup",
@@ -86,6 +89,7 @@ _MAX_MAINTENANCE_COMMITS = 100_000
 # Stable reason codes.  The message carries the human-readable detail, while
 # the reason stays machine readable for callers and tests.
 REASON_ALTERNATES_PRESENT = "alternates_present"
+REASON_ADMIN_EXISTS = "admin_exists"
 REASON_COMMIT_MISSING = "commit_missing"
 REASON_DATA_DIR_INVALID = "data_dir_invalid"
 REASON_DATABASE_INVALID = "database_invalid"
@@ -1301,6 +1305,34 @@ def compact_repository(data_dir, *, service_stopped=False):
     return summary
 
 
+def create_first_admin(data_dir, username, password):
+    """Create the first Admin in one data directory.
+
+    The Server must have initialized the data directory first (it creates the
+    database and the bare repository on startup), so this runs against a live
+    or recently-stopped host.  SQLite serializes the single insert, and the
+    one-admin guard lives in :func:`accounts.create_first_admin`.
+    """
+
+    data_dir = Path(data_dir)
+    database_path = data_dir / DATABASE_FILENAME
+    if not database_path.is_file():
+        raise MaintenanceError(
+            REASON_DATABASE_INVALID,
+            "the data directory has no database yet",
+        )
+    connection = database.open_database(database_path)
+    try:
+        user = accounts.create_first_admin(connection, username, password)
+    except accounts.AdminAlreadyExistsError as error:
+        raise MaintenanceError(
+            REASON_ADMIN_EXISTS, "an admin already exists"
+        ) from error
+    finally:
+        connection.close()
+    return {"user_id": user.id, "username": user.username, "role": user.role}
+
+
 def _run_cli(argv=None):
     parser = argparse.ArgumentParser(prog="maintenance.py")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -1308,6 +1340,10 @@ def _run_cli(argv=None):
         subparser = subcommands.add_parser(name)
         subparser.add_argument("--data-dir", required=True)
         subparser.add_argument("--service-stopped", action="store_true")
+    admin = subcommands.add_parser("create-admin")
+    admin.add_argument("--data-dir", required=True)
+    admin.add_argument("--username", required=True)
+    admin.add_argument("--password", required=True)
     arguments = parser.parse_args(argv)
 
     try:
@@ -1316,10 +1352,14 @@ def _run_cli(argv=None):
                 arguments.data_dir,
                 service_stopped=arguments.service_stopped,
             )
-        else:
+        elif arguments.command == "compact":
             summary = compact_repository(
                 arguments.data_dir,
                 service_stopped=arguments.service_stopped,
+            )
+        else:
+            summary = create_first_admin(
+                arguments.data_dir, arguments.username, arguments.password
             )
     except MaintenanceError as error:
         print(json.dumps({"error": error.reason}, sort_keys=True))

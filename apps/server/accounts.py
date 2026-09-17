@@ -31,6 +31,10 @@ class RoleConflictError(Exception):
     """Raised when a role change conflicts with existing relationships."""
 
 
+class AdminAlreadyExistsError(Exception):
+    """A data directory already has an Admin; first-admin bootstrap is one-shot."""
+
+
 class StoredUserError(Exception):
     """A durable user row cannot be represented by the admin API."""
 
@@ -123,6 +127,25 @@ def create_user(connection, actor, username, password, role):
     _validate_role(role)
     username = _validate_credentials(username, password)
     user = _new_user(username, role)
+    return _insert_user(connection, user, password)
+
+
+def create_first_admin(connection, username, password):
+    """Create the first Admin account of a fresh data directory.
+
+    This is the only path that mints an Admin without an Admin actor, so it
+    refuses as soon as one Admin exists.  That keeps it a one-shot bootstrap
+    for a new deployment instead of a second, unaudited door into a running
+    one.  The caller is an offline operator command; no HTTP route calls this.
+    """
+
+    username = _validate_credentials(username, password)
+    existing = connection.execute(
+        "SELECT 1 FROM users WHERE role = 'admin' LIMIT 1"
+    ).fetchone()
+    if existing is not None:
+        raise AdminAlreadyExistsError("an admin already exists")
+    user = _new_user(username, "admin")
     return _insert_user(connection, user, password)
 
 
