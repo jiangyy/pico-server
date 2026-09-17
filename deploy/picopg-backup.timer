@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Pico offline data backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=picopg-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Pico offline data backup
+
+[Service]
+Type=oneshot
+ExecStart=%h/picopg/deploy/picopg-backup.sh
