@@ -904,6 +904,14 @@ def restore_backup(backup_path, data_dir, *, service_stopped=False):
                     REASON_PATH_ESCAPE, "a restore path escapes its root"
                 )
             _copy_verified_file(source, target, entry)
+
+        # A compacted bare repository may store every ref in ``packed-refs``.
+        # Empty directories are intentionally absent from the file manifest,
+        # but Git still requires these two structural roots to recognize the
+        # restored directory as a repository.
+        restored_repository = temporary / REPOSITORY_DIRNAME
+        (restored_repository / "objects").mkdir(exist_ok=True)
+        (restored_repository / "refs").mkdir(exist_ok=True)
         _fsync_tree(temporary)
 
         # Validate the completed recovery set before it becomes visible.

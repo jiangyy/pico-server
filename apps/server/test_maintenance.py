@@ -490,6 +490,25 @@ class MaintenanceTest(unittest.TestCase):
         self.assertTrue((target / "app.db").is_file())
         self.assertTrue((target / "picopg.git").is_dir())
 
+    def test_restore_after_compaction_recreates_bare_repository_structure(self):
+        maintenance.compact_repository(
+            self.data_dir, service_stopped=True
+        )
+        self.make_backup()
+        target = self.base / "restore"
+
+        maintenance.restore_backup(
+            self.backup_path, target, service_stopped=True
+        )
+
+        restored = repository.open_repository(target / "picopg.git")
+        self.assertEqual(
+            repository.resolve_work_head(
+                restored, self.playground_id, self.student.id
+            ),
+            self.work_commit_id,
+        )
+
     def test_restore_target_inside_the_backup_is_refused(self):
         self.make_backup()
         target = self.backup_path / "restore"
