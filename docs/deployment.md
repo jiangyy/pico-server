@@ -91,6 +91,10 @@ cd ~/Documents/learn-python
 node apps/picopg-web/build.mjs
 scp apps/picopg-web/dist/{index.html,main.js,picopg.css,pico.svg} \
     picopg.cn:/home/xiaoci/picopg/data/web/
+# `scripts/publish.mjs` also produces `dist/publish/runtime/`; copy that
+# directory to `data/web/runtime/` when the browser runtime changes.
+scp -r dist/publish/runtime \
+    picopg.cn:/home/xiaoci/picopg/data/web/
 ssh picopg.cn 'systemctl --user restart picopg.service'
 ```
 
@@ -113,53 +117,40 @@ curl -sS  https://picopg.cn/api/v1/bootstrap   # 200
 ## 3. Ship a new Playground from `learn-python`
 
 The Server accepts a validated ZIP through `POST /api/v1/playgrounds/{id}/commits`.
-The `learn-python` publish helper that produced those ZIPs was removed with the
-old artifact contract, so today the operator assembles the ZIP by hand from a
-`node apps/picopg-web/build.mjs`-style page build; see the steps below.
+The supported helper is `node scripts/publish.mjs <id>`; it emits the course ZIP
+and the shared runtime overlay from the same build.
 
 ### 3.1 Build the artifacts locally
 
 ```bash
 cd ~/Documents/learn-python
-npm run publish
-ls dist/publish/playgrounds/hello
-ls dist/publish/runtimes/pico-runtime-1
+node scripts/publish.mjs hello --requires-submission
+ls dist/publish/hello.zip dist/publish/runtime
 ```
 
-`dist/publish/playgrounds/hello/<commitId>/course/index.html` is the
-playground itself; `dist/publish/runtimes/pico-runtime-1/runtime.json` is
-the runtime manifest. Each one is **content-addressed**: the `<commitId>`
-is `sha256(sorted paths + sha256 + size)` and is the only safe identifier
-to put on the wire.
+The ZIP contains only `picopg.json` and `course/index.html`; runtime files are
+served from `data/web/runtime/`. The `requiresSubmission` flag is explicit in
+`picopg.json` and defaults to `false` when the flag is omitted.
 
 ### 3.2 Push the runtime once per host (almost never)
 
-The runtime is bundled into the desktop package on the client side and is
-served by the Server for browsers. The Server stores it under
-`data/artifacts/`. Re-upload only when the runtime version changes:
+The runtime is served from `data/web/runtime/` for the same-origin course URL.
+Re-upload it only when the runtime version changes:
 
 ```bash
-cd dist/publish/runtimes/pico-runtime-1
-tar -cf runtime.tar runtime.json libs/ pico.js world.js pico.css pico.svg pyodide/
-ADMIN_TOKEN=…   # from server operator
-curl -fsS -X POST \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Idempotency-Key: runtime-$(cat runtime.json | jq -r .id)" \
-  --data-binary @runtime.tar \
-  https://picopg.cn/api/v1/artifacts
+scp -r dist/publish/runtime \
+  picopg.cn:/home/xiaoci/picopg/data/web/
 ```
 
 ### 3.3 Push every new Playground ZIP
 
 ```bash
-cd dist/publish/playgrounds/hello
-PLAYGROUND_DIR=$(ls -d */ | head -1 | tr -d '/')    # <commitId>
-zip -rq "$PLAYGROUND_DIR.zip" "$PLAYGROUND_DIR"
+ADMIN_TOKEN=…   # sessionToken from an Admin login
 curl -fsS -X POST \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/zip" \
-  -H "Idempotency-Key: hello-$PLAYGROUND_DIR" \
-  --data-binary @"$PLAYGROUND_DIR.zip" \
+  -H "Idempotency-Key: hello-$(date +%s)" \
+  --data-binary @dist/publish/hello.zip \
   https://picopg.cn/api/v1/playgrounds/hello/commits
 ```
 

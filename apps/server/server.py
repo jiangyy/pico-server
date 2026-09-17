@@ -5,6 +5,7 @@ import json
 import threading
 from contextlib import closing
 from datetime import datetime, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -123,7 +124,11 @@ DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
 WEB_DIRECTORY_NAME = "web"
+WEB_RUNTIME_DIRECTORY_NAME = "runtime"
 BOOTSTRAP_PATH = "/api/v1/bootstrap"
+COURSES_PATH = "/courses"
+SESSION_COOKIE_NAME = "picopg_session"
+SESSION_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
 
 # The Web bundle is four files: one startup document plus the three assets it
 # references.  Serving is a closed table rather than a directory walk, so no
@@ -558,6 +563,18 @@ def _match_artifact_version(path):
     return version
 
 
+def _match_course_file(path):
+    """Return ``(playground_id, commit_id, encoded_path)`` for course files."""
+
+    prefix = COURSES_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+    parts = path[len(prefix):].split("/", 2)
+    if len(parts) != 3 or not all(parts):
+        return None
+    return tuple(parts)
+
+
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     methods = ROUTE_METHODS.get(path)
@@ -589,6 +606,8 @@ def _allowed_methods(path):
         return ALLOWED_METHODS
     if path == PLAYGROUNDS_PATH:
         return ("GET", "HEAD", "POST")
+    if _match_course_file(path) is not None:
+        return ALLOWED_METHODS
     if _match_playground_commit(path) is not None:
         return ("POST",)
     if _match_work_sync(path) is not None:
@@ -747,6 +766,22 @@ def _content_disposition(filename):
     return f'attachment; filename="{safe}"'
 
 
+def _course_content_type(path):
+    if path.endswith(".html"):
+        return "text/html; charset=utf-8"
+    if path.endswith(".js") or path.endswith(".mjs"):
+        return "text/javascript; charset=utf-8"
+    if path.endswith(".css"):
+        return "text/css; charset=utf-8"
+    if path.endswith(".svg"):
+        return "image/svg+xml"
+    if path.endswith(".json"):
+        return "application/json; charset=utf-8"
+    if path.endswith(".wasm"):
+        return "application/wasm"
+    return "application/octet-stream"
+
+
 def _commit_metadata(actor):
     """Build the trusted, server-owned commit identity for an actor."""
 
@@ -865,6 +900,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in WEB_BUNDLE:
             self._get_web_file(path, head_only=head_only)
+        elif _match_course_file(path) is not None:
+            self._get_course_file(*_match_course_file(path), head_only=head_only)
         elif path == "/healthz":
             self._respond(200, "ok\n", head_only=head_only)
         elif path == BOOTSTRAP_PATH:
@@ -1066,6 +1103,14 @@ class Handler(BaseHTTPRequestHandler):
                 "expiresAt": session.expires_at,
                 "user": self._user_payload(session.user),
             },
+            extra_headers=(
+                (
+                    "Set-Cookie",
+                    f"{SESSION_COOKIE_NAME}={session.token}; Path=/; "
+                    f"Max-Age={SESSION_COOKIE_MAX_AGE}; HttpOnly; Secure; "
+                    "SameSite=Strict",
+                ),
+            ),
         )
 
     def _get_me(self, head_only=False):
@@ -1347,6 +1392,111 @@ class Handler(BaseHTTPRequestHandler):
             content_type=content_type,
             etag=hashlib.sha256(data).hexdigest(),
             cache_control=WEB_BUNDLE_CACHE_CONTROL,
+            head_only=head_only,
+        )
+
+    def _get_course_file(
+        self, playground_id, commit_id, encoded_path, head_only=False
+    ):
+        actor = self._authenticate_course(head_only=head_only)
+        if actor is None:
+            return
+        path = _decode_content_path(encoded_path)
+        if path is None:
+            self._deny_content_read(
+                playground_id, commit_id, head_only=head_only
+            )
+            return
+
+        runtime = (
+            path in ("pico.css", "pico.svg")
+            or path.startswith("libs/")
+            or path.startswith("pyodide/")
+        )
+        if runtime:
+            segments = path.split("/")
+            if (
+                any(not segment or segment in (".", "..") for segment in segments)
+                or segments[0] not in ("libs", "pyodide", "pico.css", "pico.svg")
+            ):
+                self._deny_content_read(
+                    playground_id, commit_id, head_only=head_only
+                )
+                return
+            try:
+                with self._database() as connection:
+                    authorization.authorize_content_read(
+                        connection,
+                        actor,
+                        self.server.repository,
+                        playground_id,
+                        commit_id,
+                    )
+                target = (self.server.runtime_path / path).resolve()
+                root = self.server.runtime_path.resolve()
+                if root not in target.parents or not target.is_file():
+                    raise FileNotFoundError
+                data = target.read_bytes()
+            except authorization.ContentAccessDeniedError:
+                self._deny_content_read(
+                    playground_id, commit_id, head_only=head_only
+                )
+                return
+            except (FileNotFoundError, OSError, RepositoryError):
+                self._deny_content_read(
+                    playground_id, commit_id, head_only=head_only
+                )
+                return
+            self._respond_bytes(
+                200,
+                data,
+                content_type=_course_content_type(path),
+                etag=hashlib.sha256(data).hexdigest(),
+                cache_control="public, max-age=31536000, immutable",
+                extra_headers=(
+                    (
+                        "Content-Security-Policy",
+                        "default-src 'none'; script-src 'self'; "
+                        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                        "connect-src 'self'",
+                    ),
+                ),
+                head_only=head_only,
+            )
+            return
+
+        try:
+            with self._database() as connection:
+                content = manifests.read_commit_file(
+                    connection,
+                    actor,
+                    self.server.repository,
+                    playground_id,
+                    commit_id,
+                    path,
+                )
+        except (authorization.ContentAccessDeniedError, manifests.ManifestError):
+            self._deny_content_read(
+                playground_id, commit_id, head_only=head_only
+            )
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+        self._respond_bytes(
+            200,
+            content.data,
+            content_type=_course_content_type(path),
+            etag=content.sha256,
+            cache_control="public, max-age=31536000, immutable",
+            extra_headers=(
+                (
+                    "Content-Security-Policy",
+                    "default-src 'none'; script-src 'self'; "
+                    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                    "connect-src 'self'",
+                ),
+            ),
             head_only=head_only,
         )
 
@@ -3022,6 +3172,30 @@ class Handler(BaseHTTPRequestHandler):
         self._audit_actor_id = actor.id
         return actor
 
+    def _authenticate_course(self, head_only=False):
+        """Authenticate course GETs with Bearer or the same-origin session cookie."""
+
+        token = self._bearer_token()
+        if token is None and self.headers.get("Authorization") is None:
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get("Cookie", ""))
+            except (CookieError, ValueError):
+                cookie = SimpleCookie()
+            morsel = cookie.get(SESSION_COOKIE_NAME)
+            token = None if morsel is None else morsel.value
+        if token is None:
+            self._api_error(401, "invalid_session", head_only=head_only)
+            return None
+        try:
+            with self._database() as connection:
+                actor = authenticate_session(connection, token)
+        except InvalidSessionError:
+            self._api_error(401, "invalid_session", head_only=head_only)
+            return None
+        self._audit_actor_id = actor.id
+        return actor
+
     def _optional_actor(self, head_only=False):
         """Resolve an optional session for a public-capable read route.
 
@@ -3062,7 +3236,17 @@ class Handler(BaseHTTPRequestHandler):
             if actor is not None:
                 self._audit_actor_id = actor.id
             revoke_session(connection, token)
-        self._respond(204, "")
+        self._respond(
+            204,
+            "",
+            extra_headers=(
+                (
+                    "Set-Cookie",
+                    f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; "
+                    "Secure; SameSite=Strict",
+                ),
+            ),
+        )
 
     def _read_json(self, max_bytes=MAX_JSON_BODY_BYTES):
         if self.headers.get_content_type() != "application/json":
@@ -3428,6 +3612,7 @@ def make_server(
     server.artifacts_path = artifacts_path
     server.generated_path = generated_path
     server.web_path = web_path
+    server.runtime_path = web_path / WEB_RUNTIME_DIRECTORY_NAME
     server.audit = audit.AuditLog(
         output=audit_output,
         clock=audit_clock,

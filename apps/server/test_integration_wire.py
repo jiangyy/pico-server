@@ -172,8 +172,18 @@ class WireIntegrationTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def _raw_request(self, method: str, path: str, *, headers=None):
+        connection = self._connection()
+        try:
+            connection.request(method, path, headers=headers or {})
+            response = connection.getresponse()
+            body = response.read()
+            return response.status, dict(response.getheaders()), body
+        finally:
+            connection.close()
+
     def _login(self, username: str, password: str) -> str:
-        status, _, body = self._request(
+        status, headers, body = self._request(
             "POST",
             "/api/v1/login",
             payload={"username": username, "password": password},
@@ -181,6 +191,9 @@ class WireIntegrationTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertIn("sessionToken", body)
         self.assertEqual(body["user"]["username"], username)
+        self.assertIn("Set-Cookie", headers)
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertIn("SameSite=Strict", headers["Set-Cookie"])
         return body["sessionToken"]
 
     def _admin_token(self) -> str:
@@ -327,6 +340,64 @@ class WireIntegrationTest(unittest.TestCase):
             "GET", "/api/v1/playgrounds", token=student_token
         )
         self.assertEqual((status, body["code"]), (403, "forbidden"))
+
+    def test_course_assets_use_cookie_auth_and_runtime_overlay(self) -> None:
+        """A same-origin iframe can read an authorized commit without a header."""
+
+        admin_token = self._admin_token()
+        playground_id = "wire-course"
+        self._create_playground(admin_token, playground_id)
+        manifest = json.dumps(
+            {"schemaVersion": 1, "runtime": "python"}
+        ).encode()
+        published = self._publish(
+            admin_token,
+            playground_id,
+            self._build_zip(
+                [
+                    ("picopg.json", manifest),
+                    ("course/index.html", b"<h1>course</h1>"),
+                ]
+            ),
+            "key-course",
+        )
+        self.server.runtime_path.joinpath("libs").mkdir(
+            parents=True, exist_ok=True
+        )
+        self.server.runtime_path.joinpath("libs", "react.js").write_bytes(
+            b"export {};"
+        )
+
+        cookie = {"Cookie": f"picopg_session={admin_token}"}
+        base = f"/courses/{playground_id}/{published['commitId']}"
+        status, headers, body = self._raw_request(
+            "GET", base + "/course/index.html", headers=cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"<h1>course</h1>")
+        self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
+        self.assertIn("Content-Security-Policy", headers)
+
+        status, _, body = self._raw_request(
+            "GET", base + "/libs/react.js", headers=cookie
+        )
+        self.assertEqual((status, body), (200, b"export {};"))
+
+        status, _, body = self._raw_request(
+            "HEAD", base + "/course/index.html", headers=cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+
+        status, _, body = self._raw_request(
+            "GET", base + "/course/index.html"
+        )
+        self.assertEqual((status, json.loads(body)["code"]), (401, "invalid_session"))
+
+        status, _, body = self._raw_request(
+            "GET", base + "/course/%2e%2e/picopg.json", headers=cookie
+        )
+        self.assertEqual((status, json.loads(body)["code"]), (404, "not_found"))
 
     def test_unpublished_playgrounds_are_invisible_in_resource_pool(self) -> None:
         """Only Playgrounds with a real published commit are listed in the
