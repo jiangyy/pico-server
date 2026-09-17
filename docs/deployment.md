@@ -56,72 +56,66 @@ rm /tmp/picopg.bundle
 systemctl --user restart picopg.service
 ```
 
-## 2. Serve the Web client bundle (`picopg.cn/`)
+### 1.1 Create the first Admin
 
-The Server's `GET /` currently returns the literal placeholder
-`"Pico service is running\n"`. The Web client must be served from this host
-name so users land on the actual product, not on a debug line. Pick **one**
-of the two approaches below — both end at the same user experience.
-
-### Option A — Server owns the static bundle (recommended)
-
-Add one handler in `apps/server/server.py` that serves files from
-`data/web/` for the few paths the Web build produces (`/`, `/main.js`,
-`/picopg.css`, `/pico.svg`, `/auth.css`, plus `/{base,login}` shells), and
-falls through to the existing API routing for everything else. The Server
-runs in the same process as the API, so there is no CORS, no extra hop, and
-the deploy contract is "drop the four files into `data/web/`".
-
-Pros: single source of truth, no nginx tweaks, deploy is a copy.
-
-Cons: a small change to `server.py`. The Server already serves
-`GET /api/v1/bootstrap` from the generated cache; the static handler is the
-same shape, just with bytes from disk.
-
-### Option B — nginx serves the bundle directly
-
-Add a second `location` block to `/etc/nginx/sites-enabled/picopg` that
-serves `/var/www/picopg/web/` for `/`, `/main.js`, `/picopg.css`,
-`/pico.svg`. Everything else keeps proxying to `127.0.0.1:8001`:
-
-```nginx
-server {
-    # ... existing server block ...
-
-    location = / { root /var/www/picopg/web; try_files /index.html =404; }
-    location ~ ^/(main\.js|picopg\.css|pico\.svg|auth\.css)$ {
-        root /var/www/picopg/web;
-        try_files $uri =404;
-        expires 1h;
-        add_header Cache-Control "public, max-age=3600";
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:8001;
-        # ... existing proxy_set_header lines ...
-    }
-}
-```
-
-Pros: zero Python changes, cache headers explicit, no impact on the API.
-
-Cons: two deploy steps (copy + reload nginx), two directories to keep in
-sync.
-
-The Web build prints the exact four filenames it produced. Copy them into
-whichever root was chosen:
+A fresh data directory has no accounts and no HTTP route can mint an Admin
+without an existing Admin, so the first one comes from the operator CLI. The
+Server must have initialized `data/` first (a normal start does that):
 
 ```bash
+ssh picopg.cn
+cd ~/picopg
+python3 apps/server/maintenance.py create-admin \
+    --data-dir data \
+    --username admin \
+    --password '<choose a strong one>'
+```
+
+It prints `{"status": "ok", ...}` on success and
+`{"error": "admin_exists"}` (exit 1) once any Admin exists — the bootstrap is
+one-shot and never a second door into a running deployment. Only an existing
+*Admin* blocks it; student accounts registered through the public API do not.
+
+## 2. Serve the Web client bundle (`picopg.cn/`)
+
+The Server serves the bundle itself. `GET /` and the three assets it
+references come from `<data>/web/`, so no nginx change is required: the
+existing `location / { proxy_pass http://127.0.0.1:8001; }` already forwards
+every path to the Server, and the API and the Web product share one origin
+(which the bundle's `connect-src 'self'` CSP requires).
+
+Install or update the bundle:
+
+```bash
+cd ~/Documents/learn-python
+node apps/picopg-web/build.mjs
 scp apps/picopg-web/dist/{index.html,main.js,picopg.css,pico.svg} \
-    picopg.cn:/var/www/picopg/web/
-# then, for option B only:
-ssh picopg.cn 'nginx -t && systemctl reload nginx'
+    picopg.cn:/home/xiaoci/picopg/data/web/
+ssh picopg.cn 'systemctl --user restart picopg.service'
+```
+
+`WEB_BUNDLE` in `apps/server/server.py` is a closed path table — `index.html`,
+`main.js`, `picopg.css`, `pico.svg`. A file in `data/web/` that is not in the
+table is unreachable by URL, and no caller-supplied name is ever joined onto
+the directory. An absent bundle keeps the historical placeholder on `/` so an
+un-provisioned host still answers its health probe. Each asset carries its
+content hash as an `ETag` and a five-minute `max-age`, so a reload reuses the
+bytes already in the browser.
+
+To verify:
+
+```bash
+curl -sSI https://picopg.cn/          # 200, text/html
+curl -sSI https://picopg.cn/main.js   # 200, text/javascript, ETag + max-age
+curl -sS  https://picopg.cn/api/v1/bootstrap   # 200
 ```
 
 ## 3. Ship a new Playground from `learn-python`
 
-The Server speaks the bundle upload contract that `learn-python/scripts/publish.mjs`
-already produces, so the operator's job is to ship bytes that match.
+The Server accepts a validated ZIP through `POST /api/v1/playgrounds/{id}/commits`.
+The `learn-python` publish helper that produced those ZIPs was removed with the
+old artifact contract, so today the operator assembles the ZIP by hand from a
+`node apps/picopg-web/build.mjs`-style page build; see the steps below.
 
 ### 3.1 Build the artifacts locally
 
