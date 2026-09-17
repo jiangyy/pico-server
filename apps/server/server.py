@@ -151,6 +151,24 @@ MAX_JSON_BODY_BYTES = 16 * 1024
 # larger envelope and lets the Comment domain enforce the body's own limit.
 MAX_COMMENT_JSON_BODY_BYTES = 6 * MAX_COMMENT_BODY_BYTES + 1024
 
+COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+# The policy every ``/courses/**`` response carries.  A course page is one
+# published HTML file that carries its **own inline ``<script>`` and
+# ``<style>``** (there is no separate asset pipeline to move them into files),
+# and Pyodide compiles its WASM under this same policy.  So ``script-src``
+# needs ``'unsafe-inline'`` for the page's own script and ``'wasm-unsafe-eval'``
+# for the WASM compile, and ``connect-src 'self'`` lets Pyodide fetch
+# ``pyodide.asm.wasm`` and the wheel from this origin.  This is deliberately the
+# same policy as the desktop host's ``COURSE_CSP``; a stricter one silently
+# renders an empty page, which is invisible to a status-code assertion.
+COURSE_CSP = (
+    "default-src 'self'; img-src 'self' data:; "
+    "style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
+    "connect-src 'self'"
+)
+
 ALLOWED_METHODS = ("GET", "HEAD")
 ROUTE_METHODS = {
     "/": ALLOWED_METHODS,
@@ -1452,15 +1470,8 @@ class Handler(BaseHTTPRequestHandler):
                 data,
                 content_type=_course_content_type(path),
                 etag=hashlib.sha256(data).hexdigest(),
-                cache_control="public, max-age=31536000, immutable",
-                extra_headers=(
-                    (
-                        "Content-Security-Policy",
-                        "default-src 'none'; script-src 'self'; "
-                        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                        "connect-src 'self'",
-                    ),
-                ),
+                cache_control=COURSE_FILE_CACHE_CONTROL,
+                extra_headers=(("Content-Security-Policy", COURSE_CSP),),
                 head_only=head_only,
             )
             return
@@ -1488,15 +1499,8 @@ class Handler(BaseHTTPRequestHandler):
             content.data,
             content_type=_course_content_type(path),
             etag=content.sha256,
-            cache_control="public, max-age=31536000, immutable",
-            extra_headers=(
-                (
-                    "Content-Security-Policy",
-                    "default-src 'none'; script-src 'self'; "
-                    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                    "connect-src 'self'",
-                ),
-            ),
+            cache_control=COURSE_FILE_CACHE_CONTROL,
+            extra_headers=(("Content-Security-Policy", COURSE_CSP),),
             head_only=head_only,
         )
 

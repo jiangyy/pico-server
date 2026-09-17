@@ -399,6 +399,49 @@ class WireIntegrationTest(unittest.TestCase):
         )
         self.assertEqual((status, json.loads(body)["code"]), (404, "not_found"))
 
+    def test_course_csp_admits_the_pages_own_inline_script_and_wasm(self) -> None:
+        """Pin the course policy's *content*, not only its presence.
+
+        A published course is one HTML file that carries its own inline
+        ``<script>``, and Pyodide compiles WASM under this same policy.  A
+        stricter policy renders a blank page while every status code stays 200,
+        so presence alone is not evidence: the two directives that make the
+        page run have to be asserted, and they must match the desktop host's
+        ``COURSE_CSP`` for the same artifact.
+        """
+
+        admin_token = self._admin_token()
+        playground_id = "wire-csp"
+        self._create_playground(admin_token, playground_id)
+        published = self._publish(
+            admin_token,
+            playground_id,
+            self._build_zip(
+                [
+                    ("picopg.json", json.dumps({"schemaVersion": 1, "runtime": "python"}).encode()),
+                    ("course/index.html", b"<script>1</script>"),
+                ]
+            ),
+            "key-csp",
+        )
+        cookie = {"Cookie": f"picopg_session={admin_token}"}
+        status, headers, _ = self._raw_request(
+            "GET",
+            f"/courses/{playground_id}/{published['commitId']}/course/index.html",
+            headers=cookie,
+        )
+        self.assertEqual(status, 200)
+        csp = headers["Content-Security-Policy"]
+        script_src = next(
+            directive for directive in csp.split(";") if directive.strip().startswith("script-src")
+        )
+        self.assertIn("'unsafe-inline'", script_src, csp)
+        self.assertIn("'wasm-unsafe-eval'", script_src, csp)
+        self.assertIn("connect-src 'self'", csp)
+        # A course page is never framed or given a token, so the policy must
+        # not silently permit either.
+        self.assertNotIn("frame-ancestors *", csp)
+
     def test_unpublished_playgrounds_are_invisible_in_resource_pool(self) -> None:
         """Only Playgrounds with a real published commit are listed in the
         teacher resource pool. An empty Playground (Admin created metadata
