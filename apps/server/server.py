@@ -784,20 +784,37 @@ def _content_disposition(filename):
     return f'attachment; filename="{safe}"'
 
 
+# Suffix -> media type for the files a course bundle and the runtime contain.
+# The image types matter: a card cover is a plain ``<img src>``, and this Server
+# sends ``X-Content-Type-Options: nosniff``, so an unlisted suffix would be
+# handed to the browser as an opaque download.
+COURSE_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".ico": "image/vnd.microsoft.icon",
+    ".wasm": "application/wasm",
+    ".zip": "application/zip",
+    ".whl": "application/zip",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+}
+
+
 def _course_content_type(path):
-    if path.endswith(".html"):
-        return "text/html; charset=utf-8"
-    if path.endswith(".js") or path.endswith(".mjs"):
-        return "text/javascript; charset=utf-8"
-    if path.endswith(".css"):
-        return "text/css; charset=utf-8"
-    if path.endswith(".svg"):
-        return "image/svg+xml"
-    if path.endswith(".json"):
-        return "application/json; charset=utf-8"
-    if path.endswith(".wasm"):
-        return "application/wasm"
-    return "application/octet-stream"
+    suffix = path.rpartition(".")[2].lower()
+    return COURSE_CONTENT_TYPES.get(f".{suffix}", "application/octet-stream")
 
 
 def _commit_metadata(actor):

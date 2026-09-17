@@ -399,6 +399,50 @@ class WireIntegrationTest(unittest.TestCase):
         )
         self.assertEqual((status, json.loads(body)["code"]), (404, "not_found"))
 
+    def test_a_declared_cover_is_served_as_an_image(self) -> None:
+        """A card cover is a plain `<img src>`, so its media type has to be the
+        image's own; this Server sends `nosniff`, and an unlisted suffix would
+        arrive as an opaque download."""
+
+        admin_token = self._admin_token()
+        playground_id = "wire-cover"
+        self._create_playground(admin_token, playground_id)
+        # A one-pixel PNG, the smallest thing a browser will decode.
+        png = bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+            "890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
+        )
+        published = self._publish(
+            admin_token,
+            playground_id,
+            self._build_zip(
+                [
+                    (
+                        "picopg.json",
+                        json.dumps(
+                            {
+                                "schemaVersion": 1,
+                                "runtime": "python",
+                                "cover": "course/card.png",
+                            }
+                        ).encode(),
+                    ),
+                    ("course/index.html", b"<h1>c</h1>"),
+                    ("course/card.png", png),
+                ]
+            ),
+            "key-cover",
+        )
+        cookie = {"Cookie": f"picopg_session={admin_token}"}
+        status, headers, body = self._raw_request(
+            "GET",
+            f"/courses/{playground_id}/{published['commitId']}/course/card.png",
+            headers=cookie,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(body, png)
+
     def test_course_csp_admits_the_pages_own_inline_script_and_wasm(self) -> None:
         """Pin the course policy's *content*, not only its presence.
 
