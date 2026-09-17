@@ -80,6 +80,12 @@ def _require_admin(actor):
         raise ForbiddenActionError("admin role required")
 
 
+def _require_teacher_or_admin(actor):
+    _require_actor(actor)
+    if actor.role not in ("teacher", "admin"):
+        raise ForbiddenActionError("teacher or admin role required")
+
+
 def _playground_row(connection, playground_id):
     playground_id = _require_opaque_id(playground_id)
     return connection.execute(
@@ -140,6 +146,39 @@ def list_playgrounds(connection, actor, *, limit, after=None):
             )
         )
     return PlaygroundPage(items=tuple(items), next_key=next_key)
+
+
+def list_releasable_playground_ids(connection, actor, *, limit, after=None):
+    """Return one stable page of unarchived Playground ids for release."""
+
+    _require_teacher_or_admin(actor)
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+    parameters = []
+    where = "WHERE archived_at IS NULL"
+    if after is not None:
+        where += " AND id > ?"
+        parameters.append(after)
+    parameters.append(limit + 1)
+    rows = connection.execute(
+        "SELECT id FROM playgrounds "
+        f"{where} ORDER BY id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+    page_rows = rows[:limit]
+    for row in page_rows:
+        if not _repository.valid_playground_id(row["id"]):
+            raise StoredPlaygroundError(
+                "stored playground identifier is invalid"
+            )
+    return PlaygroundPage(
+        items=tuple(row["id"] for row in page_rows),
+        next_key=(
+            page_rows[-1]["id"] if len(rows) > limit else None
+        ),
+    )
 
 
 def create_playground(connection, actor, playground_id):

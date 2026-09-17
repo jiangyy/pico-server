@@ -294,6 +294,30 @@ class PlaygroundDomainTest(unittest.TestCase):
                 self.connection, self.admin_actor, limit=10
             )
 
+    def test_releasable_playgrounds_are_ordered_unarchived_and_role_bounded(self):
+        teacher = self.create_user("teacher")
+        student = self.create_user("student")
+        for playground_id in ("resource-c", "resource-a", "resource-b"):
+            playgrounds.create_playground(
+                self.connection, self.admin_actor, playground_id
+            )
+        playgrounds.update_playground(
+            self.connection,
+            self.admin_actor,
+            "resource-b",
+            {"archived": True},
+        )
+
+        page = playgrounds.list_releasable_playground_ids(
+            self.connection, teacher, limit=10
+        )
+        self.assertEqual(page.items, ("resource-a", "resource-c"))
+        self.assertIsNone(page.next_key)
+        with self.assertRaises(accounts.ForbiddenActionError):
+            playgrounds.list_releasable_playground_ids(
+                self.connection, student, limit=10
+            )
+
 
 class PlaygroundPublishingTest(unittest.TestCase):
     """Authorization-order and end-to-end publishing tests."""

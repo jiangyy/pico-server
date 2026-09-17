@@ -23,11 +23,13 @@ import repository as repository_module
 
 
 __all__ = [
+    "CourseMetadata",
     "CommitFile",
     "CommitManifest",
     "ManifestError",
     "ManifestFile",
     "current_playground_commit",
+    "course_metadata",
     "generate_manifest",
     "manifest_to_mapping",
     "normalize_content_path",
@@ -131,6 +133,63 @@ class CommitManifest:
 
     commit_id: str
     files: tuple
+
+
+@dataclass(frozen=True)
+class CourseMetadata:
+    """Teacher-facing metadata declared by one immutable course commit."""
+
+    title: str | None
+    summary: str | None
+    requires_submission: bool
+
+
+def _optional_text(value, maximum, *, nonblank=False):
+    if type(value) is not str or len(value) > maximum:
+        return None
+    if nonblank and not value.strip():
+        return None
+    return value
+
+
+def course_metadata(repository, commit_id):
+    """Read the bounded ``picopg.json`` display metadata of one commit.
+
+    This does not authorize the commit; callers must authorize the enclosing
+    operation before calling it.
+    """
+
+    entries = repository_module.list_commit_tree(repository, commit_id)
+    target = next((item for item in entries if item.path == MANIFEST_PATH), None)
+    if (
+        target is None
+        or target.kind != "blob"
+        or target.mode not in ALLOWED_FILE_MODES
+        or target.size is None
+        or target.size > MAX_FILE_BYTES
+    ):
+        raise repository_module.RepositoryError("invalid course manifest")
+    data = repository_module.read_blobs(repository, [target.object_id]).get(
+        target.object_id
+    )
+    if data is None or len(data) != target.size:
+        raise repository_module.RepositoryError("invalid course manifest")
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise repository_module.RepositoryError(
+            "invalid course manifest"
+        ) from error
+    if type(document) is not dict:
+        raise repository_module.RepositoryError("invalid course manifest")
+    declared = document.get("requiresSubmission", False)
+    if type(declared) is not bool:
+        raise repository_module.RepositoryError("invalid course manifest")
+    return CourseMetadata(
+        title=_optional_text(document.get("title"), 200, nonblank=True),
+        summary=_optional_text(document.get("summary"), 2000),
+        requires_submission=declared,
+    )
 
 
 def _path_is_allowed(path):

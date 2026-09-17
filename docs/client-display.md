@@ -53,8 +53,7 @@
 
 - `commitId` 是当前 ref 的 commit（教师发布时固定它；旧版本需要 id 的话可另议）。
 - `title`/`summary` 来自该 commit 的 `picopg.json`（与 §1 同一投影）。
-- `requiresSubmission` 目前没有来源，二选一（请确认）：`picopg.json` 增加声明（例 `"kind": "assignment" | "exercise"`），
-  或客户端在发布抽屉里让教师选（默认作业）。
+- `requiresSubmission` 来自 `picopg.json` 的同名可选布尔字段；缺省为 `false`（课程）。
 - 授权：Teacher/Admin 可读。这是一个「可发布内容列表」，不改变内容读取授权——教师仍必须拥有班级
   才能创建 Release，学生仍只能通过 Release/public 看到内容。
 - 排序稳定；已归档默认不返回。

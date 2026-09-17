@@ -1190,6 +1190,58 @@ class PlaygroundApiTest(unittest.TestCase):
             1,
         )
 
+    def test_teacher_resource_list_uses_current_manifest_metadata(self):
+        admin = self.seed_user("admin")
+        teacher = self.seed_user("teacher")
+        student = self.seed_user("student")
+        admin_token = self.login_token(admin.username)
+        teacher_token = self.login_token(teacher.username)
+        student_token = self.login_token(student.username)
+        playground_id = self.unique("resource")
+        self.create_playground(admin_token, playground_id)
+        manifest = json.dumps(
+            {
+                "schemaVersion": 1,
+                "runtime": "python",
+                "title": "递归练习",
+                "summary": "固定内容版本",
+                "requiresSubmission": True,
+            },
+            ensure_ascii=False,
+        ).encode()
+        published = self.publish(
+            admin_token,
+            playground_id,
+            self.build_zip((("picopg.json", manifest),)),
+            self.unique("key"),
+        )[2]
+
+        for token in (teacher_token, admin_token):
+            status, _, body = self.request(
+                "GET", "/api/v1/playgrounds", token=token
+            )
+            self.assertEqual(status, 200)
+            resource = next(
+                item
+                for item in body["playgrounds"]
+                if item["id"] == playground_id
+            )
+            self.assertEqual(
+                resource,
+                {
+                    "id": playground_id,
+                    "commitId": published["commitId"],
+                    "title": "递归练习",
+                    "summary": "固定内容版本",
+                    "requiresSubmission": True,
+                },
+            )
+
+        status, _, body = self.request(
+            "GET", "/api/v1/playgrounds", token=student_token
+        )
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+
     def test_repacked_identical_bundle_is_the_same_request(self):
         admin = self.seed_user("admin")
         token = self.login_token(admin.username)
@@ -1720,10 +1772,9 @@ class PlaygroundApiTest(unittest.TestCase):
 
     def test_playground_route_methods_and_paths(self):
         method_not_allowed = (
-            ("GET", "/api/v1/playgrounds", "POST"),
-            ("PUT", "/api/v1/playgrounds", "POST"),
-            ("PATCH", "/api/v1/playgrounds", "POST"),
-            ("DELETE", "/api/v1/playgrounds", "POST"),
+            ("PUT", "/api/v1/playgrounds", "GET, HEAD, POST"),
+            ("PATCH", "/api/v1/playgrounds", "GET, HEAD, POST"),
+            ("DELETE", "/api/v1/playgrounds", "GET, HEAD, POST"),
             ("GET", "/api/v1/playgrounds/some-id", "PATCH"),
             ("POST", "/api/v1/playgrounds/some-id", "PATCH"),
             ("PUT", "/api/v1/playgrounds/some-id", "PATCH"),

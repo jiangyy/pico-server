@@ -73,6 +73,7 @@ from playgrounds import (
     StoredPlaygroundError,
     create_playground,
     list_playgrounds,
+    list_releasable_playground_ids,
     publish_playground,
     update_playground,
 )
@@ -571,7 +572,7 @@ def _allowed_methods(path):
     if _match_class(path) is not None:
         return ALLOWED_METHODS
     if path == PLAYGROUNDS_PATH:
-        return ("POST",)
+        return ("GET", "HEAD", "POST")
     if _match_playground_commit(path) is not None:
         return ("POST",)
     if _match_work_sync(path) is not None:
@@ -862,6 +863,8 @@ class Handler(BaseHTTPRequestHandler):
             self._get_admin_users(head_only=head_only)
         elif path == ADMIN_PLAYGROUNDS_PATH:
             self._get_admin_playgrounds(head_only=head_only)
+        elif path == PLAYGROUNDS_PATH:
+            self._get_playgrounds(head_only=head_only)
         elif path == "/api/v1/me":
             self._get_me(head_only=head_only)
         elif path == CLASSES_PATH:
@@ -1827,6 +1830,63 @@ class Handler(BaseHTTPRequestHandler):
                 "nextCursor": (
                     pagination.encode_cursor(
                         pagination.ADMIN_PLAYGROUNDS_ROUTE, page.next_key
+                    )
+                    if page.next_key is not None
+                    else None
+                ),
+            },
+            head_only=head_only,
+        )
+
+    def _get_playgrounds(self, head_only=False):
+        actor = self._authenticate(head_only=head_only)
+        if actor is None:
+            return
+        try:
+            limit, after = pagination.parse_pagination(
+                urlsplit(self.path).query,
+                pagination.PLAYGROUNDS_ROUTE,
+            )
+            with self._database() as connection:
+                page = list_releasable_playground_ids(
+                    connection, actor, limit=limit, after=after
+                )
+            items = []
+            for playground_id in page.items:
+                commit_id = manifests.current_playground_commit(
+                    self.server.repository, playground_id
+                )
+                if commit_id is None:
+                    continue
+                metadata = manifests.course_metadata(
+                    self.server.repository, commit_id
+                )
+                item = {
+                    "id": playground_id,
+                    "commitId": commit_id,
+                    "requiresSubmission": metadata.requires_submission,
+                }
+                if metadata.title is not None:
+                    item["title"] = metadata.title
+                if metadata.summary is not None:
+                    item["summary"] = metadata.summary
+                items.append(item)
+        except (pagination.PaginationError, ValueError):
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return
+        except ForbiddenActionError:
+            self._api_error(403, "forbidden", head_only=head_only)
+            return
+        except (StoredPlaygroundError, RepositoryError):
+            self._api_error(500, "internal_error", head_only=head_only)
+            return
+        self._respond_json(
+            200,
+            {
+                "playgrounds": items,
+                "nextCursor": (
+                    pagination.encode_cursor(
+                        pagination.PLAYGROUNDS_ROUTE, page.next_key
                     )
                     if page.next_key is not None
                     else None

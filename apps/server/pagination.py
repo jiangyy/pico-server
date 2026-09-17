@@ -23,6 +23,7 @@ __all__ = [
     "ADMIN_PLAYGROUNDS_ROUTE",
     "ADMIN_USERS_ROUTE",
     "CATALOG_ROUTE",
+    "PLAYGROUNDS_ROUTE",
     "CLASSES_ROUTE",
     "CURSOR_VERSION",
     "DEFAULT_LIMIT",
@@ -48,6 +49,7 @@ CLASSES_ROUTE = "classes"
 RELEASES_ROUTE = "releases"
 SUBMISSIONS_ROUTE = "submissions"
 CATALOG_ROUTE = "catalog"
+PLAYGROUNDS_ROUTE = "playgrounds"
 
 _BASE64URL_ALPHABET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"

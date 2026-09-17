@@ -629,6 +629,28 @@ class ManifestTests(BundleTestCase):
                 [manifest_entry(payload)],
             )
 
+    def test_requires_submission_is_optional_boolean(self):
+        for value in (True, False):
+            payload = json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "runtime": "python",
+                    "requiresSubmission": value,
+                }
+            ).encode()
+            self.assertIn(
+                "picopg.json", validate_bundle([manifest_entry(payload)])
+            )
+        for raw in ('"yes"', "1", "null", "[]", "{}"):
+            payload = (
+                '{"schemaVersion":1,"runtime":"python",'
+                f'"requiresSubmission":{raw}}}'
+            ).encode()
+            self.assert_reason(
+                bundles.REASON_MANIFEST_INVALID_REQUIRES_SUBMISSION,
+                [manifest_entry(payload)],
+            )
+
     def test_extra_keys_are_opaque_and_allowed(self):
         payload = (
             b'{"schemaVersion":1,"runtime":"python","name":"anything",'
