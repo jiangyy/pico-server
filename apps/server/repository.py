@@ -19,6 +19,7 @@ import permissions
 
 DEFAULT_REPOSITORY_PATH = Path("data/picopg.git")
 GIT_TIMEOUT_SECONDS = 30
+_MAX_MAINTENANCE_REFS = 10_000
 
 # Git is authoritative for ref syntax, but reject obviously unsafe identifiers
 # before starting a subprocess. The set matches the characters Git forbids in a
@@ -931,3 +932,53 @@ def _parse_batch_output(payload, requested):
         blobs[object_id] = bytes(payload[position:end])
         position = end + 1
     return blobs
+
+
+# --- Offline maintenance ---------------------------------------------------
+
+
+def list_refs(repository):
+    """Return every ref name in the repository, or raise on a Git failure.
+
+    Only ref *names* are returned; this is used by offline maintenance to
+    reject an unexpected ref outside the documented namespaces.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    completed = _run_git(
+        (
+            "for-each-ref",
+            f"--count={_MAX_MAINTENANCE_REFS + 1}",
+            "--format=%(refname)",
+        ),
+        cwd=repository.path,
+    )
+    if completed.returncode != 0:
+        raise RepositoryError("could not list references")
+    try:
+        lines = completed.stdout.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RepositoryError("reference names are not valid UTF-8") from error
+    if len(lines) > _MAX_MAINTENANCE_REFS:
+        raise RepositoryError("repository has too many references")
+    names = []
+    for line in lines:
+        name = line.strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def compact(repository):
+    """Run a normal, non-destructive ``git gc`` through the sanitized bridge.
+
+    No aggressive mode, no immediate pruning, and no force update is used, so
+    an unreachable object is never discarded before its grace period.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    completed = _run_git(("gc",), cwd=repository.path)
+    if completed.returncode != 0:
+        raise RepositoryError("repository compaction failed")

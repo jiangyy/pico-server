@@ -1756,5 +1756,43 @@ class GitSubprocessIsolationTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
 
 
+class OfflineMaintenanceRepositoryTest(unittest.TestCase):
+    def test_list_refs_is_bounded_and_returns_exact_names(self):
+        handle = repository.Repository(Path("/private/repository"))
+        completed = subprocess.CompletedProcess(
+            ["git"], 0, b"refs/heads/playgrounds/p\nrefs/heads/works/p/s\n", b""
+        )
+        with mock.patch.object(
+            repository, "_run_git", return_value=completed
+        ) as run:
+            self.assertEqual(
+                repository.list_refs(handle),
+                ["refs/heads/playgrounds/p", "refs/heads/works/p/s"],
+            )
+        arguments = run.call_args.args[0]
+        self.assertIn(
+            f"--count={repository._MAX_MAINTENANCE_REFS + 1}", arguments
+        )
+
+    def test_compact_uses_only_normal_git_gc(self):
+        handle = repository.Repository(Path("/private/repository"))
+        completed = subprocess.CompletedProcess(["git"], 0, b"", b"")
+        with mock.patch.object(
+            repository, "_run_git", return_value=completed
+        ) as run:
+            repository.compact(handle)
+        self.assertEqual(run.call_args.args[0], ("gc",))
+        self.assertNotIn("--prune=now", run.call_args.args[0])
+
+    def test_compact_failure_is_stable(self):
+        handle = repository.Repository(Path("/private/repository"))
+        completed = subprocess.CompletedProcess(["git"], 1, b"secret", b"path")
+        with mock.patch.object(repository, "_run_git", return_value=completed):
+            with self.assertRaisesRegex(
+                RepositoryError, "repository compaction failed"
+            ):
+                repository.compact(handle)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

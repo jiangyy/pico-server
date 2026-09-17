@@ -8,6 +8,8 @@ or overwritten recovery set.
 """
 
 import json
+import contextlib
+import io
 import os
 import shutil
 import sqlite3
@@ -707,6 +709,236 @@ class MaintenanceTest(unittest.TestCase):
             ],
             [],
         )
+
+    # ----- offline health and compaction --------------------------------
+
+    def test_validate_data_dir_on_live_data(self):
+        summary = maintenance.validate_data_dir(
+            self.data_dir, service_stopped=True
+        )
+        self.assertEqual(summary["releases"], 1)
+        self.assertEqual(summary["submissions"], 1)
+        self.assertEqual(summary["artifacts"], 1)
+
+    def test_validate_data_dir_ignores_generated(self):
+        shutil.rmtree(self.generated_path, ignore_errors=True)
+        maintenance.validate_data_dir(self.data_dir, service_stopped=True)
+        self.generated_path.mkdir(parents=True, exist_ok=True)
+        (self.generated_path / "current.json").write_bytes(b"corrupt")
+        maintenance.validate_data_dir(self.data_dir, service_stopped=True)
+
+    def test_validate_data_dir_requires_service_stopped(self):
+        for stopped in (False, None, 1, "yes"):
+            with self.subTest(stopped=stopped):
+                with self.assertRaises(maintenance.MaintenanceError) as caught:
+                    maintenance.validate_data_dir(
+                        self.data_dir, service_stopped=stopped
+                    )
+                self.assertEqual(
+                    caught.exception.reason,
+                    maintenance.REASON_SERVICE_RUNNING,
+                )
+                with self.assertRaises(maintenance.MaintenanceError) as caught:
+                    maintenance.compact_repository(
+                        self.data_dir, service_stopped=stopped
+                    )
+                self.assertEqual(
+                    caught.exception.reason,
+                    maintenance.REASON_SERVICE_RUNNING,
+                )
+
+    def test_validate_data_dir_rejects_unexpected_ref(self):
+        completed = repository._run_git(
+            (
+                "update-ref",
+                "refs/tags/unexpected",
+                self.playground_commit_id,
+            ),
+            cwd=self.repository_path,
+        )
+        self.assertEqual(completed.returncode, 0)
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_data_dir(
+                self.data_dir, service_stopped=True
+            )
+        self.assertEqual(caught.exception.reason, maintenance.REASON_GIT_INVALID)
+
+    def test_validate_data_dir_rejects_invalid_ref_tree(self):
+        completed = repository._run_git(
+            (
+                "update-ref",
+                self.repository.playground_ref(self.playground_id),
+                self.work_commit_id,
+            ),
+            cwd=self.repository_path,
+        )
+        self.assertEqual(completed.returncode, 0)
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_data_dir(
+                self.data_dir, service_stopped=True
+            )
+        self.assertEqual(caught.exception.reason, maintenance.REASON_GIT_INVALID)
+
+    def test_validate_data_dir_rejects_corrupt_artifact_layout(self):
+        (self.artifacts_path / "v1" / "extra.bin").write_bytes(b"extra")
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.validate_data_dir(
+                self.data_dir, service_stopped=True
+            )
+        self.assertEqual(
+            caught.exception.reason, maintenance.REASON_DATA_DIR_INVALID
+        )
+
+    def test_validate_data_dir_enforces_private_permissions(self):
+        os.chmod(self.data_dir, 0o755)
+        os.chmod(self.database_path, 0o644)
+        os.chmod(self.repository_path, 0o755)
+        os.chmod(self.artifacts_path, 0o755)
+        maintenance.validate_data_dir(self.data_dir, service_stopped=True)
+        self.assertEqual(self.data_dir.stat().st_mode & 0o077, 0)
+        self.assertEqual(self.database_path.stat().st_mode & 0o077, 0)
+        self.assertEqual(self.repository_path.stat().st_mode & 0o077, 0)
+        self.assertEqual(self.artifacts_path.stat().st_mode & 0o077, 0)
+
+    def test_hostile_git_environment_cannot_redirect_maintenance(self):
+        trace = self.base / "git-trace"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(self.base / "decoy"),
+                "GIT_OBJECT_DIRECTORY": str(self.base / "objects"),
+                "GIT_TRACE": str(trace),
+            },
+        ):
+            maintenance.validate_data_dir(
+                self.data_dir, service_stopped=True
+            )
+            maintenance.compact_repository(
+                self.data_dir, service_stopped=True
+            )
+        self.assertFalse(trace.exists())
+
+    def test_compact_repository_preserves_authority(self):
+        def refs():
+            return {
+                ref: repository._run_git(
+                    ("rev-parse", ref), cwd=self.repository_path
+                ).stdout.strip()
+                for ref in repository.list_refs(self.repository)
+            }
+
+        before = refs()
+        database_before = self.database_path.read_bytes()
+        artifact_before = (
+            self.artifacts_path / "v1" / "runtime.exe"
+        ).read_bytes()
+        generated_before = (
+            self.generated_path / "catalog.json"
+        ).read_bytes()
+        original_validate = maintenance.validate_data_dir
+        with mock.patch.object(
+            maintenance,
+            "validate_data_dir",
+            wraps=original_validate,
+        ) as validate:
+            summary = maintenance.compact_repository(
+                self.data_dir, service_stopped=True
+            )
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(summary["releases"], 1)
+        self.assertEqual(refs(), before)
+        self.assertEqual(self.database_path.read_bytes(), database_before)
+        self.assertEqual(
+            (self.artifacts_path / "v1" / "runtime.exe").read_bytes(),
+            artifact_before,
+        )
+        self.assertEqual(
+            (self.generated_path / "catalog.json").read_bytes(),
+            generated_before,
+        )
+
+        manifest = manifests.generate_manifest(
+            self.connection,
+            None,
+            self.repository,
+            self.playground_id,
+            self.playground_commit_id,
+        )
+        self.assertTrue(manifest.files)
+
+    def test_compact_failure_is_stable_and_keeps_git_lock(self):
+        lock = self.repository_path / "gc.pid.lock"
+        lock.write_bytes(b"keep")
+        with mock.patch.object(
+            repository,
+            "compact",
+            side_effect=repository.RepositoryError("private failure"),
+        ):
+            with self.assertRaises(maintenance.MaintenanceError) as caught:
+                maintenance.compact_repository(
+                    self.data_dir, service_stopped=True
+                )
+        self.assertEqual(caught.exception.reason, maintenance.REASON_GIT_INVALID)
+        self.assertEqual(lock.read_bytes(), b"keep")
+
+    def test_cli_validate_and_refusal_exit_status(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = maintenance._run_cli(
+                [
+                    "validate",
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--service-stopped",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertIn('"status": "ok"', output.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = maintenance._run_cli(
+                ["validate", "--data-dir", str(self.data_dir)]
+            )
+        self.assertEqual(code, 1)
+
+    def test_cli_compact_and_sanitized_failure(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = maintenance._run_cli(
+                [
+                    "compact",
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--service-stopped",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["status"], "ok")
+
+        private_path = str(self.data_dir / "secret")
+        with mock.patch.object(
+            maintenance,
+            "validate_data_dir",
+            side_effect=maintenance.MaintenanceError(
+                maintenance.REASON_GIT_INVALID, private_path
+            ),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = maintenance._run_cli(
+                    [
+                        "validate",
+                        "--data-dir",
+                        str(self.data_dir),
+                        "--service-stopped",
+                    ]
+                )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {"error": maintenance.REASON_GIT_INVALID},
+        )
+        self.assertNotIn(private_path, output.getvalue())
 
     # ----- helpers ------------------------------------------------------
 

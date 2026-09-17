@@ -28,14 +28,19 @@ a backup and then copies the verified files into a brand new, empty data
 directory; it never deletes or replaces a live data directory.
 """
 
+import argparse
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 
+import artifacts
+import bundles
+import permissions
 import repository as repository_module
 import works
 import database
@@ -58,8 +63,10 @@ __all__ = [
     "REASON_SERVICE_RUNNING",
     "REASON_UNEXPECTED_FILE",
     "create_backup",
+    "compact_repository",
     "restore_backup",
     "validate_backup",
+    "validate_data_dir",
 ]
 
 
@@ -74,6 +81,7 @@ MANIFEST_FILENAME = "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
 
 _CHUNK_BYTES = 1024 * 1024
+_MAX_MAINTENANCE_COMMITS = 100_000
 
 # Stable reason codes.  The message carries the human-readable detail, while
 # the reason stays machine readable for callers and tests.
@@ -526,7 +534,7 @@ def _validate_repository(path):
         # reads blobs and therefore cannot detect corruption in the object
         # store.  ``fsck`` is read-only and non-interactive.
         completed = repository_module._run_git(
-            ("fsck", "--no-progress"),
+            ("fsck", "--full", "--strict", "--no-progress"),
             cwd=repository.path,
         )
     except repository_module.RepositoryError as error:
@@ -585,7 +593,7 @@ def _work_metadata_pin(repository, work_commit_id):
         return works._read_base_work_playground_commit_id(
             repository, work_commit_id
         )
-    except works.WorkError as error:
+    except (works.WorkError, repository_module.RepositoryError) as error:
         raise MaintenanceError(
             REASON_COMMIT_MISSING, "Work metadata is missing or invalid"
         ) from error
@@ -942,3 +950,375 @@ def _discard_temporary(path, parent_root, prefix):
     if not os.path.basename(resolved).startswith(prefix):
         return
     shutil.rmtree(resolved, ignore_errors=True)
+
+
+# --- Offline health and repository compaction ------------------------------
+
+
+def _live_database_connection(data_dir):
+    database = data_dir / DATABASE_FILENAME
+    if database.is_symlink() or not database.is_file():
+        raise MaintenanceError(REASON_DATABASE_INVALID, "database is missing")
+    return _open_read_only(database)
+
+
+def _resolve_ref(repository, ref):
+    try:
+        completed = repository_module._run_git(
+            ("rev-parse", "--verify", "--quiet", ref), cwd=repository.path
+        )
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "could not resolve a reference"
+        ) from error
+    if completed.returncode != 0:
+        raise MaintenanceError(REASON_GIT_INVALID, "a reference does not resolve")
+    commit_id = completed.stdout.strip().decode("ascii", "replace")
+    try:
+        resolved = repository_module.resolve_commit(repository, commit_id)
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "a reference does not name a commit"
+        ) from error
+    if resolved != commit_id:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "a reference does not name a commit"
+        )
+    return commit_id
+
+
+def _linear_history(repository, ref, *, stop=None):
+    """Return one bounded, non-merge first-parent history."""
+
+    try:
+        completed = repository_module._run_git(
+            (
+                "rev-list",
+                "--first-parent",
+                "--parents",
+                f"--max-count={_MAX_MAINTENANCE_COMMITS + 1}",
+                ref,
+            ),
+            cwd=repository.path,
+        )
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "could not read reference history"
+        ) from error
+    if completed.returncode != 0:
+        raise MaintenanceError(REASON_GIT_INVALID, "could not read reference history")
+    lines = completed.stdout.decode("ascii", "replace").splitlines()
+    if len(lines) > _MAX_MAINTENANCE_COMMITS:
+        raise MaintenanceError(REASON_GIT_INVALID, "reference history is too long")
+
+    commits = []
+    reached_stop = False
+    for line in lines:
+        fields = line.split()
+        if not fields:
+            raise MaintenanceError(REASON_GIT_INVALID, "malformed commit history")
+        commit_id, parents = fields[0], fields[1:]
+        if commit_id == stop:
+            reached_stop = True
+            break
+        if len(parents) > 1 or (stop is not None and len(parents) != 1):
+            raise MaintenanceError(REASON_GIT_INVALID, "commit history is not linear")
+        _require_commit(repository, commit_id)
+        commits.append(commit_id)
+        if not parents:
+            break
+    if stop is not None and not reached_stop:
+        raise MaintenanceError(
+            REASON_COMMIT_MISSING, "Work history does not reach its Playground"
+        )
+    return commits
+
+
+def _validate_playground_commit(repository, commit_id):
+    try:
+        tree = works._read_playground_tree(repository, commit_id)
+        bundles.validate_bundle(
+            bundles.BundleEntry(path, data) for path, data in tree.items()
+        )
+    except (
+        bundles.BundleValidationError,
+        works.WorkError,
+        repository_module.RepositoryError,
+    ) as error:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "Playground commit is invalid"
+        ) from error
+
+
+def _validate_work_commit(repository, commit_id, playground_commit_id):
+    try:
+        if _work_metadata_pin(repository, commit_id) != playground_commit_id:
+            raise MaintenanceError(
+                REASON_COMMIT_MISSING,
+                "Work history changed its pinned Playground commit",
+            )
+        tree = works._read_work_tree(repository, commit_id)
+        playground_tree = works._read_playground_tree(
+            repository, playground_commit_id
+        )
+        if tree.get(works.WORK_MANIFEST_PATH) != works._work_manifest(
+            playground_commit_id
+        ):
+            raise MaintenanceError(REASON_GIT_INVALID, "Work metadata is invalid")
+        if any(tree.get(path) != data for path, data in playground_tree.items()):
+            raise MaintenanceError(
+                REASON_GIT_INVALID, "Work does not contain its pinned Playground"
+            )
+        work_entries = [
+            works.WorkEntry(path, data)
+            for path, data in tree.items()
+            if path.startswith(works.WORK_PREFIX)
+        ]
+        normalized_work = works.validate_work_files(work_entries)
+        expected_paths = set(playground_tree) | {works.WORK_MANIFEST_PATH} | set(
+            normalized_work
+        )
+        if set(tree) != expected_paths:
+            raise MaintenanceError(REASON_GIT_INVALID, "Work tree is invalid")
+    except MaintenanceError:
+        raise
+    except (works.WorkError, repository_module.RepositoryError) as error:
+        raise MaintenanceError(REASON_GIT_INVALID, "Work commit is invalid") from error
+
+
+def _validate_ref_namespace(repository):
+    """Validate every documented ref and reject every other namespace."""
+
+    prefix_playgrounds = "refs/heads/playgrounds/"
+    prefix_works = "refs/heads/works/"
+    validated_playgrounds = set()
+    validated_works = set()
+    try:
+        refs = repository_module.list_refs(repository)
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(REASON_GIT_INVALID, "could not list references") from error
+
+    for ref in refs:
+        head = _resolve_ref(repository, ref)
+        if ref.startswith(prefix_playgrounds):
+            playground_id = ref[len(prefix_playgrounds):]
+            try:
+                expected_ref = repository.playground_ref(playground_id)
+            except repository_module.RepositoryError as error:
+                raise MaintenanceError(
+                    REASON_GIT_INVALID, "unexpected Playground reference"
+                ) from error
+            if expected_ref != ref:
+                raise MaintenanceError(
+                    REASON_GIT_INVALID, "unexpected Playground reference"
+                )
+            for commit_id in _linear_history(repository, ref):
+                if commit_id not in validated_playgrounds:
+                    _validate_playground_commit(repository, commit_id)
+                    validated_playgrounds.add(commit_id)
+        elif ref.startswith(prefix_works):
+            remainder = ref[len(prefix_works):]
+            playground_id, separator, student_id = remainder.partition("/")
+            try:
+                expected_ref = repository.work_ref(playground_id, student_id)
+                playground_ref = repository.playground_ref(playground_id)
+            except repository_module.RepositoryError as error:
+                raise MaintenanceError(
+                    REASON_GIT_INVALID, "unexpected Work reference"
+                ) from error
+            if not separator or expected_ref != ref:
+                raise MaintenanceError(REASON_GIT_INVALID, "unexpected Work reference")
+            playground_commit_id = _work_metadata_pin(repository, head)
+            _require_ancestor(repository, playground_commit_id, playground_ref)
+            if playground_commit_id not in validated_playgrounds:
+                _validate_playground_commit(repository, playground_commit_id)
+                validated_playgrounds.add(playground_commit_id)
+            for commit_id in _linear_history(
+                repository, ref, stop=playground_commit_id
+            ):
+                if commit_id not in validated_works:
+                    _validate_work_commit(
+                        repository, commit_id, playground_commit_id
+                    )
+                    validated_works.add(commit_id)
+        else:
+            raise MaintenanceError(
+                REASON_GIT_INVALID, "unexpected reference namespace"
+            )
+
+
+def validate_data_dir(data_dir, *, service_stopped=False):
+    """Validate one live data directory without creating a backup.
+
+    Returns a small counts summary.  ``generated/`` is intentionally ignored:
+    it is disposable and must neither make validation pass nor fail.
+    """
+
+    _require_service_stopped(service_stopped)
+
+    data_dir = Path(data_dir)
+    if data_dir.is_symlink() or not data_dir.is_dir():
+        raise MaintenanceError(
+            REASON_DATA_DIR_INVALID, "the data directory does not exist"
+        )
+    database = data_dir / DATABASE_FILENAME
+    git_directory = data_dir / REPOSITORY_DIRNAME
+    artifacts_directory = data_dir / ARTIFACTS_DIRNAME
+    data_root = os.path.realpath(data_dir)
+
+    for managed_path in (database, git_directory, artifacts_directory):
+        if os.path.lexists(managed_path) and not _contained(
+            data_root, managed_path
+        ):
+            raise MaintenanceError(
+                REASON_PATH_ESCAPE, "a managed path escapes the data directory"
+            )
+
+    try:
+        permissions.ensure_private_directory(data_dir)
+        if git_directory.exists():
+            permissions.ensure_private_directory(git_directory)
+        if artifacts_directory.exists():
+            permissions.ensure_private_directory(artifacts_directory)
+        if database.exists():
+            permissions.ensure_private_file(database)
+    except permissions.PermissionPolicyError as error:
+        raise MaintenanceError(
+            REASON_DATA_DIR_INVALID, "managed permissions are invalid"
+        ) from error
+
+    connection = _live_database_connection(data_dir)
+    try:
+        _validate_database(connection)
+        repository = _validate_repository(git_directory)
+        _validate_commit_references(connection, repository)
+        releases = connection.execute(
+            "SELECT COUNT(*) FROM releases"
+        ).fetchone()[0]
+        submissions = connection.execute(
+            "SELECT COUNT(*) FROM submissions"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    _validate_ref_namespace(repository)
+
+    try:
+        entries = artifacts.index_artifacts(artifacts_directory)
+        for entry in entries:
+            artifacts.verify_artifact(artifacts_directory, entry)
+    except artifacts.ArtifactError as error:
+        raise MaintenanceError(
+            REASON_DATA_DIR_INVALID, "artifact storage is invalid"
+        ) from error
+
+    return {
+        "releases": releases,
+        "submissions": submissions,
+        "artifacts": len(entries),
+    }
+
+
+def _capture_refs(repository):
+    refs = {}
+    try:
+        names = repository_module.list_refs(repository)
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(REASON_GIT_INVALID, "could not list references") from error
+    for ref in names:
+        refs[ref] = _resolve_ref(repository, ref)
+    return refs
+
+
+def _database_commit_ids(data_dir):
+    connection = _live_database_connection(data_dir)
+    try:
+        commits = set()
+        for row in connection.execute(
+            "SELECT DISTINCT playground_commit_id FROM releases"
+        ).fetchall():
+            commits.add(row[0])
+        for row in connection.execute(
+            "SELECT DISTINCT work_commit_id FROM submissions"
+        ).fetchall():
+            commits.add(row[0])
+    finally:
+        connection.close()
+    return commits
+
+
+def compact_repository(data_dir, *, service_stopped=False):
+    """Validate, run a safe ``git gc``, and prove nothing authoritative moved."""
+
+    _require_service_stopped(service_stopped)
+
+    data_dir = Path(data_dir)
+    summary = validate_data_dir(data_dir, service_stopped=True)
+    git_directory = data_dir / REPOSITORY_DIRNAME
+    repository = _validate_repository(git_directory)
+    before = _capture_refs(repository)
+    commits = _database_commit_ids(data_dir)
+
+    try:
+        repository_module.compact(repository)
+    except repository_module.RepositoryError as error:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "repository compaction failed"
+        ) from error
+
+    after_summary = validate_data_dir(data_dir, service_stopped=True)
+    if after_summary != summary:
+        raise MaintenanceError(
+            REASON_DATA_DIR_INVALID, "authority counts changed during compaction"
+        )
+    repository = _validate_repository(git_directory)
+    after = _capture_refs(repository)
+    if before != after:
+        raise MaintenanceError(
+            REASON_GIT_INVALID, "references changed during compaction"
+        )
+    for commit_id in commits:
+        try:
+            resolved = repository_module.resolve_commit(repository, commit_id)
+        except repository_module.RepositoryError as error:
+            raise MaintenanceError(
+                REASON_COMMIT_MISSING,
+                "a commit became unreadable during compaction",
+            ) from error
+        if resolved is None:
+            raise MaintenanceError(
+                REASON_COMMIT_MISSING,
+                "a commit disappeared during compaction",
+            )
+    return summary
+
+
+def _run_cli(argv=None):
+    parser = argparse.ArgumentParser(prog="maintenance.py")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    for name in ("validate", "compact"):
+        subparser = subcommands.add_parser(name)
+        subparser.add_argument("--data-dir", required=True)
+        subparser.add_argument("--service-stopped", action="store_true")
+    arguments = parser.parse_args(argv)
+
+    try:
+        if arguments.command == "validate":
+            summary = validate_data_dir(
+                arguments.data_dir,
+                service_stopped=arguments.service_stopped,
+            )
+        else:
+            summary = compact_repository(
+                arguments.data_dir,
+                service_stopped=arguments.service_stopped,
+            )
+    except MaintenanceError as error:
+        print(json.dumps({"error": error.reason}, sort_keys=True))
+        return 1
+    print(json.dumps({"status": "ok", "summary": summary}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_run_cli())
