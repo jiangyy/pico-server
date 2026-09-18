@@ -153,7 +153,6 @@ PORTAL_HEADERS = (
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     ),
     ("Referrer-Policy", "no-referrer"),
-    ("X-Content-Type-Options", "nosniff"),
 )
 
 # The policy every ``/courses/**`` response carries.  A course page is one
