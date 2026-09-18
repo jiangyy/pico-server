@@ -25,11 +25,13 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 import bundles
 import idempotency
+import permissions
 import playgrounds
 import repository as repository_module
 from pagination import Page
@@ -282,6 +284,125 @@ def create_submission(connection, repository, request, request_key):
         callback,
     )
     return status, response
+
+
+# --- the copy a human opens ------------------------------------------------
+#
+# The database row is the record; these files are for whoever marks the work.
+# One submission lands at::
+#
+#     <root>/<班级>/<姓名>/<YYYYMMDD-HHMMSS>-<id8>/work/main.py
+#     <root>/<班级>/<姓名>/<YYYYMMDD-HHMMSS>-<id8>/submission.json
+#
+# A name with no 班级 is filed directly under ``<root>/<姓名>/``.
+#
+# The student string is the only caller-controlled part of that path, so it is
+# sanitized into safe single segments; the file paths below it are already
+# portable ``work/**`` (:func:`_normalized_work_path`), so joining them cannot
+# escape the submission directory.  Writing the same submission twice writes
+# the same bytes to the same path, which is what makes a replayed idempotent
+# retry harmless.
+
+# A name is a label, not a payload: 64 characters is more than any real one and
+# keeps the whole path inside the usual filesystem limits.
+MAX_SEGMENT_LENGTH = 64
+
+# The client files work under one display name, ``姓名（班级）``.  Splitting it
+# is presentation, not identity: a name that does not match is used as-is.
+_STUDENT_PATTERN = re.compile(r"\A(.+?)（(.+?)）\Z")
+
+MANIFEST_NAME = "submission.json"
+
+
+def _safe_segment(value):
+    """Return ``value`` as one filesystem-safe path segment (possibly empty)."""
+
+    normalized = unicodedata.normalize("NFC", value)
+    printable = "".join(
+        " " if character in "/\\\u0000" else character
+        for character in normalized
+        if character.isprintable() or character == "\u0000"
+    )
+    return " ".join(printable.split()).strip(". ")[:MAX_SEGMENT_LENGTH]
+
+
+def student_segments(student):
+    """Return ``(class_room, name)`` for a self-reported name.
+
+    ``张三（1 班）`` becomes ``("1 班", "张三")``; anything else is a bare name
+    with no class.  Both parts are sanitized, and an empty result falls back to
+    the whole string so a submission never lands in an unnamed directory.
+    """
+
+    match = _STUDENT_PATTERN.match(student)
+    if match is not None:
+        name = _safe_segment(match.group(1))
+        class_room = _safe_segment(match.group(2))
+        if name and class_room:
+            return class_room, name
+    return "", _safe_segment(student) or "student"
+
+
+def submission_directory(root, submission_id, student, created_at):
+    """Return the directory one submission's files belong in, as a path.
+
+    The timestamp keeps folders in the order the work arrived; the id suffix
+    keeps two submissions in the same second apart.
+    """
+
+    digits = "".join(character for character in created_at if character.isdigit())
+    stamp = f"{digits[:8]}-{digits[8:14]}" if len(digits) >= 14 else digits
+    class_room, name = student_segments(student)
+    parts = [part for part in (class_room, name, f"{stamp}-{submission_id[:8]}") if part]
+
+    directory = Path(root)
+    for part in parts:
+        directory = directory / part
+    return directory
+
+
+def write_submission_files(
+    root,
+    submission_id,
+    student,
+    playground_id,
+    playground_commit_id,
+    created_at,
+    files,
+):
+    """Write one submission's files under ``root`` and return the directory.
+
+    Nothing here decides whether a submission is valid: the caller has already
+    stored the row, so these bytes are a copy of an accepted submission.  A
+    failure raises, because a record without its files is exactly the state
+    this function exists to prevent.
+    """
+
+    directory = permissions.ensure_private_directory(
+        submission_directory(root, submission_id, student, created_at)
+    )
+
+    for path, text in files.items():
+        target = directory.joinpath(*path.split("/"))
+        permissions.ensure_private_directory(target.parent)
+        target.write_text(text, encoding="utf-8")
+        permissions.ensure_private_file(target)
+
+    manifest = {
+        "id": submission_id,
+        "playgroundId": playground_id,
+        "commitId": playground_commit_id,
+        "student": student,
+        "createdAt": created_at,
+        "files": sorted(files),
+    }
+    manifest_path = directory / MANIFEST_NAME
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    permissions.ensure_private_file(manifest_path)
+    return directory
 
 
 def _submission_from_row(row):

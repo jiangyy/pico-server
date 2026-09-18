@@ -7,6 +7,7 @@ request handler cannot: what is stored, what is refused, and what an exact
 retry returns.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -406,6 +407,107 @@ class ReadSubmissionTest(SubmissionTestBase):
             ],
             [{"path": "work/main.py", "text": "print(1)\n"}],
         )
+
+
+class SubmissionFileLayoutTest(unittest.TestCase):
+    """Where a handed-in file set lands on disk.
+
+    The student string is the only caller-controlled part of that path, so
+    these tests are as much about what a hostile name cannot do as about the
+    layout a teacher will read.
+    """
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name) / "submissions"
+
+    def write(self, student, files=None):
+        return submissions.write_submission_files(
+            root=self.root,
+            submission_id="abcdef1234567890",
+            student=student,
+            playground_id="pg-one",
+            playground_commit_id="c1" + "0" * 38,
+            created_at="2026-09-18T10:11:12Z",
+            files=files if files is not None else {"work/main.py": "print(1)\n"},
+        )
+
+    def test_class_and_name_become_one_directory_each(self):
+        directory = self.write("张三（1 班）")
+
+        self.assertEqual(
+            directory.relative_to(self.root),
+            Path("1 班") / "张三" / "20260918-101112-abcdef12",
+        )
+        self.assertEqual(
+            (directory / "work/main.py").read_text(encoding="utf-8"), "print(1)\n"
+        )
+
+    def test_a_name_without_a_class_is_filed_directly_under_it(self):
+        directory = self.write("张三")
+        self.assertEqual(
+            directory.relative_to(self.root),
+            Path("张三") / "20260918-101112-abcdef12",
+        )
+
+    def test_the_folder_says_whose_work_it_is(self):
+        directory = self.write("张三（1 班）")
+        manifest = json.loads(
+            (directory / submissions.MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest,
+            {
+                "commitId": "c1" + "0" * 38,
+                "createdAt": "2026-09-18T10:11:12Z",
+                "files": ["work/main.py"],
+                "id": "abcdef1234567890",
+                "playgroundId": "pg-one",
+                "student": "张三（1 班）",
+            },
+        )
+
+    def test_a_name_cannot_reach_outside_the_root(self):
+        for hostile in (
+            "../../etc/passwd",
+            "..",
+            "/etc/passwd",
+            "a/b",
+            "a\\b",
+            "..（..）",
+        ):
+            with self.subTest(hostile=hostile):
+                directory = self.write(hostile)
+                self.assertIn(self.root, directory.parents)
+                # Every segment is one name: no separators survive.
+                for part in directory.relative_to(self.root).parts:
+                    self.assertNotIn("/", part)
+                    self.assertNotIn("\\", part)
+                    self.assertNotIn(part, ("", ".", ".."))
+
+    def test_a_nameless_student_still_gets_a_directory(self):
+        # A `student` that sanitizes away (`.` and `/` only) must not produce an
+        # unnamed folder: the directory name is the only handle a teacher has.
+        directory = self.write("...")
+        self.assertIn("student", directory.relative_to(self.root).parts)
+
+    def test_a_long_name_is_truncated_per_segment(self):
+        directory = self.write(f"{'名' * 200}（{'班' * 200}）")
+        class_room, name, _stamp = directory.relative_to(self.root).parts
+        self.assertEqual(len(name), submissions.MAX_SEGMENT_LENGTH)
+        self.assertEqual(len(class_room), submissions.MAX_SEGMENT_LENGTH)
+
+    def test_files_are_private_and_rewriting_the_same_work_is_harmless(self):
+        first = self.write("张三（1 班）")
+        second = self.write("张三（1 班）")
+
+        self.assertEqual(first, second)
+        if os.name == "posix":
+            self.assertEqual(os.stat(second).st_mode & 0o777, 0o700)
+            self.assertEqual(
+                os.stat(second / "work/main.py").st_mode & 0o777, 0o600
+            )
 
 
 if __name__ == "__main__":

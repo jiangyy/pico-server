@@ -418,6 +418,68 @@ class SubmissionTest(ServerTestCase):
         self.assertEqual(submission["commitId"], commit_id)
         self.assertEqual(submission["student"], "2026-001")
 
+    def test_a_submission_is_filed_under_its_class_and_name(self):
+        playground_id, commit_id = self.seed()
+
+        status, _, body = self.submit(playground_id, commit_id, student="张三（1 班）")
+        self.assertEqual(status, 201)
+        submission_id = body["submission"]["id"]
+
+        # One directory per piece of work: <班级>/<姓名>/<时间>-<id8>/work/main.py
+        class_directory = Path(self.server.submissions_path) / "1 班" / "张三"
+        self.assertTrue(class_directory.is_dir())
+        (folder,) = list(class_directory.iterdir())
+        self.assertTrue(folder.name.endswith(submission_id[:8]))
+        self.assertEqual(
+            (folder / "work/main.py").read_text(encoding="utf-8"), "print(1)\n"
+        )
+
+        # The folder says whose work it is without anyone having to ask the API.
+        manifest = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["id"], submission_id)
+        self.assertEqual(manifest["student"], "张三（1 班）")
+        self.assertEqual(manifest["playgroundId"], playground_id)
+        self.assertEqual(manifest["commitId"], commit_id)
+        self.assertEqual(manifest["files"], ["work/main.py"])
+
+    def test_a_hostile_student_name_stays_inside_the_submissions_root(self):
+        playground_id, commit_id = self.seed()
+        root = Path(self.server.submissions_path)
+
+        status, _, _ = self.submit(
+            playground_id, commit_id, student="../../etc/passwd（../../..）"
+        )
+        self.assertEqual(status, 201)
+
+        # Every directory the request created is under the injected root, and
+        # every segment is a single name: no separators, no `..`.
+        created = list(root.rglob("*"))
+        self.assertTrue(created)
+        for path in created:
+            self.assertIn(root, path.parents)
+            self.assertNotIn("..", path.relative_to(root).parts)
+        self.assertFalse((root.parent.parent / "etc").exists())
+
+    def test_an_exact_retry_rewrites_the_same_folder(self):
+        playground_id, commit_id = self.seed()
+        key = str(uuid.uuid4())
+        payload = {
+            "playgroundId": playground_id,
+            "commitId": commit_id,
+            "student": "李四（2 班）",
+            "files": {"work/main.py": "print(2)\n"},
+        }
+
+        first = self.request("POST", "/api/v1/submissions", payload, extra_headers={"Idempotency-Key": key})
+        second = self.request("POST", "/api/v1/submissions", payload, extra_headers={"Idempotency-Key": key})
+        self.assertEqual((first[0], second[0]), (201, 201))
+        self.assertEqual(first[2], second[2])
+
+        # The replay wrote the same bytes to the same place, so there is still
+        # exactly one folder for that piece of work.
+        (folder,) = list((Path(self.server.submissions_path) / "2 班" / "李四").iterdir())
+        self.assertEqual((folder / "work/main.py").read_text(encoding="utf-8"), "print(2)\n")
+
     def test_the_operator_reads_the_submitted_files_back(self):
         playground_id, commit_id = self.seed()
         submission_id = self.submit(playground_id, commit_id)[2]["submission"]["id"]

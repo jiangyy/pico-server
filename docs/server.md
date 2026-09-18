@@ -11,7 +11,13 @@ data/
   generated/   可重建缓存：catalog、manifest index、bootstrap、artifact index
   artifacts/   不可变 runtime/EXE，按 version 目录存放
   runtime/     课程页面按需加载的共享运行时
+  submissions/ 收上来的作业：<班级>/<姓名>/<时间>-<id8>/work/**
 ```
+
+`submissions/` 是数据库行的副本，给批改的人看：一份作业一个目录，里面是学生交的
+`work/**` 加一个 `submission.json`（id、student、playgroundId、commitId、createdAt、
+文件清单）。学生自报的名字是这条路径里唯一由调用者控制的部分，所以它被切成安全
+的单段文件名；同名作业重交是**同一个人的新目录**（时间戳不同），精确重试则写到同一处。
 
 ## 读取（公开）
 

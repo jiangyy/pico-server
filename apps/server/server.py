@@ -62,6 +62,7 @@ from submissions import (
     get_submission,
     list_submissions,
     submission_to_mapping,
+    write_submission_files,
 )
 
 
@@ -71,6 +72,7 @@ DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
 RUNTIME_DIRECTORY_NAME = "runtime"
+SUBMISSIONS_DIRECTORY_NAME = "submissions"
 BOOTSTRAP_PATH = "/api/v1/bootstrap"
 COURSES_PATH = "/courses"
 
@@ -966,6 +968,26 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(400, "invalid_request")
             return
 
+        # The row is the record; the files are the copy a human opens. Writing
+        # after the row exists means a storage failure is a failed request the
+        # client can retry, and a replay writes the same bytes to the same
+        # path, so the retry is harmless.
+        if status == 201:
+            submission = body.get("submission") if isinstance(body, dict) else None
+            try:
+                write_submission_files(
+                    self.server.submissions_path,
+                    submission["id"],
+                    request.student,
+                    request.playground_id,
+                    request.playground_commit_id,
+                    submission["createdAt"],
+                    dict(request.files),
+                )
+            except (KeyError, TypeError, OSError, permissions.PermissionPolicyError):
+                self._api_error(500, "submission_storage_failed")
+                return
+
         self._respond_json(status, body)
 
     def _get_submissions(self, head_only=False):
@@ -1279,17 +1301,20 @@ def make_server(
     artifacts_path=None,
     generated_path=None,
     runtime_path=None,
+    submissions_path=None,
     operator_token=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
-    ``artifacts_path``, ``generated_path`` and ``runtime_path`` are injected
-    runtime directories.  When omitted they default to sibling directories of
-    the database, which keeps every deployment path under one data directory.
-    The directories are created lazily by the artifact index and
-    generated-cache code instead of at startup, so a read-only or unused
-    cache never becomes a start-up failure.  ``runtime_path`` contains the
-    shared files loaded on demand by course pages.
+    ``artifacts_path``, ``generated_path``, ``runtime_path`` and
+    ``submissions_path`` are injected runtime directories.  When omitted they
+    default to sibling directories of the database, which keeps every
+    deployment path under one data directory.  The directories are created
+    lazily by the artifact index, generated-cache code and submission writer
+    instead of at startup, so a read-only or unused directory never becomes a
+    start-up failure.  ``runtime_path`` contains the shared files loaded on
+    demand by course pages; ``submissions_path`` holds one directory per
+    handed-in piece of work.
     """
     operator_token = _validate_operator_token(operator_token)
 
@@ -1311,6 +1336,11 @@ def make_server(
     else:
         runtime_path = Path(runtime_path)
 
+    if submissions_path is None:
+        submissions_path = database_path.parent / SUBMISSIONS_DIRECTORY_NAME
+    else:
+        submissions_path = Path(submissions_path)
+
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
 
@@ -1324,6 +1354,7 @@ def make_server(
     server.artifacts_path = artifacts_path
     server.generated_path = generated_path
     server.runtime_path = runtime_path
+    server.submissions_path = submissions_path
     server.operator_token = operator_token
     _initialize_generated(server)
     return server
