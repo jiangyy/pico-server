@@ -209,7 +209,7 @@ def build_payloads(generated_path, *, connection, repository, artifacts_path):
     catalog = public_catalog(connection, repository)
     manifest_index = _build_manifests(repository, catalog)
 
-    artifact_mappings = [entry.to_mapping() for entry in entries]
+    artifact_mappings = artifacts.index_to_mapping(entries)["artifacts"]
     return {
         ARTIFACT_INDEX_FILENAME: _encode({"artifacts": artifact_mappings}),
         CATALOG_FILENAME: _encode({"catalog": catalog}),
