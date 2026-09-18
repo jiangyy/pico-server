@@ -38,12 +38,14 @@ data/
 | --- | --- | --- |
 | `POST /api/v1/playgrounds` | operator token | `{"id": …}` |
 | `POST /api/v1/playgrounds/{id}/commits` | operator token | ZIP + `Idempotency-Key` |
+| `DELETE /api/v1/playgrounds/{id}` | operator token | — |
 | `POST /api/v1/submissions` | 任何人 | `{playgroundId, commitId, student, files}` + `Idempotency-Key` |
 | `GET /api/v1/submissions[/{id}]` | operator token | — |
 
 - Operator token 在启动时给（`PICOPG_OPERATOR_TOKEN`），常量时间比较，不入库。没有它就拒绝启动：否则每个写端点都是公开的。
 - Bundle 只允许 `course/**`、`starter/**`、`picopg.json`：拒绝绝对路径、`..`、链接、重复归一化路径、特殊文件、未知 schema/runtime 及超限内容（≤1024 文件、单文件 ≤1MiB、合计 ≤8MiB、ZIP ≤10MiB）。
 - Submission 只允许 `work/**`，路径必须可移植（无保留名、无 `:`、无结尾点/空格、大小写不冲突），限额同上。提交的字节只进数据库，永远不进仓库。
+- 下线（`DELETE`）只删那个 Playground 的 ref，顺带忘掉它的发布幂等记录：数据库行、commit 对象、已经收上来的作业都留着，用同一个 id 重新发布即恢复（恢复的是新的 commit，旧 commitId 不再可读）。ref 没了就没有“已发布历史”，所以目录、manifest、课程页一律看不到它。
 
 ## 一致性
 

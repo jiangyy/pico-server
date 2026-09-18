@@ -488,9 +488,14 @@ def _reference_matches(repository, ref, object_id):
 def _compare_and_swap(
     repository, ref, new_id, old_id, error=PlaygroundHeadChangedError
 ):
-    completed = _run_git(
-        ("update-ref", ref, new_id, old_id), cwd=repository.path
+    # ``update-ref`` with a zero ``new_id`` deletes the ref instead of moving it,
+    # under the same "the old value must still be there" guard.
+    arguments = (
+        ("update-ref", "-d", ref, old_id)
+        if _is_zero_object_id(new_id)
+        else ("update-ref", ref, new_id, old_id)
     )
+    completed = _run_git(arguments, cwd=repository.path)
     if completed.returncode != 0:
         # A failed update is only a lost race when the protected ref no longer
         # holds the expected object.  An unchanged ref means disk, lock, or
@@ -537,6 +542,33 @@ def publish_playground(repository, playground_id, bundle, metadata):
     return PublishResult(
         playground_id=playground_id, commit_id=commit_id, no_op=False
     )
+
+
+def retire_playground(repository, playground_id):
+    """Remove a Playground's published ref and report whether one was there.
+
+    This is the whole of "students no longer see it": every read path resolves the
+    ref first, so a Playground without one is simply not in the catalog.  Nothing
+    else is touched — the commits stay in the object store (publishing the id
+    again restores it), and the database row with the submissions that reference
+    it is left alone, which is why retiring works even for a course students have
+    already handed work in for.
+
+    The delete is a compare-and-swap like a publish, so a concurrent publish of
+    the same id surfaces as :class:`PlaygroundHeadChangedError` instead of being
+    silently discarded.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+
+    ref = repository.playground_ref(playground_id)
+    head = _resolve_head(repository, ref)
+    if head is None:
+        return False
+
+    _compare_and_swap(repository, ref, _zero_object_id(repository), head)
+    return True
 
 
 # --- Read-only access to published commits ---------------------------------

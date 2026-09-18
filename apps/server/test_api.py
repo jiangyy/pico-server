@@ -144,6 +144,23 @@ class ServerTestCase(unittest.TestCase):
         assert status == 201, (status, body)
         return playground_id, body["commitId"]
 
+    def submit(self, playground_id, commit_id, **overrides):
+        """Hand one piece of work in; overrides replace any request field."""
+
+        payload = {
+            "playgroundId": playground_id,
+            "commitId": commit_id,
+            "student": "2026-001",
+            "files": {"work/main.py": "print(1)\n"},
+        }
+        payload.update(overrides)
+        return self.request(
+            "POST",
+            "/api/v1/submissions",
+            payload,
+            extra_headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
+
 
 class DistributionTest(ServerTestCase):
     """What a client can read: the catalog, a manifest and exact bytes."""
@@ -390,23 +407,104 @@ class PublishTest(ServerTestCase):
         self.assertEqual(body["code"], "not_found")
 
 
+class RetiringTest(ServerTestCase):
+    """Operator takes a course out of the catalog: students stop seeing it.
+
+    Retiring is not a delete: the row, the submissions that reference it and the
+    commits all stay, so the same id can be published again.
+    """
+
+    def catalog_ids(self):
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        return [entry["playgroundId"] for entry in body["catalog"]]
+
+    def retire(self, playground_id, token=OPERATOR_TOKEN):
+        return self.request(
+            "DELETE", f"/api/v1/playgrounds/{playground_id}", token=token
+        )
+
+    def test_retiring_a_playground_takes_it_out_of_the_catalog(self):
+        playground_id, commit_id = self.seed("pg-retire")
+        self.assertIn("pg-retire", self.catalog_ids())
+
+        status, _, body = self.retire("pg-retire")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"playgroundId": "pg-retire", "retired": True})
+
+        self.assertNotIn("pg-retire", self.catalog_ids())
+        # Nothing is readable any more: the ref is what every read resolves first.
+        for path in (
+            f"/api/v1/playgrounds/pg-retire/commits/{commit_id}/manifest",
+            "/courses/pg-retire/{0}/course/index.html".format(commit_id),
+        ):
+            self.assertEqual(self.request("GET", path)[0], 404)
+
+        # The record is untouched: publishing the same id brings the course back
+        # and readable. The restored commit is a new one — the old ref is gone for
+        # good, so any client pinned to the retired commit would 404.
+        status, _, body = self.publish("pg-retire")
+        self.assertEqual(status, 201)
+        self.assertIn("pg-retire", self.catalog_ids())
+        restored = self.request(
+            "GET",
+            f"/api/v1/playgrounds/pg-retire/commits/{body['commitId']}/manifest",
+        )
+        self.assertEqual(restored[0], 200)
+
+    def test_a_publish_replayed_after_a_retire_publishes_again(self):
+        playground_id, _ = self.seed("pg-retire")
+        self.assertEqual(self.retire(playground_id)[0], 200)
+
+        # The very same idempotency key as the first publish. The retire dropped
+        # the recorded result, so this is a real publish: replaying it would
+        # answer 201 with a commit that no longer exists.
+        status, _, body = self.publish(playground_id, key="key-1")
+        self.assertEqual(status, 201)
+        self.assertIn(playground_id, self.catalog_ids())
+        manifest = self.request(
+            "GET",
+            f"/api/v1/playgrounds/{playground_id}/commits/{body['commitId']}/manifest",
+        )
+        self.assertEqual(manifest[0], 200)
+
+    def test_retiring_needs_the_operator_token(self):
+        self.seed("pg-retire")
+
+        self.assertEqual(self.retire("pg-retire", token=None)[0], 401)
+        self.assertEqual(self.retire("pg-retire", token="wrong-token-000000")[0], 401)
+        self.assertIn("pg-retire", self.catalog_ids())
+
+    def test_retiring_an_unknown_playground_is_not_found(self):
+        self.assertEqual(self.retire("pg-never-published")[0], 404)
+
+    def test_retiring_twice_reports_that_it_was_already_gone(self):
+        self.seed("pg-retire")
+
+        self.assertEqual(self.retire("pg-retire")[2]["retired"], True)
+        status, _, body = self.retire("pg-retire")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["retired"], False)
+
+    def test_a_retired_course_keeps_the_work_already_handed_in(self):
+        playground_id, commit_id = self.seed("pg-retire")
+        submission_id = self.submit(playground_id, commit_id)[2]["submission"]["id"]
+
+        self.assertEqual(self.retire(playground_id)[0], 200)
+
+        # The submission is still readable, and its Playground still exists for it.
+        status, _, body = self.request(
+            "GET", f"/api/v1/submissions/{submission_id}", token=OPERATOR_TOKEN
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["submission"]["playgroundId"], playground_id)
+
+        # A new submission against a retired course is refused.
+        self.assertEqual(self.submit(playground_id, commit_id)[0], 404)
+
+
 class SubmissionTest(ServerTestCase):
     """The one anonymous write: a bounded file set from a client."""
-
-    def submit(self, playground_id, commit_id, **overrides):
-        payload = {
-            "playgroundId": playground_id,
-            "commitId": commit_id,
-            "student": "2026-001",
-            "files": {"work/main.py": "print(1)\n"},
-        }
-        payload.update(overrides)
-        return self.request(
-            "POST",
-            "/api/v1/submissions",
-            payload,
-            extra_headers={"Idempotency-Key": str(uuid.uuid4())},
-        )
 
     def test_a_client_can_submit_without_an_account(self):
         playground_id, commit_id = self.seed()

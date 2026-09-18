@@ -42,6 +42,7 @@ from playgrounds import (
     MissingPlaygroundError,
     PlaygroundConflictError,
     create_playground,
+    get_playground,
     publish_playground,
 )
 from repository import (
@@ -50,6 +51,7 @@ from repository import (
     PlaygroundHeadChangedError,
     RepositoryError,
     open_repository,
+    retire_playground,
     valid_playground_id,
 )
 from submissions import (
@@ -138,6 +140,29 @@ def _match_playground_commit(path):
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
+
+
+def _match_playground(path):
+    """Return the playground ID in ``/api/v1/playgrounds/<id>``, else None."""
+
+    prefix = PLAYGROUNDS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+
+    playground_id = path[len(prefix):]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
+def _playground_commits_endpoint(playground_id):
+    """The idempotency endpoint of a Playground's bundle publish.
+
+    One spelling, used by both the publish that records a result and the retire
+    that has to forget it, so the two can never drift apart.
+    """
+
+    return f"POST {PLAYGROUNDS_PATH}/{playground_id}{PLAYGROUND_COMMITS_SUFFIX}"
 
 
 def _commit_route_parts(path):
@@ -238,6 +263,8 @@ def _allowed_methods(path):
         return ALLOWED_METHODS
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
+    if _match_playground(path) is not None:
+        return ("DELETE",)
     if _match_playground_commit(path) is not None:
         return ("POST",)
     if _match_course_file(path) is not None:
@@ -375,7 +402,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch(self._method_not_allowed)
 
     def do_DELETE(self):
-        self._dispatch(self._method_not_allowed)
+        self._dispatch(self._route_delete)
 
     def _dispatch(self, route, **kwargs):
         self._headers_sent = False
@@ -446,6 +473,74 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed()
         else:
             self._not_found()
+
+    def _route_delete(self):
+        path = urlsplit(self.path).path
+        playground_id = _match_playground(path)
+
+        if playground_id is not None:
+            self._delete_playground(playground_id)
+        elif _allowed_methods(path) is not None:
+            self._method_not_allowed()
+        else:
+            self._not_found()
+
+    def _delete_playground(self, playground_id):
+        """Take a Playground out of the catalog.
+
+        Students stop seeing it on their next refresh; nothing else changes.  The
+        database row stays (the submissions that reference it keep a valid
+        parent) and the commits stay in the repository, so publishing the same id
+        again restores it.  Reading a retired commit is already refused, because
+        every read path resolves the ref first.
+
+        The recorded publishes of this Playground are dropped, because a recorded
+        result is only true while the ref it describes is still there: an exact
+        replay answers with the stored response without touching Git, so an old
+        idempotency key would report a 201 for a course nobody can read.  The rows
+        go before the ref does, so a failure here leaves the Playground published
+        rather than silently unrepeatable.
+        """
+
+        if not self._require_operator():
+            return
+
+        try:
+            with self._database() as connection:
+                stored = get_playground(connection, playground_id)
+                if stored is not None:
+                    with connection:
+                        connection.execute(
+                            "DELETE FROM idempotency_results "
+                            "WHERE scope = ? AND endpoint = ?",
+                            (
+                                OPERATOR_SCOPE,
+                                _playground_commits_endpoint(playground_id),
+                            ),
+                        )
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
+            return
+
+        if stored is None:
+            self._not_found()
+            return
+
+        try:
+            retired = retire_playground(self.server.repository, playground_id)
+        except PlaygroundHeadChangedError:
+            self._api_error(409, "playground_head_changed")
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error")
+            return
+
+        if not self._refresh_generated():
+            # Authority is the ref, which is already gone; the next read rebuilds.
+            pass
+        self._respond_json(
+            200, {"playgroundId": playground_id, "retired": retired}
+        )
 
     def _current_generation(self):
         """Resolve the current generation, rebuilding at most once."""
@@ -851,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
                 status, body = execute_idempotent(
                     connection,
                     OPERATOR_SCOPE,
-                    f"POST /api/v1/playgrounds/{playground_id}/commits",
+                    _playground_commits_endpoint(playground_id),
                     request_key,
                     _bundle_request(playground_id, bundle),
                     lambda connection: self._publish_bundle(
