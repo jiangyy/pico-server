@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+
+# 部署机的运行数据（app.db、裸仓库、generated/、artifacts/、runtime/、submissions/）
+# 只存在于那台机器上，不进库。
+data/
