@@ -36,7 +36,6 @@ from pathlib import Path
 import artifacts
 import manifests
 import permissions
-import playgrounds
 
 
 __all__ = [
@@ -144,18 +143,14 @@ def atomic_write(path, data):
 
 
 def public_catalog(connection, repository):
-    """Return the public, unarchived Playground catalog from authority.
+    """Return the published Playground catalog from authority.
 
-    Only public Playgrounds are listed, and each entry records the exact
-    current commit.  Private metadata and Release visibility are deliberately
-    absent, because a generated cache must never carry per-actor access.
+    Every stored Playground is readable by every client, and each entry records
+    the exact current commit, so the cache holds no per-caller access.
     """
 
     rows = connection.execute(
-        "SELECT id FROM playgrounds"
-        " WHERE policy = ? AND archived_at IS NULL"
-        " ORDER BY id",
-        (playgrounds.PUBLIC_POLICY,),
+        "SELECT id FROM playgrounds ORDER BY id"
     ).fetchall()
 
     catalog = []
@@ -170,13 +165,15 @@ def public_catalog(connection, repository):
 
 
 def _build_manifests(connection, repository, catalog):
-    """Return the deterministic manifests of every public current commit."""
+    """Return the deterministic manifests of every published commit.
+
+    ``connection`` is unused here and kept only because the generation builder
+    passes one database connection to every step.
+    """
 
     manifest_index = []
     for item in catalog:
         manifest = manifests.generate_manifest(
-            connection,
-            None,
             repository,
             item["playgroundId"],
             item["commitId"],

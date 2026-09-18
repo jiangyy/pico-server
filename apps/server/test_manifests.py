@@ -12,15 +12,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from unittest import mock
 
 # Allow ``import manifests`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import accounts  # noqa: E402
-import authorization  # noqa: E402
 import bundles  # noqa: E402
 import manifests  # noqa: E402
 import playgrounds  # noqa: E402
@@ -41,41 +38,11 @@ class ManifestTestBase(unittest.TestCase):
         self.repository_path = base / "picopg.git"
         self.repository = repository.open_repository(self.repository_path)
 
-        bootstrap = accounts.User(
-            id="seed-actor",
-            username="seed-actor",
-            role="admin",
-            created_at="2026-01-01T00:00:00Z",
-        )
-        self.admin = accounts.create_user(
-            self.connection,
-            bootstrap,
-            f"admin-{uuid.uuid4().hex[:8]}",
-            "secret",
-            "admin",
-        )
 
     # ----- database helpers ---------------------------------------------
 
-    def create_user(self, role):
-        return accounts.create_user(
-            self.connection,
-            self.admin,
-            f"{role}-{uuid.uuid4().hex[:8]}",
-            "secret",
-            role,
-        )
-
-    def create_playground(self, creator, playground_id):
-        """Create Playground metadata; management is Admin-only."""
-        return playgrounds.create_playground(
-            self.connection, self.admin, playground_id
-        )
-
-    def make_public(self, creator, playground_id):
-        return playgrounds.update_playground(
-            self.connection, self.admin, playground_id, {"policy": "public"}
-        )
+    def create_playground(self, playground_id):
+        return playgrounds.create_playground(self.connection, playground_id)
 
     def make_bundle(self, entries):
         return bundles.validate_bundle(
@@ -100,7 +67,6 @@ class ManifestTestBase(unittest.TestCase):
     def publish(self, playground_id, course_data=b"print(1)"):
         return playgrounds.publish_playground(
             self.connection,
-            self.admin,
             playground_id,
             self.repository,
             self.make_bundle(self.default_entries(course_data)),
@@ -193,14 +159,9 @@ class ManifestTestBase(unittest.TestCase):
 
     # ----- manifest helpers ----------------------------------------------
 
-    def generate(self, playground_id, commit_id, actor=None, **kwargs):
+    def generate(self, playground_id, commit_id):
         return manifests.generate_manifest(
-            self.connection,
-            self.admin if actor is None else actor,
-            self.repository,
-            playground_id,
-            commit_id,
-            **kwargs,
+            self.repository, playground_id, commit_id
         )
 
     def generated_file(self, manifest, path):
@@ -243,7 +204,7 @@ class ManifestGenerationTest(ManifestTestBase):
     def setUp(self):
         super().setUp()
         self.playground_id = "pg-manifest"
-        self.create_playground(self.admin, self.playground_id)
+        self.create_playground(self.playground_id)
 
     # ----- happy paths ---------------------------------------------------
 
@@ -291,35 +252,6 @@ class ManifestGenerationTest(ManifestTestBase):
         payload = manifests.serialize_manifest(manifest)
         self.assertIsInstance(payload, bytes)
         self.assertEqual(json.loads(payload), mapping)
-
-    def test_binary_and_empty_blobs_use_exact_bytes(self):
-        binary = bytes(range(256))
-        self.create_playground(self.admin, "pg-bytes")
-        entries = [
-            ("picopg.json", MANIFEST_BYTES),
-            ("course/empty.txt", b""),
-            ("course/data.bin", binary),
-        ]
-        result = playgrounds.publish_playground(
-            self.connection,
-            self.admin,
-            "pg-bytes",
-            self.repository,
-            self.make_bundle(entries),
-            self.metadata(),
-        )
-        manifest = self.generate("pg-bytes", result.commit_id)
-
-        empty = self.generated_file(manifest, "course/empty.txt")
-        self.assertEqual(empty.size, 0)
-        self.assertEqual(
-            empty.sha256, hashlib.sha256(b"").hexdigest()
-        )
-
-        data = self.generated_file(manifest, "course/data.bin")
-        self.assertEqual(data.size, 256)
-        self.assertEqual(data.sha256, hashlib.sha256(binary).hexdigest())
-        self.assertEqual(data.blob_id, self.hash_blob(binary))
 
     def test_generation_is_deterministic(self):
         result = self.publish(self.playground_id)
@@ -380,58 +312,47 @@ class ManifestGenerationTest(ManifestTestBase):
         self.assertIn("ls-tree", commands)
         self.assertIn("cat-file", commands)
 
-    # ----- authorization -------------------------------------------------
+    # ----- published history ---------------------------------------------
 
-    def test_denied_actor_is_denied_before_any_content_read(self):
-        result = self.publish(self.playground_id)
-        student = self.create_user("student")
-        self.assert_read_not_attempted()
+    def test_binary_and_empty_blobs_use_exact_bytes(self):
+        binary = bytes(range(256))
+        self.create_playground("pg-bytes")
+        result = playgrounds.publish_playground(
+            self.connection,
+            "pg-bytes",
+            self.repository,
+            self.make_bundle(
+                [
+                    ("picopg.json", MANIFEST_BYTES),
+                    ("course/empty.txt", b""),
+                    ("course/data.bin", binary),
+                ]
+            ),
+            self.metadata(),
+        )
+        manifest = self.generate("pg-bytes", result.commit_id)
 
-        with self.assertRaises(
-            authorization.ContentAccessDeniedError
-        ):
-            self.generate(
-                self.playground_id, result.commit_id, actor=student
-            )
+        self.assertEqual(self.generated_file(manifest, "course/empty.txt").size, 0)
+        self.assertEqual(self.generated_file(manifest, "course/data.bin").size, len(binary))
 
-    def test_missing_commit_is_denied_before_any_content_read(self):
-        self.make_public(self.admin, self.playground_id)
-        self.assert_read_not_attempted()
-
-        with self.assertRaises(
-            authorization.ContentAccessDeniedError
-        ):
-            self.generate(self.playground_id, "a" * 40)
-
-    def test_missing_and_denied_targets_share_one_error(self):
-        result = self.publish(self.playground_id)
-        student = self.create_user("student")
-
-        def denial(commit_id):
-            with self.assertRaises(
-                authorization.ContentAccessDeniedError
-            ) as caught:
-                self.generate(
-                    self.playground_id, commit_id, actor=student
-                )
-            return caught.exception
-
-        missing = denial("a" * 40)
-        unauthorized = denial(result.commit_id)
-        self.assertEqual(type(missing), type(unauthorized))
-        self.assertEqual(str(missing), str(unauthorized))
-
-    def test_commit_from_another_playground_is_denied(self):
-        self.create_playground(self.admin, "pg-other")
+    def test_a_commit_from_another_playground_is_refused(self):
+        self.create_playground("pg-other")
         other = self.publish("pg-other")
-        self.make_public(self.admin, self.playground_id)
 
-        with self.assertRaises(
-            authorization.ContentAccessDeniedError
-        ):
+        with self.assertRaises(manifests.ManifestError) as caught:
             self.generate(self.playground_id, other.commit_id)
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_COMMIT_NOT_PUBLISHED
+        )
 
-    # ----- malformed trees -----------------------------------------------
+    def test_a_missing_commit_is_refused_before_any_content_read(self):
+        self.assert_read_not_attempted()
+
+        with self.assertRaises(manifests.ManifestError) as caught:
+            self.generate(self.playground_id, "a" * 40)
+        self.assertEqual(
+            caught.exception.reason, manifests.REASON_COMMIT_NOT_PUBLISHED
+        )
 
     def test_non_blob_gitlink_entry_is_rejected(self):
         published = self.publish(self.playground_id)
@@ -573,30 +494,6 @@ class ManifestGenerationTest(ManifestTestBase):
                     manifests.REASON_PATH_NOT_ALLOWED,
                 )
 
-    def test_legacy_non_portable_read_ignores_tree_content(self):
-        commit = self.craft_commit(
-            {
-                "picopg.json": MANIFEST_BYTES,
-                "course/CON.py": b"secret",
-            }
-        )
-        self.set_ref(self.playground_id, commit)
-        self.assert_blobs_not_read()
-        with self.assertRaises(manifests.ManifestError) as caught:
-            manifests.read_commit_file(
-                self.connection,
-                self.admin,
-                self.repository,
-                self.playground_id,
-                commit,
-                "course/CON.py",
-            )
-        self.assertEqual(
-            caught.exception.reason, manifests.REASON_PATH_NOT_ALLOWED
-        )
-
-    # ----- limits --------------------------------------------------------
-
     def test_entry_count_limit_is_enforced(self):
         result = self.publish(self.playground_id)
         with mock.patch.object(manifests, "MAX_ENTRY_COUNT", 2):
@@ -671,23 +568,16 @@ class CommitFileReadTest(ManifestTestBase):
     def setUp(self):
         super().setUp()
         self.playground_id = "pg-file"
-        self.create_playground(self.admin, self.playground_id)
+        self.create_playground(self.playground_id)
 
-    def read(self, playground_id, commit_id, path, actor="admin", **kwargs):
+    def read(self, playground_id, commit_id, path):
         return manifests.read_commit_file(
-            self.connection,
-            self.admin if actor == "admin" else actor,
-            self.repository,
-            playground_id,
-            commit_id,
-            path,
-            **kwargs,
+            self.repository, playground_id, commit_id, path
         )
 
     def publish_entries(self, playground_id, entries):
         return playgrounds.publish_playground(
             self.connection,
-            self.admin,
             playground_id,
             self.repository,
             self.make_bundle(entries),
@@ -777,63 +667,6 @@ class CommitFileReadTest(ManifestTestBase):
         self.assertEqual(content.path, "course/caf\u00e9.py")
         self.assertEqual(content.data, b"nfc")
 
-    def test_anonymous_reads_only_public_unarchived_content(self):
-        result = self.publish(self.playground_id)
-        with self.assertRaises(authorization.ContentAccessDeniedError):
-            self.read(
-                self.playground_id,
-                result.commit_id,
-                "course/module/app.py",
-                actor=None,
-            )
-
-        self.make_public(self.admin, self.playground_id)
-        content = self.read(
-            self.playground_id,
-            result.commit_id,
-            "course/module/app.py",
-            actor=None,
-        )
-        self.assertEqual(content.data, b"print(1)")
-
-        playgrounds.update_playground(
-            self.connection,
-            self.admin,
-            self.playground_id,
-            {"archived": True},
-        )
-        with self.assertRaises(authorization.ContentAccessDeniedError):
-            self.read(
-                self.playground_id,
-                result.commit_id,
-                "course/module/app.py",
-                actor=None,
-            )
-
-    def test_denied_actor_is_denied_before_any_content_read(self):
-        result = self.publish(self.playground_id)
-        student = self.create_user("student")
-        self.assert_read_not_attempted()
-
-        with self.assertRaises(authorization.ContentAccessDeniedError):
-            self.read(
-                self.playground_id,
-                result.commit_id,
-                "course/module/app.py",
-                actor=student,
-            )
-
-    def test_commit_from_another_playground_is_denied(self):
-        self.create_playground(self.admin, "pg-other-file")
-        other = self.publish("pg-other-file")
-        self.make_public(self.admin, self.playground_id)
-        self.assert_read_not_attempted()
-
-        with self.assertRaises(authorization.ContentAccessDeniedError):
-            self.read(
-                self.playground_id, other.commit_id, "course/module/app.py"
-            )
-
     def test_missing_path_is_not_found(self):
         result = self.publish(self.playground_id)
         with self.assertRaises(manifests.ManifestError) as caught:
@@ -896,7 +729,7 @@ class CommitFileReadTest(ManifestTestBase):
 
     def test_current_playground_commit_tracks_published_head(self):
         empty_id = "pg-empty-file"
-        self.create_playground(self.admin, empty_id)
+        self.create_playground(empty_id)
         self.assertIsNone(
             manifests.current_playground_commit(self.repository, empty_id)
         )
@@ -911,28 +744,6 @@ class CommitFileReadTest(ManifestTestBase):
         self.assertIsNone(
             manifests.current_playground_commit(self.repository, "pg-missing")
         )
-
-    def test_generate_manifest_supports_anonymous_public_read(self):
-        result = self.publish(self.playground_id)
-        with self.assertRaises(authorization.ContentAccessDeniedError):
-            manifests.generate_manifest(
-                self.connection,
-                None,
-                self.repository,
-                self.playground_id,
-                result.commit_id,
-            )
-
-        self.make_public(self.admin, self.playground_id)
-        manifest = manifests.generate_manifest(
-            self.connection,
-            None,
-            self.repository,
-            self.playground_id,
-            result.commit_id,
-        )
-        self.assertEqual(manifest.commit_id, result.commit_id)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

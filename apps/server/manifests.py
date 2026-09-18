@@ -1,10 +1,10 @@
-"""Deterministic manifests for authorized immutable Playground commits.
+"""Deterministic manifests for published immutable Playground commits.
 
-A manifest is derived from one exact Playground commit that the caller is
-authorized to read.  Authorization runs first against the exact
-``(playgroundId, commitId)`` pair; only then is the commit's tree listed and
-its blob bytes hashed.  The commit is never substituted with the current branch
-HEAD, no checkout or temporary copy is created, and nothing is cached.
+A manifest is derived from one exact Playground commit.  The commit must be
+reachable from that Playground's published ref before its tree is listed or any
+blob bytes are hashed, so a commit id alone never reaches Git content.  The
+commit is never substituted with the current branch HEAD, no checkout or
+temporary copy is created, and nothing is cached.
 
 The manifest is a pure value: the same commit always produces the same
 path-ordered file list and the same deterministic JSON bytes.
@@ -16,8 +16,6 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-import accounts
-import authorization
 import bundles
 import repository as repository_module
 
@@ -66,6 +64,7 @@ REASON_PATH_CASE_COLLISION = "path_case_collision"
 REASON_DUPLICATE_PATH = "duplicate_path"
 REASON_MISSING_BLOB = "missing_blob"
 REASON_BLOB_SIZE_MISMATCH = "blob_size_mismatch"
+REASON_COMMIT_NOT_PUBLISHED = "commit_not_published"
 
 REASON_CODES = frozenset(
     {
@@ -94,18 +93,6 @@ class ManifestError(Exception):
     def __init__(self, reason):
         self.reason = reason
         super().__init__(reason)
-
-
-# Unauthenticated content requests are evaluated with an explicit anonymous
-# actor.  The centralized authorization rules therefore still make the
-# public/private decision instead of the HTTP layer duplicating policy: only a
-# public, unarchived Playground commit is reachable without an account.
-_ANONYMOUS_ACTOR = accounts.User(
-    id="anonymous",
-    username="anonymous",
-    role="anonymous",
-    created_at="",
-)
 
 
 @dataclass(frozen=True)
@@ -155,8 +142,8 @@ def _optional_text(value, maximum, *, nonblank=False):
 def course_metadata(repository, commit_id):
     """Read the bounded ``picopg.json`` display metadata of one commit.
 
-    This does not authorize the commit; callers must authorize the enclosing
-    operation before calling it.
+    This does not check that the commit is published; callers that read a
+    caller-supplied commit id check that first.
     """
 
     entries = repository_module.list_commit_tree(repository, commit_id)
@@ -275,39 +262,27 @@ def _build_manifest(repository, commit_id):
     return CommitManifest(commit_id=commit_id, files=tuple(files))
 
 
-def generate_manifest(
-    connection,
-    actor,
-    repository,
-    playground_id,
-    commit_id,
-    *,
-    now=None,
-):
-    """Return the deterministic manifest of one authorized Playground commit.
+def generate_manifest(repository, playground_id, commit_id):
+    """Return the deterministic manifest of one published Playground commit.
 
-    Authorization of the exact ``(playground_id, commit_id)`` pair happens
-    before any tree or blob content is read, so a missing or unauthorized
-    target raises :class:`authorization.ContentAccessDeniedError` and no Git
+    The exact ``(playground_id, commit_id)`` pair is checked against the
+    Playground's published history before any tree or blob content is read, so
+    an unknown or unpublished target raises :class:`ManifestError` and no Git
     content access is attempted.  A reachable commit whose tree violates the
-    manifest contract raises :class:`ManifestError`.
+    manifest contract raises :class:`ManifestError` too.
     """
 
-    authorization.authorize_content_read(
-        connection,
-        _resolve_actor(actor),
-        repository,
-        playground_id,
-        commit_id,
-        now=now,
-    )
+    _require_published(repository, playground_id, commit_id)
     return _build_manifest(repository, commit_id)
 
 
-def _resolve_actor(actor):
-    """Return the actor to authorize, or the anonymous public-only actor."""
+def _require_published(repository, playground_id, commit_id):
+    """Raise ``ManifestError`` unless the commit is in that history."""
 
-    return _ANONYMOUS_ACTOR if actor is None else actor
+    if not repository_module.commit_in_playground_history(
+        repository, playground_id, commit_id
+    ):
+        raise ManifestError(REASON_COMMIT_NOT_PUBLISHED)
 
 
 def normalize_content_path(path):
@@ -344,32 +319,17 @@ def current_playground_commit(repository, playground_id):
         return None
 
 
-def read_commit_file(
-    connection,
-    actor,
-    repository,
-    playground_id,
-    commit_id,
-    path,
-    *,
-    now=None,
-):
-    """Return one exact file from an authorized Playground commit.
+def read_commit_file(repository, playground_id, commit_id, path):
+    """Return one exact file from a published Playground commit.
 
-    The exact ``(playground_id, commit_id)`` pair is authorized before any
-    commit tree or blob is read.  The requested path is then resolved inside
-    that commit's own tree; a caller-supplied blob id is never accepted.  A
-    path that is not allowed or not present raises :class:`ManifestError`.
+    The ``(playground_id, commit_id)`` pair is checked against the Playground's
+    published history before any commit tree or blob is read.  The requested
+    path is then resolved inside that commit's own tree; a caller-supplied blob
+    id is never accepted.  A path that is not allowed or not present raises
+    :class:`ManifestError`.
     """
 
-    authorization.authorize_content_read(
-        connection,
-        _resolve_actor(actor),
-        repository,
-        playground_id,
-        commit_id,
-        now=now,
-    )
+    _require_published(repository, playground_id, commit_id)
 
     normalized_path = normalize_content_path(path)
     entries = repository_module.list_commit_tree(repository, commit_id)

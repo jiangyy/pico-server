@@ -1,37 +1,42 @@
-"""Immutable Submission operations for PicoPG.
+"""Immutable Submission records for PicoPG.
 
-A Submission records that one Student's exact, Server-owned Work commit was
-submitted for one Release.  Submissions are append-only: this module exposes no
-update, delete, or status behavior, stores no source or mutable state, and
-never copies Work content.  Creation re-reads current Class membership and the
-exact Release/Work relationship on every call and then records the row through
-the task-10 persistent idempotency layer, so an exact retry replays the
-original result and a changed body conflicts.
+A Submission is the whole write side of the service: the files a student hands
+in, plus the name they hand them in under.  Nothing here builds a Git commit,
+copies course material, or reads a blob — the client names the exact published
+Playground commit the work belongs to, that commit is checked against the
+Playground's own history, and only its id is stored.  A submission therefore
+cannot alter what other clients download, and re-submitting the same work is a
+new immutable row rather than an edit.
 
-The centralized content authorization reads the real ``submissions`` table
-through :func:`release_ids_for_work_commit`; a Teacher is authorized for a Work
-commit only when a real Submission of that exact commit exists under a Release
-in a Class they own.
+Submissions are append-only: this module exposes no update, delete, or status
+behavior.  Creation goes through the persistent idempotency layer, so an exact
+retry returns the original ``201`` body and a changed body conflicts.
 """
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import accounts
 import idempotency
+import playgrounds
 import repository as repository_module
+import works
 from pagination import Page
 
 
-# One logical create scope: the request body names the Release and the Work
-# commit, so reusing a key for a different Release or commit is a conflict.
+# One logical create scope: the request names the Playground, the exact commit,
+# the student, and the files, so reusing a key for a different body conflicts.
 SUBMISSION_CREATE_ENDPOINT = "/api/v1/submissions"
+
+# A self-reported student name is a display string, not an identity: it is
+# bounded, trimmed, and never used for authorization.
+MAX_STUDENT_LENGTH = 128
 
 # Git object IDs are lowercase hexadecimal.  Requiring the exact full-width
 # form before any lookup stops a symbolic name such as ``HEAD`` from being
-# resolved as if it were the supplied Work commit.
+# resolved as if it were the supplied commit.
 _COMMIT_ID_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
 
 
@@ -40,541 +45,318 @@ class SubmissionError(Exception):
 
 
 class InvalidSubmissionRequestError(SubmissionError, ValueError):
-    """A Submission request carried a malformed field or time value."""
+    """A Submission request carried a malformed field."""
 
 
-class UnknownReleaseError(SubmissionError):
-    """The target Release does not exist."""
-
-
-class SubmissionNotAllowedError(SubmissionError):
-    """The Release is not open, or a required Submission is past due."""
-
-
-class UnknownWorkCommitError(SubmissionError):
-    """The commit is not on the Student's Work history or pins another."""
+class UnknownPlaygroundError(SubmissionError):
+    """The named Playground has no such published commit."""
 
 
 class MissingSubmissionError(SubmissionError):
     """No readable Submission exists for the requested identifier."""
 
 
-class SubmissionIntegrityError(SubmissionError):
-    """Durable Submission metadata is inconsistent with the repository."""
+class StoredSubmissionError(SubmissionError):
+    """A durable Submission row cannot be represented by the API."""
+
+
+@dataclass(frozen=True)
+class SubmissionRequest:
+    """One validated, bounded submission body."""
+
+    playground_id: str
+    playground_commit_id: str
+    student: str
+    files: tuple
 
 
 @dataclass(frozen=True)
 class Submission:
-    """Immutable metadata for one Student/Release/Work-commit record."""
+    """One stored Submission without its files."""
 
     id: str
-    release_id: str
-    student_id: str
-    student_username: str
-    work_commit_id: str
+    playground_id: str
+    playground_commit_id: str
+    student: str
     created_at: str
 
 
-def submission_to_mapping(submission):
-    """Return the canonical camelCase mapping for a Submission.
+@dataclass(frozen=True)
+class StoredSubmission:
+    """One stored Submission with the exact files that were handed in."""
 
-    ``username`` exposes the submitting Student's account name so a Teacher
-    reading a Submission list can identify the Student without a second
-    account lookup.  It is never Work source content.
-    """
-    return {
-        "id": submission.id,
-        "releaseId": submission.release_id,
-        "studentId": submission.student_id,
-        "username": submission.student_username,
-        "workCommitId": submission.work_commit_id,
-        "createdAt": submission.created_at,
-    }
-
-
-# --- validation helpers ----------------------------------------------------
-
-
-def _format_time(value):
-    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    submission: Submission
+    files: tuple
 
 
 def _now():
-    return _format_time(datetime.now(timezone.utc))
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _normalize_now(value):
-    """Return a canonical UTC RFC3339 string for the boundary comparison."""
-
-    if value is None:
-        return _now()
-    if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise InvalidSubmissionRequestError(
-                "now must include a timezone"
-            )
-        moment = value
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise InvalidSubmissionRequestError("now must not be empty")
-        if text.endswith("Z") or text.endswith("z"):
-            text = text[:-1] + "+00:00"
-        try:
-            moment = datetime.fromisoformat(text)
-        except ValueError as error:
-            raise InvalidSubmissionRequestError(
-                "now must be an RFC3339 timestamp"
-            ) from error
-        if moment.tzinfo is None or moment.utcoffset() is None:
-            raise InvalidSubmissionRequestError(
-                "now must include a timezone"
-            )
-    else:
-        raise InvalidSubmissionRequestError(
-            "now must be a timestamp or RFC3339 string"
-        )
-    return _format_time(moment.astimezone(timezone.utc))
-
-
-def _require_student(actor):
-    if not isinstance(actor, accounts.User):
-        raise accounts.ForbiddenActionError("valid account required")
-    if actor.role != "student":
-        raise accounts.ForbiddenActionError("student role required")
-    return actor
-
-
-def _require_actor(actor):
-    if not isinstance(actor, accounts.User):
-        raise accounts.ForbiddenActionError("valid account required")
-    return actor
-
-
-def _require_identifier(value, field):
-    if not isinstance(value, str) or not value:
-        raise InvalidSubmissionRequestError(
-            f"{field} must be a non-empty string"
-        )
+def _require_playground_id(value):
+    if not repository_module.valid_playground_id(value):
+        raise InvalidSubmissionRequestError("playgroundId is not valid")
     return value
 
 
 def _require_commit_id(value):
-    value = _require_identifier(value, "workCommitId")
-    if _COMMIT_ID_PATTERN.match(value) is None:
-        raise InvalidSubmissionRequestError(
-            "workCommitId must be a Git object id"
-        )
+    if type(value) is not str or _COMMIT_ID_PATTERN.match(value) is None:
+        raise InvalidSubmissionRequestError("commitId is not a commit id")
     return value
 
 
-def _require_repository(repository):
-    if not isinstance(repository, repository_module.Repository):
-        raise InvalidSubmissionRequestError("repository adapter required")
-    return repository
+def _require_student(value):
+    if type(value) is not str:
+        raise InvalidSubmissionRequestError("student must be a string")
+    student = value.strip()
+    if not student or len(student) > MAX_STUDENT_LENGTH:
+        raise InvalidSubmissionRequestError("student must be 1..128 characters")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in student):
+        raise InvalidSubmissionRequestError("student must not carry control characters")
+    return student
 
 
-# --- database lookups ------------------------------------------------------
+def decode_submission_request(payload):
+    """Validate a submission body and return a normalized request.
 
-
-def _require_release(connection, release_id):
-    row = connection.execute(
-        "SELECT * FROM releases WHERE id = ?", (release_id,)
-    ).fetchone()
-    if row is None:
-        raise UnknownReleaseError(release_id)
-    return row
-
-
-def _current_class_id(connection, student_id):
-    row = connection.execute(
-        "SELECT class_id FROM class_memberships WHERE student_id = ?",
-        (student_id,),
-    ).fetchone()
-    return None if row is None else row["class_id"]
-
-
-def release_ids_for_work_commit(connection, student_id, work_commit_id):
-    """Return the Release ids of one Student's Submissions of one Work commit.
-
-    This is the narrow lookup used by the centralized content authorization.
-    It reads only the real ``submissions`` table; an unknown or malformed input
-    yields an empty list, so the caller fails closed when no row matches.
+    The file set is checked with :func:`works.validate_work_files`: only
+    portable ``work/**`` paths, bounded count, bounded per-file and total
+    bytes, no duplicate or case-colliding path.  Nothing is returned unless
+    the whole body passes.
     """
 
-    if not isinstance(student_id, str) or not student_id:
-        return []
-    if not isinstance(work_commit_id, str) or not work_commit_id:
-        return []
-    rows = connection.execute(
-        """
-        SELECT release_id FROM submissions
-        WHERE student_id = ? AND work_commit_id = ?
-        """,
-        (student_id, work_commit_id),
-    ).fetchall()
-    return [row["release_id"] for row in rows]
+    if type(payload) is not dict:
+        raise InvalidSubmissionRequestError("body must be an object")
 
+    playground_id = _require_playground_id(payload.get("playgroundId"))
+    playground_commit_id = _require_commit_id(payload.get("commitId"))
+    student = _require_student(payload.get("student"))
 
-def _submission_from_row(row):
-    return Submission(
-        id=row["id"],
-        release_id=row["release_id"],
-        student_id=row["student_id"],
-        student_username=row["username"],
-        work_commit_id=row["work_commit_id"],
-        created_at=row["created_at"],
-    )
+    files = payload.get("files")
+    if type(files) is not dict:
+        raise InvalidSubmissionRequestError("files must be an object")
 
-
-# --- Work history and Server-owned metadata --------------------------------
-
-
-def _work_commit_in_history(
-    repository, playground_id, student_id, work_commit_id
-):
-    """Return whether the exact commit is reachable from the Work ref.
-
-    Only the derived Work ref is used.  The Work ref is never resolved to its
-    HEAD and substituted for the supplied commit; ``merge-base --is-ancestor``
-    answers whether the exact object is part of that history.
-    """
+    entries = []
+    for path, text in files.items():
+        if type(text) is not str:
+            raise InvalidSubmissionRequestError("each file must be text")
+        entries.append(works.WorkEntry(path, text.encode("utf-8")))
 
     try:
-        ref = repository.work_ref(playground_id, student_id)
-    except repository_module.RepositoryError:
-        return False
-    completed = repository_module._run_git(
-        ("merge-base", "--is-ancestor", work_commit_id, ref),
-        cwd=repository.path,
+        normalized = works.validate_work_files(entries)
+    except works.WorkValidationError as error:
+        raise InvalidSubmissionRequestError(
+            f"invalid files: {error.reason}"
+        ) from error
+
+    texts = {path: data.decode("utf-8") for path, data in normalized.items()}
+    return SubmissionRequest(
+        playground_id=playground_id,
+        playground_commit_id=playground_commit_id,
+        student=student,
+        files=tuple(sorted(texts.items())),
     )
-    return completed.returncode == 0
 
 
-def _work_pinned_playground_commit(repository, work_commit_id):
-    """Return the Playground commit pinned by the Work commit, or ``None``.
+def _require_published_commit(connection, repository, request):
+    """Fail unless the named commit is in that Playground's own history."""
 
-    The Work domain owns the ``.picopg/work.json`` reader; it is imported here
-    lazily so the Submission and Work modules do not form an import cycle.
-    """
-
-    import works
-
-    try:
-        return works._read_base_work_playground_commit_id(
-            repository, work_commit_id
-        )
-    except (works.WorkError, repository_module.RepositoryError):
-        return None
-
-
-# --- creation --------------------------------------------------------------
-
-
-def _authorize_membership(connection, student_id, release):
-    if _current_class_id(connection, student_id) != release["class_id"]:
-        raise accounts.ForbiddenActionError(
-            "student is not a member of the release class"
-        )
-
-
-def _authorize_open(release, evaluated_at):
-    if release["open_at"] > evaluated_at:
-        raise SubmissionNotAllowedError("release is not open")
-
-
-def _authorize_due(release, evaluated_at):
-    if not release["requires_submission"] or release["due_at"] is None:
-        return
-    if evaluated_at > release["due_at"]:
-        raise SubmissionNotAllowedError("submission is past due")
-
-
-def _authorize_work_commit(repository, release, student_id, work_commit_id):
-    if not _work_commit_in_history(
-        repository, release["playground_id"], student_id, work_commit_id
+    if playgrounds.get_playground(connection, request.playground_id) is None:
+        raise UnknownPlaygroundError("playground does not exist")
+    if not repository_module.commit_in_playground_history(
+        repository, request.playground_id, request.playground_commit_id
     ):
-        raise UnknownWorkCommitError(
-            "work commit is not on the student's work history"
-        )
-    if (
-        _work_pinned_playground_commit(repository, work_commit_id)
-        != release["playground_commit_id"]
-    ):
-        raise UnknownWorkCommitError(
-            "work commit pins a different playground commit"
-        )
-
-
-def _insert_submission(
-    connection, release_id, student_id, student_username, work_commit_id
-):
-    submission = Submission(
-        id=uuid.uuid4().hex,
-        release_id=release_id,
-        student_id=student_id,
-        student_username=student_username,
-        work_commit_id=work_commit_id,
-        created_at=_now(),
-    )
-    connection.execute(
-        """
-        INSERT INTO submissions (
-            id, release_id, student_id, work_commit_id, created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            submission.id,
-            submission.release_id,
-            submission.student_id,
-            submission.work_commit_id,
-            submission.created_at,
-        ),
-    )
-    return submission
+        raise UnknownPlaygroundError("commit is not published")
 
 
 def create_submission(
     connection,
-    actor,
     repository,
-    release_id,
-    work_commit_id,
+    request,
     request_key,
     now=None,
 ):
-    """Create one immutable Submission, idempotently, in a single transaction.
+    """Create one immutable Submission, idempotently, in one transaction.
 
-    Only the Student actor may submit, and only for their own Work.  The
-    Student must currently be a member of the Release Class, the Release must
-    be open, and a required Submission must not be past due.  The supplied
-    commit must be on the Student's own Work history and its Server-owned
-    metadata must pin the exact Playground commit fixed by the Release.  The
-    row and the idempotency result commit or roll back together, so an exact
-    retry returns the stored ``201`` body and a changed body raises
+    The Playground row and the published-commit check run inside the same
+    transaction as the row insert, so a submission can only ever reference
+    content this server actually publishes.  The row and the idempotency result
+    commit or roll back together, so an exact retry returns the stored ``201``
+    body and a changed body raises
     :class:`idempotency.IdempotencyConflict`.
     """
 
-    actor = _require_student(actor)
-    release_id = _require_identifier(release_id, "releaseId")
-    work_commit_id = _require_commit_id(work_commit_id)
-    repository = _require_repository(repository)
-    evaluated_at = _normalize_now(now)
+    if type(request) is not SubmissionRequest:
+        raise InvalidSubmissionRequestError("a decoded request is required")
 
-    endpoint = SUBMISSION_CREATE_ENDPOINT
-    request = {
-        "releaseId": release_id,
-        "workCommitId": work_commit_id,
+    logical_request = {
+        "playgroundId": request.playground_id,
+        "commitId": request.playground_commit_id,
+        "student": request.student,
+        "files": dict(request.files),
     }
 
     def callback(business_connection):
-        release = _require_release(business_connection, release_id)
-        _authorize_membership(business_connection, actor.id, release)
-        _authorize_open(release, evaluated_at)
-        _authorize_due(release, evaluated_at)
-        _authorize_work_commit(
-            repository, release, actor.id, work_commit_id
-        )
-        submission = _insert_submission(
-            business_connection,
-            release_id,
-            actor.id,
-            actor.username,
-            work_commit_id,
-        )
-        return 201, {"submission": submission_to_mapping(submission)}
+        _require_published_commit(business_connection, repository, request)
 
-    return idempotency.execute(
-        connection, actor.id, endpoint, request_key, request, callback
-    )
-
-
-# --- reads -----------------------------------------------------------------
-
-
-def list_submissions(
-    connection, actor, *, release_id=None, limit=50, after=None
-):
-    """Return one bounded page ordered by ``(created_at, id)``.
-
-    A Student sees only their own records, a Teacher sees only records under
-    Releases in Classes they own, and an Admin sees all Submission metadata.
-    ``release_id`` filters to one Release and is the route binding for the
-    release-scoped endpoint.  No role reveals Work source content.
-    """
-
-    _require_actor(actor)
-    after_created = None
-    after_id = None
-    if after is not None:
-        if type(after) is not list or len(after) != 2:
-            raise ValueError("invalid cursor")
-        after_created, after_id = after
-
-    conditions = []
-    parameters = []
-    joins = (
-        " JOIN users ON users.id = submissions.student_id"
-    )
-    if actor.role == "teacher":
-        joins += (
-            " JOIN releases ON releases.id = submissions.release_id"
-            " JOIN classes ON classes.id = releases.class_id"
-        )
-        conditions.append("classes.teacher_id = ?")
-        parameters.append(actor.id)
-    elif actor.role == "student":
-        conditions.append("submissions.student_id = ?")
-        parameters.append(actor.id)
-    elif actor.role == "admin":
-        pass
-    else:
-        raise accounts.ForbiddenActionError("unknown role")
-
-    if release_id is not None:
-        conditions.append("submissions.release_id = ?")
-        parameters.append(release_id)
-    if after_created is not None:
-        conditions.append(
-            "(submissions.created_at > ? OR"
-            " (submissions.created_at = ? AND submissions.id > ?))"
-        )
-        parameters.extend([after_created, after_created, after_id])
-
-    where = " WHERE " + " AND ".join(conditions) if conditions else ""
-    parameters.append(limit + 1)
-    rows = connection.execute(
-        "SELECT submissions.*, users.username AS username"
-        " FROM submissions"
-        f"{joins}{where}"
-        " ORDER BY submissions.created_at, submissions.id LIMIT ?",
-        parameters,
-    ).fetchall()
-
-    page_rows = rows[:limit]
-    next_key = (
-        [page_rows[-1]["created_at"], page_rows[-1]["id"]]
-        if len(rows) > limit
-        else None
-    )
-    return Page(
-        items=tuple(_submission_from_row(row) for row in page_rows),
-        next_key=next_key,
-    )
-
-
-def _row_is_visible(connection, actor, row):
-    if actor.role == "admin":
-        return True
-    if actor.role == "teacher":
-        owner = connection.execute(
+        submission_id = uuid.uuid4().hex
+        created_at = now or _now()
+        business_connection.execute(
             """
-            SELECT classes.teacher_id
-            FROM releases
-            JOIN classes ON classes.id = releases.class_id
-            WHERE releases.id = ?
+            INSERT INTO submissions (
+                id, playground_id, playground_commit_id, student,
+                files_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (row["release_id"],),
-        ).fetchone()
-        return owner is not None and owner["teacher_id"] == actor.id
-    if actor.role == "student":
-        return row["student_id"] == actor.id
-    raise accounts.ForbiddenActionError("unknown role")
+            (
+                submission_id,
+                request.playground_id,
+                request.playground_commit_id,
+                request.student,
+                json.dumps(dict(request.files), ensure_ascii=False, sort_keys=True),
+                created_at,
+            ),
+        )
+        stored = Submission(
+            id=submission_id,
+            playground_id=request.playground_id,
+            playground_commit_id=request.playground_commit_id,
+            student=request.student,
+            created_at=created_at,
+        )
+        return 201, {"submission": submission_to_mapping(stored)}
+
+    status, response = idempotency.execute(
+        connection,
+        request.student,
+        SUBMISSION_CREATE_ENDPOINT,
+        request_key,
+        logical_request,
+        callback,
+    )
+    return status, response
 
 
-@dataclass(frozen=True)
-class SubmissionReview:
-    """The exact immutable facts needed to review one Submission's Work."""
+def _submission_from_row(row):
+    """Return the Submission a durable row describes, or fail closed."""
 
-    submission_id: str
-    student_id: str
-    work_commit_id: str
-    playground_id: str
-    playground_commit_id: str
+    try:
+        submission_id = row["id"]
+        playground_id = row["playground_id"]
+        playground_commit_id = row["playground_commit_id"]
+        student = row["student"]
+        created_at = row["created_at"]
+    except (IndexError, KeyError) as error:
+        raise StoredSubmissionError("stored submission is invalid") from error
+
+    if (
+        type(submission_id) is not str
+        or not submission_id
+        or not repository_module.valid_playground_id(playground_id)
+        or type(playground_commit_id) is not str
+        or _COMMIT_ID_PATTERN.match(playground_commit_id) is None
+        or type(student) is not str
+        or not student
+        or type(created_at) is not str
+        or not created_at
+    ):
+        raise StoredSubmissionError("stored submission is invalid")
+
+    return Submission(
+        id=submission_id,
+        playground_id=playground_id,
+        playground_commit_id=playground_commit_id,
+        student=student,
+        created_at=created_at,
+    )
 
 
-def review_submission(connection, actor, repository, submission_id):
-    """Authorize one exact Submission for Work source review.
+def get_submission(connection, submission_id):
+    """Return one Submission with its files, or raise ``MissingSubmissionError``."""
 
-    Only the Student recorded on this exact Submission and the current owner
-    Teacher of the Class reached through its immutable Release may review.
-    Admin is deliberately denied source access.  Every missing, unknown, or
-    unauthorized target raises :class:`MissingSubmissionError`, so the caller
-    returns one hidden response.
-
-    The stored Work commit is revalidated against the exact Work ref and the
-    Release's pinned Playground commit; a durable inconsistency raises
-    :class:`SubmissionIntegrityError` instead of serving partial content.
-    """
-
-    _require_actor(actor)
-    _require_repository(repository)
-    submission_id = _require_identifier(submission_id, "submissionId")
+    if type(submission_id) is not str or not submission_id:
+        raise MissingSubmissionError("submission does not exist")
 
     row = connection.execute(
-        """
-        SELECT submissions.id,
-               submissions.student_id,
-               submissions.work_commit_id,
-               releases.playground_id,
-               releases.playground_commit_id,
-               classes.teacher_id
-        FROM submissions
-        JOIN releases ON releases.id = submissions.release_id
-        JOIN classes ON classes.id = releases.class_id
-        WHERE submissions.id = ?
-        """,
+        "SELECT id, playground_id, playground_commit_id, student,"
+        " files_json, created_at FROM submissions WHERE id = ?",
         (submission_id,),
     ).fetchone()
     if row is None:
-        raise MissingSubmissionError(submission_id)
+        raise MissingSubmissionError("submission does not exist")
 
-    if actor.role == "student":
-        if row["student_id"] != actor.id:
-            raise MissingSubmissionError(submission_id)
-    elif actor.role == "teacher":
-        if row["teacher_id"] != actor.id:
-            raise MissingSubmissionError(submission_id)
-    else:
-        raise MissingSubmissionError(submission_id)
-
-    playground_id = row["playground_id"]
-    work_commit_id = row["work_commit_id"]
-    if not _work_commit_in_history(
-        repository, playground_id, row["student_id"], work_commit_id
+    submission = _submission_from_row(row)
+    try:
+        files = json.loads(row["files_json"])
+    except (TypeError, ValueError) as error:
+        raise StoredSubmissionError("stored submission is invalid") from error
+    if type(files) is not dict or any(
+        type(path) is not str or type(text) is not str
+        for path, text in files.items()
     ):
-        raise SubmissionIntegrityError("submitted Work commit is not reachable")
-    if (
-        _work_pinned_playground_commit(repository, work_commit_id)
-        != row["playground_commit_id"]
-    ):
-        raise SubmissionIntegrityError("submitted Work pin is inconsistent")
+        raise StoredSubmissionError("stored submission is invalid")
 
-    return SubmissionReview(
-        submission_id=submission_id,
-        student_id=row["student_id"],
-        work_commit_id=work_commit_id,
-        playground_id=playground_id,
-        playground_commit_id=row["playground_commit_id"],
+    return StoredSubmission(
+        submission=submission,
+        files=tuple(sorted(files.items())),
     )
 
 
-def get_submission(connection, actor, submission_id):
-    """Return one visible Submission, hiding missing and unauthorized rows."""
+def list_submissions(connection, *, limit, after=None):
+    """Return one keyset page of submissions, newest first.
 
-    _require_actor(actor)
-    submission_id = _require_identifier(submission_id, "submissionId")
+    The bound is applied at the authoritative query with ``LIMIT limit + 1``,
+    so a page never grows past the caller's limit.  A durable row that cannot
+    be represented fails closed instead of being silently skipped.
+    """
 
-    row = connection.execute(
-        """
-        SELECT submissions.*, users.username AS username
-        FROM submissions
-        JOIN users ON users.id = submissions.student_id
-        WHERE submissions.id = ?
-        """,
-        (submission_id,),
-    ).fetchone()
-    if row is None or not _row_is_visible(connection, actor, row):
-        raise MissingSubmissionError(submission_id)
-    return _submission_from_row(row)
+    if type(limit) is not int or limit <= 0:
+        raise InvalidSubmissionRequestError("limit must be positive")
+
+    after_key = None
+    if after is not None:
+        after_key = after if isinstance(after, tuple) else tuple(after)
+        if len(after_key) != 2:
+            raise InvalidSubmissionRequestError("cursor is not valid")
+
+    if after_key is None:
+        rows = connection.execute(
+            "SELECT id, playground_id, playground_commit_id, student,"
+            " files_json, created_at FROM submissions"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit + 1,),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            "SELECT id, playground_id, playground_commit_id, student,"
+            " files_json, created_at FROM submissions"
+            " WHERE (created_at, id) < (?, ?)"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (after_key[0], after_key[1], limit + 1),
+        ).fetchall()
+
+    items = tuple(_submission_from_row(row) for row in rows[:limit])
+    next_key = None
+    if len(rows) > limit:
+        next_key = (items[-1].created_at, items[-1].id)
+    return Page(items=items, next_key=next_key)
+
+
+def submission_to_mapping(submission, files=None):
+    """Return the bounded JSON view of one Submission."""
+
+    if type(submission) is not Submission:
+        raise StoredSubmissionError("stored submission is invalid")
+
+    mapping = {
+        "id": submission.id,
+        "playgroundId": submission.playground_id,
+        "commitId": submission.playground_commit_id,
+        "student": submission.student,
+        "createdAt": submission.created_at,
+    }
+    if files is not None:
+        mapping["files"] = [
+            {"path": path, "text": text} for path, text in files
+        ]
+    return mapping

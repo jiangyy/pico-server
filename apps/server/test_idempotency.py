@@ -29,26 +29,25 @@ class IdempotencyTest(unittest.TestCase):
         self.addCleanup(connection.close)
         return connection
 
-    def create_user(self, connection, user_id="actor-1", username="actor"):
+    def create_playground(self, connection, playground_id="pg-1"):
+        """Insert a business row; the scope is a name, not a foreign key."""
+
         connection.execute(
-            """
-            INSERT INTO users (id, username, role, password_hash, created_at)
-            VALUES (?, ?, 'teacher', 'hash', '2026-09-15T00:00:00Z')
-            """,
-            (user_id, username),
+            "INSERT INTO playgrounds (id, created_at) VALUES (?, ?)",
+            (playground_id, "2026-09-15T00:00:00Z"),
         )
 
     def count(self, connection, table):
         return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
-    def count_business_user(self, connection, user_id):
+    def count_business_playground(self, connection, playground_id):
         return connection.execute(
-            "SELECT COUNT(*) FROM users WHERE id = ?", (user_id,)
+            "SELECT COUNT(*) FROM playgrounds WHERE id = ?", (playground_id,)
         ).fetchone()[0]
 
     def test_exact_retry_returns_stored_result_without_callback(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
         calls = []
 
@@ -86,7 +85,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_same_key_with_different_request_conflicts(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
         calls = []
 
@@ -109,8 +108,8 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_actor_scope_is_isolated(self):
         connection = self.open()
-        self.create_user(connection, user_id="actor-1", username="actor-1")
-        self.create_user(connection, user_id="actor-2", username="actor-2")
+        self.create_playground(connection, "pg-1")
+        self.create_playground(connection, "pg-2")
         connection.commit()
 
         first = execute(
@@ -128,7 +127,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_endpoint_scope_is_isolated(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         first = execute(
@@ -146,11 +145,11 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_success_commits_business_row_and_result_together(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         def callback(conn):
-            self.create_user(conn, user_id="business-1", username="business")
+            self.create_playground(conn, "pg-business-1")
             return 201, {"id": "business-1"}
 
         result = execute(
@@ -159,16 +158,16 @@ class IdempotencyTest(unittest.TestCase):
         )
 
         self.assertEqual(result, (201, {"id": "business-1"}))
-        self.assertEqual(self.count_business_user(connection, "business-1"), 1)
+        self.assertEqual(self.count_business_playground(connection, "pg-business-1"), 1)
         self.assertEqual(self.count(connection, "idempotency_results"), 1)
 
     def test_callback_failure_rolls_back_business_and_result(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         def callback(conn):
-            self.create_user(conn, user_id="business-1", username="business")
+            self.create_playground(conn, "pg-business-1")
             raise RuntimeError("business failure")
 
         with self.assertRaises(RuntimeError):
@@ -177,12 +176,12 @@ class IdempotencyTest(unittest.TestCase):
                 {"name": "A"}, callback,
             )
 
-        self.assertEqual(self.count_business_user(connection, "business-1"), 0)
+        self.assertEqual(self.count_business_playground(connection, "pg-business-1"), 0)
         self.assertEqual(self.count(connection, "idempotency_results"), 0)
 
     def test_failed_attempt_does_not_poison_retry(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         def failing(conn):
@@ -203,11 +202,11 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_invalid_callback_result_rolls_back_business_row(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         def callback(conn):
-            self.create_user(conn, user_id="business-1", username="business")
+            self.create_playground(conn, "pg-business-1")
             return 201, {"bad": object()}
 
         with self.assertRaises(IdempotencyRequestError):
@@ -216,12 +215,12 @@ class IdempotencyTest(unittest.TestCase):
                 {"name": "A"}, callback,
             )
 
-        self.assertEqual(self.count_business_user(connection, "business-1"), 0)
+        self.assertEqual(self.count_business_playground(connection, "pg-business-1"), 0)
         self.assertEqual(self.count(connection, "idempotency_results"), 0)
 
     def test_empty_and_oversized_scope_is_rejected_before_work(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
         calls = []
 
@@ -247,7 +246,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_scope_at_maximum_length_is_accepted(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         result = execute(
@@ -263,7 +262,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_oversized_request_is_rejected_before_callback(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
         calls = []
 
@@ -301,7 +300,7 @@ class IdempotencyTest(unittest.TestCase):
 
     def test_stored_response_is_json_without_secret_or_raw_body(self):
         connection = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         execute(
@@ -333,7 +332,7 @@ class IdempotencyTest(unittest.TestCase):
     def test_concurrent_attempt_resolves_through_unique_constraint(self):
         connection = self.open()
         other = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         def winner(conn):
@@ -346,7 +345,7 @@ class IdempotencyTest(unittest.TestCase):
                 other, "actor-1", "/playgrounds", "key-1",
                 {"name": "A"}, winner,
             )
-            self.create_user(conn, user_id="business-1", username="business")
+            self.create_playground(conn, "pg-business-1")
             return 500, {"id": "loser"}
 
         result = execute(
@@ -355,7 +354,7 @@ class IdempotencyTest(unittest.TestCase):
         )
 
         self.assertEqual(result, (201, {"id": "winner"}))
-        self.assertEqual(self.count_business_user(connection, "business-1"), 0)
+        self.assertEqual(self.count_business_playground(connection, "pg-business-1"), 0)
         self.assertEqual(self.count(connection, "idempotency_results"), 1)
         stored = connection.execute(
             "SELECT response_json FROM idempotency_results"
@@ -365,7 +364,7 @@ class IdempotencyTest(unittest.TestCase):
     def test_concurrent_attempt_with_different_request_conflicts(self):
         connection = self.open()
         other = self.open()
-        self.create_user(connection)
+        self.create_playground(connection)
         connection.commit()
 
         def loser(conn):

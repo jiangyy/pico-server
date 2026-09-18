@@ -7,7 +7,7 @@ from pathlib import Path
 import permissions
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 1
 
 
 class SchemaValidationError(RuntimeError):
@@ -40,38 +40,9 @@ _TABLE_COLUMNS = {
         "version": (1, 0),
         "applied_at": (0, 1),
     },
-    "users": {
-        "id": (1, 0),
-        "username": (0, 1),
-        "role": (0, 1),
-        "password_hash": (0, 1),
-        "created_at": (0, 1),
-    },
-    "sessions": {
-        "token_hash": (1, 0),
-        "user_id": (0, 1),
-        "created_at": (0, 1),
-        "expires_at": (0, 1),
-        "revoked_at": (0, 0),
-    },
-    "classes": {
-        "id": (1, 0),
-        "name": (0, 1),
-        "teacher_id": (0, 1),
-        "created_at": (0, 1),
-        "archived_at": (0, 0),
-    },
-    "class_memberships": {
-        "student_id": (1, 0),
-        "class_id": (0, 1),
-        "joined_at": (0, 1),
-    },
     "playgrounds": {
         "id": (1, 0),
-        "creator_id": (0, 1),
-        "policy": (0, 1),
         "created_at": (0, 1),
-        "archived_at": (0, 0),
     },
     "idempotency_results": {
         "actor_id": (1, 1),
@@ -82,73 +53,45 @@ _TABLE_COLUMNS = {
         "response_json": (0, 1),
         "created_at": (0, 1),
     },
-    "releases": {
-        "id": (1, 1),
-        "class_id": (0, 1),
-        "playground_id": (0, 1),
-        "playground_commit_id": (0, 1),
-        "created_by": (0, 1),
-        "open_at": (0, 1),
-        "due_at": (0, 0),
-        "requires_submission": (0, 1),
-        "created_at": (0, 1),
-    },
     "submissions": {
         "id": (1, 1),
-        "release_id": (0, 1),
-        "student_id": (0, 1),
-        "work_commit_id": (0, 1),
-        "created_at": (0, 1),
-    },
-    "comments": {
-        "id": (1, 1),
-        "submission_id": (0, 1),
-        "author_user_id": (0, 0),
-        "source": (0, 1),
-        "body": (0, 1),
+        "playground_id": (0, 1),
+        "playground_commit_id": (0, 1),
+        "student": (0, 1),
+        "files_json": (0, 1),
         "created_at": (0, 1),
     },
 }
 
-# A table dropped by migration 10 must not reappear at the current version.
-_FORBIDDEN_TABLES = frozenset({"publisher_grants"})
+# Tables that a previous schema had and this one must not have: a durable row
+# here would mean the database was never migrated to the current model.
+_FORBIDDEN_TABLES = frozenset(
+    {
+        "users",
+        "sessions",
+        "classes",
+        "class_memberships",
+        "publisher_grants",
+        "releases",
+        "comments",
+    }
+)
 
 # ``(table, column, referenced table, referenced column, on-delete action)``
 _FOREIGN_KEYS = (
-    ("sessions", "user_id", "users", "id", "CASCADE"),
-    ("classes", "teacher_id", "users", "id", "RESTRICT"),
-    ("class_memberships", "student_id", "users", "id", "RESTRICT"),
-    ("class_memberships", "class_id", "classes", "id", "RESTRICT"),
-    ("playgrounds", "creator_id", "users", "id", "RESTRICT"),
-    ("idempotency_results", "actor_id", "users", "id", "CASCADE"),
-    ("releases", "class_id", "classes", "id", "RESTRICT"),
-    ("releases", "playground_id", "playgrounds", "id", "RESTRICT"),
-    ("releases", "created_by", "users", "id", "RESTRICT"),
-    ("submissions", "release_id", "releases", "id", "RESTRICT"),
-    ("submissions", "student_id", "users", "id", "RESTRICT"),
-    ("comments", "submission_id", "submissions", "id", "RESTRICT"),
-    ("comments", "author_user_id", "users", "id", "RESTRICT"),
+    ("submissions", "playground_id", "playgrounds", "id", "RESTRICT"),
 )
 
 # Exact ordered column names for every index a production query relies on.
 _REQUIRED_INDEXES = {
-    "sessions_user_id_idx": ("sessions", ("user_id",)),
-    "classes_teacher_id_idx": ("classes", ("teacher_id",)),
-    "class_memberships_class_id_idx": (
-        "class_memberships",
-        ("class_id",),
+    "playgrounds_created_at_idx": ("playgrounds", ("created_at",)),
+    "idempotency_results_created_at_idx": (
+        "idempotency_results",
+        ("created_at",),
     ),
-    "playgrounds_creator_id_idx": ("playgrounds", ("creator_id",)),
-    "releases_class_id_idx": ("releases", ("class_id",)),
-    "releases_playground_commit_id_idx": (
-        "releases",
-        ("playground_id", "playground_commit_id"),
-    ),
-    "submissions_release_id_idx": ("submissions", ("release_id",)),
-    "submissions_student_id_idx": ("submissions", ("student_id",)),
-    "comments_submission_id_created_at_idx": (
-        "comments",
-        ("submission_id", "created_at", "id"),
+    "submissions_playground_idx": (
+        "submissions",
+        ("playground_id", "created_at"),
     ),
 }
 
@@ -181,6 +124,14 @@ def open_database(path):
 
 
 def _initialize_schema(connection):
+    """Create the current schema in one step.
+
+    The model is small enough that one version describes it exactly: there is
+    no account, class, or release history to migrate forward.  A database from
+    an earlier model is rejected by :func:`validate_schema` instead of being
+    silently half-migrated.
+    """
+
     with connection:
         connection.execute("BEGIN")
         connection.execute(
@@ -200,114 +151,23 @@ def _initialize_schema(connection):
             raise SchemaValidationError("migration")
 
         if version < 1:
-            _record_migration(connection, 1)
-
-        if version < 2:
-            connection.execute(
-                """
-                CREATE TABLE users (
-                    id TEXT PRIMARY KEY,
-                    username TEXT NOT NULL UNIQUE,
-                    role TEXT NOT NULL
-                        CHECK (role IN ('student', 'teacher', 'admin')),
-                    password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            _record_migration(connection, 2)
-
-        if version < 3:
-            connection.execute(
-                """
-                CREATE TABLE sessions (
-                    token_hash TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    revoked_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX sessions_user_id_idx ON sessions(user_id)"
-            )
-            _record_migration(connection, 3)
-
-        if version < 4:
-            connection.execute(
-                """
-                CREATE TABLE classes (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL CHECK (name <> ''),
-                    teacher_id TEXT NOT NULL
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    created_at TEXT NOT NULL,
-                    archived_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE class_memberships (
-                    student_id TEXT PRIMARY KEY
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    class_id TEXT NOT NULL
-                        REFERENCES classes(id) ON DELETE RESTRICT,
-                    joined_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX classes_teacher_id_idx ON classes(teacher_id)"
-            )
-            connection.execute(
-                "CREATE INDEX class_memberships_class_id_idx "
-                "ON class_memberships(class_id)"
-            )
-            _record_migration(connection, 4)
-
-        if version < 5:
             connection.execute(
                 """
                 CREATE TABLE playgrounds (
                     id TEXT PRIMARY KEY,
-                    creator_id TEXT NOT NULL
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    policy TEXT NOT NULL DEFAULT 'release_only'
-                        CHECK (policy IN ('release_only', 'public')),
-                    created_at TEXT NOT NULL,
-                    archived_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE publisher_grants (
-                    user_id TEXT PRIMARY KEY
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    granted_by TEXT NOT NULL
-                        REFERENCES users(id) ON DELETE RESTRICT,
                     created_at TEXT NOT NULL
                 )
                 """
             )
             connection.execute(
-                "CREATE INDEX playgrounds_creator_id_idx "
-                "ON playgrounds(creator_id)"
+                "CREATE INDEX playgrounds_created_at_idx "
+                "ON playgrounds(created_at)"
             )
-            connection.execute(
-                "CREATE INDEX publisher_grants_granted_by_idx "
-                "ON publisher_grants(granted_by)"
-            )
-            _record_migration(connection, 5)
-
-        if version < 6:
             connection.execute(
                 """
                 CREATE TABLE idempotency_results (
                     actor_id TEXT NOT NULL
-                        REFERENCES users(id) ON DELETE CASCADE,
+                        CHECK (actor_id <> '' AND length(actor_id) <= 255),
                     endpoint TEXT NOT NULL
                         CHECK (endpoint <> '' AND length(endpoint) <= 255),
                     request_key TEXT NOT NULL
@@ -322,89 +182,30 @@ def _initialize_schema(connection):
                 )
                 """
             )
-            _record_migration(connection, 6)
-
-        if version < 7:
             connection.execute(
-                """
-                CREATE TABLE releases (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    class_id TEXT NOT NULL
-                        REFERENCES classes(id) ON DELETE RESTRICT,
-                    playground_id TEXT NOT NULL
-                        REFERENCES playgrounds(id) ON DELETE RESTRICT,
-                    playground_commit_id TEXT NOT NULL
-                        CHECK (playground_commit_id <> ''),
-                    created_by TEXT NOT NULL
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    open_at TEXT NOT NULL,
-                    due_at TEXT,
-                    requires_submission INTEGER NOT NULL
-                        CHECK (requires_submission IN (0, 1)),
-                    created_at TEXT NOT NULL
-                )
-                """
+                "CREATE INDEX idempotency_results_created_at_idx "
+                "ON idempotency_results(created_at)"
             )
-            connection.execute(
-                "CREATE INDEX releases_class_id_idx ON releases(class_id)"
-            )
-            connection.execute(
-                "CREATE INDEX releases_playground_commit_id_idx "
-                "ON releases(playground_id, playground_commit_id)"
-            )
-            _record_migration(connection, 7)
-
-        if version < 8:
             connection.execute(
                 """
                 CREATE TABLE submissions (
                     id TEXT PRIMARY KEY NOT NULL,
-                    release_id TEXT NOT NULL
-                        REFERENCES releases(id) ON DELETE RESTRICT,
-                    student_id TEXT NOT NULL
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    work_commit_id TEXT NOT NULL
-                        CHECK (work_commit_id <> ''),
+                    playground_id TEXT NOT NULL
+                        REFERENCES playgrounds(id) ON DELETE RESTRICT,
+                    playground_commit_id TEXT NOT NULL
+                        CHECK (playground_commit_id <> ''),
+                    student TEXT NOT NULL
+                        CHECK (student <> '' AND length(student) <= 128),
+                    files_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
             connection.execute(
-                "CREATE INDEX submissions_release_id_idx "
-                "ON submissions(release_id)"
+                "CREATE INDEX submissions_playground_idx "
+                "ON submissions(playground_id, created_at)"
             )
-            connection.execute(
-                "CREATE INDEX submissions_student_id_idx "
-                "ON submissions(student_id)"
-            )
-            _record_migration(connection, 8)
-
-        if version < 9:
-            connection.execute(
-                """
-                CREATE TABLE comments (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    submission_id TEXT NOT NULL
-                        REFERENCES submissions(id) ON DELETE RESTRICT,
-                    author_user_id TEXT
-                        REFERENCES users(id) ON DELETE RESTRICT,
-                    source TEXT NOT NULL
-                        CHECK (source IN ('teacher', 'ai', 'system')),
-                    body TEXT NOT NULL CHECK (body <> ''),
-                    created_at TEXT NOT NULL,
-                    CHECK (source <> 'teacher' OR author_user_id IS NOT NULL)
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX comments_submission_id_created_at_idx "
-                "ON comments(submission_id, created_at, id)"
-            )
-            _record_migration(connection, 9)
-
-        if version < 10:
-            connection.execute("DROP TABLE IF EXISTS publisher_grants")
-            _record_migration(connection, 10)
+            _record_migration(connection, 1)
 
         validate_schema(connection)
 

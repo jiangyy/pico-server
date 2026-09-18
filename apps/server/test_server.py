@@ -1,4 +1,9 @@
-"""Tests for the PicoPG HTTP service."""
+"""Tests for the PicoPG HTTP service skeleton.
+
+The feature contract lives in ``test_api.py``.  This file only checks the
+things that hold for every request: the health endpoint, the 404 and 405
+vocabulary, HEAD mirroring, and the bare repository the server is handed.
+"""
 
 import os
 import sys
@@ -13,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from server import ALLOWED_METHODS, make_server  # noqa: E402
 
+OPERATOR_TOKEN = "test-operator-token-value"
+
 
 class ServerTest(unittest.TestCase):
     """Black-box tests against a real server on an ephemeral port."""
@@ -22,21 +29,12 @@ class ServerTest(unittest.TestCase):
         cls.temporary_directory = tempfile.TemporaryDirectory()
         database_path = Path(cls.temporary_directory.name) / "app.db"
         cls.repository_path = Path(cls.temporary_directory.name) / "picopg.git"
-        cls.portal_path = Path(cls.temporary_directory.name) / "portal"
-        cls.portal_path.mkdir()
-        for name, data in {
-            "index.html": b"<!doctype html><title>Pico portal</title>",
-            "styles.css": b"body{margin:0}",
-            "tokens.css": b":root{color-scheme:light}",
-            "pico.svg": b"<svg xmlns='http://www.w3.org/2000/svg'/>",
-        }.items():
-            cls.portal_path.joinpath(name).write_bytes(data)
         cls.server = make_server(
             host="127.0.0.1",
             port=0,
             database_path=database_path,
             repository_path=cls.repository_path,
-            portal_path=cls.portal_path,
+            operator_token=OPERATOR_TOKEN,
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -59,12 +57,6 @@ class ServerTest(unittest.TestCase):
         conn.close()
         return status, headers, data
 
-    def test_homepage(self):
-        status, headers, body = self.request("GET", "/")
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"<!doctype html><title>Pico portal</title>")
-        self.assertIn("default-src 'none'", headers["content-security-policy"])
-
     def test_healthz(self):
         status, _, body = self.request("GET", "/healthz")
         self.assertEqual(status, 200)
@@ -75,27 +67,16 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body, b"not found\n")
 
-    def test_portal_assets_are_served_but_client_bundle_is_not(self):
-        for path in ("/index.html", "/styles.css", "/tokens.css", "/pico.svg"):
-            with self.subTest(path=path):
-                self.assertEqual(self.request("GET", path)[0], 200)
-        for path in ("/main.js", "/picopg.css"):
-            with self.subTest(path=path):
-                self.assertEqual(self.request("GET", path)[0], 404)
-
     def test_head_mirrors_get_headers_without_body(self):
-        status, headers, body = self.request("HEAD", "/")
+        status, headers, body = self.request("HEAD", "/healthz")
         self.assertEqual(status, 200)
         self.assertEqual(body, b"")
-        self.assertEqual(
-            int(headers["content-length"]),
-            len(b"<!doctype html><title>Pico portal</title>"),
-        )
+        self.assertEqual(int(headers["content-length"]), len(b"ok\n"))
 
     def test_unsupported_methods_are_405(self):
-        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        for method in ("PUT", "DELETE", "PATCH"):
             with self.subTest(method=method):
-                status, headers, _ = self.request(method, "/")
+                status, headers, _ = self.request(method, "/healthz")
                 self.assertEqual(status, 405)
                 self.assertEqual(headers["allow"], ", ".join(ALLOWED_METHODS))
 

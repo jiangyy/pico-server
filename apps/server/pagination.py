@@ -20,17 +20,12 @@ from urllib.parse import parse_qs
 
 
 __all__ = [
-    "ADMIN_PLAYGROUNDS_ROUTE",
-    "ADMIN_USERS_ROUTE",
     "CATALOG_ROUTE",
-    "PLAYGROUNDS_ROUTE",
-    "CLASSES_ROUTE",
     "CURSOR_VERSION",
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
     "Page",
     "PaginationError",
-    "RELEASES_ROUTE",
     "SUBMISSIONS_ROUTE",
     "decode_cursor",
     "encode_cursor",
@@ -43,13 +38,8 @@ CURSOR_VERSION = 1
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
 
-ADMIN_USERS_ROUTE = "admin.users"
-ADMIN_PLAYGROUNDS_ROUTE = "admin.playgrounds"
-CLASSES_ROUTE = "classes"
-RELEASES_ROUTE = "releases"
 SUBMISSIONS_ROUTE = "submissions"
 CATALOG_ROUTE = "catalog"
-PLAYGROUNDS_ROUTE = "playgrounds"
 
 _BASE64URL_ALPHABET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"

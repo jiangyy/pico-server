@@ -1,12 +1,11 @@
-"""Tests for rebuildable public caches.
+"""Tests for the rebuildable public caches.
 
 The tests build a real bare repository, real SQLite records and a temporary
 artifacts directory, then exercise deterministic rebuild, delete/rebuild,
-failure before replacement, artifact mutation, and the rule that private
-authorization never depends on the generated cache.
+failure before replacement, and artifact mutation.  A generated cache is a
+derived copy: deleting it must always be recoverable from authority.
 """
 
-import hashlib
 import json
 import os
 import shutil
@@ -20,9 +19,7 @@ from unittest import mock
 # Allow ``import generated`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import accounts  # noqa: E402
 import artifacts  # noqa: E402
-import authorization  # noqa: E402
 import bundles  # noqa: E402
 import generated  # noqa: E402
 import manifests  # noqa: E402
@@ -45,33 +42,13 @@ class GeneratedCacheTest(unittest.TestCase):
         self.artifacts_path = base / "artifacts"
         self.generated_path = base / "generated"
 
-        bootstrap = accounts.User(
-            id="seed-actor",
-            username="seed-actor",
-            role="admin",
-            created_at="2026-01-01T00:00:00Z",
-        )
-        self.admin = accounts.create_user(
-            self.connection,
-            bootstrap,
-            f"admin-{uuid.uuid4().hex[:8]}",
-            "secret",
-            "admin",
-        )
 
     # ----- fixtures ------------------------------------------------------
 
-    def publish(self, playground_id, policy):
+    def publish(self, playground_id, policy=None):
         playground = playgrounds.create_playground(
-            self.connection, self.admin, playground_id
+            self.connection, playground_id
         )
-        if policy == playgrounds.PUBLIC_POLICY:
-            playgrounds.update_playground(
-                self.connection,
-                self.admin,
-                playground_id,
-                {"policy": playgrounds.PUBLIC_POLICY},
-            )
         bundle = bundles.validate_bundle(
             [
                 bundles.BundleEntry("picopg.json", MANIFEST_BYTES),
@@ -83,7 +60,6 @@ class GeneratedCacheTest(unittest.TestCase):
         )
         result = playgrounds.publish_playground(
             self.connection,
-            self.admin,
             playground_id,
             self.repository,
             bundle,
@@ -128,52 +104,8 @@ class GeneratedCacheTest(unittest.TestCase):
 
     # ----- tests ---------------------------------------------------------
 
-    def test_rebuild_writes_public_caches_and_excludes_private(self):
-        public_id = f"public-{uuid.uuid4().hex[:8]}"
-        private_id = f"private-{uuid.uuid4().hex[:8]}"
-        _, public_commit = self.publish(
-            public_id, playgrounds.PUBLIC_POLICY
-        )
-        _, private_commit = self.publish(
-            private_id, playgrounds.RELEASE_ONLY_POLICY
-        )
-        self.write_artifact("v1", "runtime.exe", b"runtime")
-
-        payloads = self.rebuild()
-
-        catalog = json.loads(payloads[generated.CATALOG_FILENAME])
-        self.assertEqual(
-            catalog["catalog"],
-            [{"playgroundId": public_id, "commitId": public_commit}],
-        )
-        self.assertNotIn(private_id, payloads[generated.CATALOG_FILENAME].decode())
-        self.assertNotIn(
-            private_commit, payloads[generated.CATALOG_FILENAME].decode()
-        )
-
-        artifact_index = json.loads(
-            payloads[generated.ARTIFACT_INDEX_FILENAME]
-        )
-        self.assertEqual(len(artifact_index["artifacts"]), 1)
-        self.assertEqual(artifact_index["artifacts"][0]["version"], "v1")
-
-        manifest_index = json.loads(payloads[generated.MANIFESTS_FILENAME])
-        self.assertEqual(
-            [item["playgroundId"] for item in manifest_index["manifests"]],
-            [public_id],
-        )
-        self.assertNotIn(
-            private_commit, payloads[generated.MANIFESTS_FILENAME].decode()
-        )
-
-        bootstrap = json.loads(payloads[generated.BOOTSTRAP_FILENAME])
-        self.assertEqual(bootstrap["catalog"], catalog["catalog"])
-        self.assertEqual(
-            bootstrap["artifacts"], artifact_index["artifacts"]
-        )
-
     def test_rebuild_is_deterministic(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.write_artifact("v1", "runtime.exe", b"runtime")
 
         first = self.rebuild()
@@ -185,7 +117,7 @@ class GeneratedCacheTest(unittest.TestCase):
         )
 
     def test_delete_all_generated_files_then_rebuild_restores_them(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.write_artifact("v1", "runtime.exe", b"runtime")
         first = self.rebuild()
 
@@ -200,7 +132,7 @@ class GeneratedCacheTest(unittest.TestCase):
         )
 
     def test_publish_is_deterministic_and_pointer_is_durable(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.write_artifact("v1", "runtime.exe", b"runtime")
         payloads = self.rebuild()
 
@@ -222,7 +154,7 @@ class GeneratedCacheTest(unittest.TestCase):
         )
 
     def test_identical_rebuild_reuses_one_generation(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.write_artifact("v1", "runtime.exe", b"runtime")
         self.rebuild()
         first = generated.resolve_current_generation(self.generated_path)
@@ -237,14 +169,14 @@ class GeneratedCacheTest(unittest.TestCase):
         )
 
     def test_failed_pointer_replace_keeps_old_generation_current(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.write_artifact("v1", "runtime.exe", b"runtime")
         self.rebuild()
         before = generated.resolve_current_generation(self.generated_path)
 
         # A second public Playground changes authority, so the next rebuild
         # builds a new generation and then fails while replacing the pointer.
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         original_replace = generated.os.replace
 
         def failing_replace(source, destination, *arguments, **keywords):
@@ -264,7 +196,7 @@ class GeneratedCacheTest(unittest.TestCase):
         self.assertEqual(after.generation_id, before.generation_id)
 
     def test_corrupt_generation_is_rejected(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.rebuild()
         identifier = generated.resolve_current_generation(
             self.generated_path
@@ -280,7 +212,7 @@ class GeneratedCacheTest(unittest.TestCase):
             generated.resolve_current_generation(self.generated_path)
 
     def test_symlinked_generation_is_rejected(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.rebuild()
         identifier = generated.resolve_current_generation(
             self.generated_path
@@ -296,7 +228,7 @@ class GeneratedCacheTest(unittest.TestCase):
             generated.resolve_current_generation(self.generated_path)
 
     def test_failure_before_replacement_keeps_old_output(self):
-        self.publish(f"public-{uuid.uuid4().hex[:8]}", playgrounds.PUBLIC_POLICY)
+        self.publish(f"public-{uuid.uuid4().hex[:8]}")
         self.write_artifact("v1", "runtime.exe", b"runtime")
         self.rebuild()
         before = self.read_generated()
@@ -327,18 +259,15 @@ class GeneratedCacheTest(unittest.TestCase):
             [generated.CATALOG_FILENAME],
         )
 
-    def test_private_authorization_does_not_use_generated_cache(self):
-        private_id = f"private-{uuid.uuid4().hex[:8]}"
-        _, private_commit = self.publish(
-            private_id, playgrounds.RELEASE_ONLY_POLICY
-        )
-        self.rebuild()
-
-        # Forge the cache to advertise the private commit.  Authorization is
-        # live and must still deny an unauthenticated read.
+    def test_a_forged_cache_cannot_publish_an_unreachable_commit(self):
+        # A cache is derived, so a hand-written catalog must not be able to
+        # advertise a commit the Playground's ref cannot reach: the manifest
+        # is generated from authority, not from the cache.
+        playground_id = f"forged-{uuid.uuid4().hex[:8]}"
+        _, commit_id = self.publish(playground_id)
         forged = {
             "catalog": [
-                {"playgroundId": private_id, "commitId": private_commit}
+                {"playgroundId": playground_id, "commitId": "0" * 40}
             ]
         }
         generated.atomic_write(
@@ -346,14 +275,18 @@ class GeneratedCacheTest(unittest.TestCase):
             json.dumps(forged, sort_keys=True).encode("utf-8"),
         )
 
-        with self.assertRaises(authorization.ContentAccessDeniedError):
+        self.assertEqual(
+            self.request_catalog_ids(),
+            [(playground_id, commit_id)],
+        )
+        with self.assertRaises(manifests.ManifestError):
             manifests.generate_manifest(
-                self.connection,
-                None,
-                self.repository,
-                private_id,
-                private_commit,
+                self.repository, playground_id, "0" * 40
             )
+
+    def request_catalog_ids(self):
+        catalog = generated.public_catalog(self.connection, self.repository)
+        return [(item["playgroundId"], item["commitId"]) for item in catalog]
 
     def test_artifact_mutation_is_rejected_on_rebuild(self):
         self.write_artifact("v1", "runtime.exe", b"first")

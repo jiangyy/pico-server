@@ -2,8 +2,7 @@
 
 Only the Python standard library and the installed ``git`` executable are used.
 This module deliberately exposes no generic ref helper: callers may only build
-Playground or Work references through the two validated helpers on
-:class:`Repository`.
+a Playground reference through the validated helper on :class:`Repository`.
 """
 
 import os
@@ -19,7 +18,6 @@ import permissions
 
 DEFAULT_REPOSITORY_PATH = Path("data/picopg.git")
 GIT_TIMEOUT_SECONDS = 30
-_MAX_MAINTENANCE_REFS = 10_000
 
 # Git is authoritative for ref syntax, but reject obviously unsafe identifiers
 # before starting a subprocess. The set matches the characters Git forbids in a
@@ -49,15 +47,6 @@ class Repository:
         ref = f"refs/heads/playgrounds/{opaque_id}"
         _check_ref_format(ref)
         return ref
-
-    def work_ref(self, playground_id, student_id):
-        """Return the Work ref for ``playground_id`` and ``student_id``."""
-        validate_playground_id(playground_id)
-        _validate_identifier(student_id, "student id")
-        ref = f"refs/heads/works/{playground_id}/{student_id}"
-        _check_ref_format(ref)
-        return ref
-
 
 def open_repository(path=DEFAULT_REPOSITORY_PATH):
     """Open or idempotently initialize the private bare repository at ``path``."""
@@ -263,19 +252,6 @@ class PlaygroundHeadChangedError(RepositoryError):
     reason = "playground_head_changed"
 
     def __init__(self, message="playground head changed"):
-        super().__init__(message)
-
-
-class WorkHeadChangedError(RepositoryError):
-    """The Work ref is missing, moved, or not the expected base.
-
-    The comparison-and-swap never overwrites the ref; a concurrent writer or
-    a caller that supplied a stale base sees this error instead.
-    """
-
-    reason = "work_head_changed"
-
-    def __init__(self, message="work head changed"):
         super().__init__(message)
 
 
@@ -563,117 +539,11 @@ def publish_playground(repository, playground_id, bundle, metadata):
     )
 
 
-# --- Server-owned Work commits ---------------------------------------------
+# --- Read-only access to published commits ---------------------------------
 #
-# A Work commit is assembled by the Work domain from the exact Playground tree
-# plus the normalized ``work/**`` snapshot.  This layer only turns that complete
-# server-built tree into one commit and compare-and-swaps the single Work ref;
-# no caller value chooses the ref, the parent, or a force update.
-
-
-def _is_safe_tree_path(path):
-    if type(path) is not str or not path:
-        return False
-    if "\\" in path or _CONTROL_CHARACTERS.search(path):
-        return False
-    if path.startswith("/"):
-        return False
-    segments = path.split("/")
-    if any(segment in ("", ".", "..") for segment in segments):
-        return False
-    return True
-
-
-def _snapshot_tree_files(files):
-    """Defensively copy a complete server-built tree into a sorted list.
-
-    Only plain ``str`` paths and ``bytes`` values are accepted, and every path
-    is re-checked as a safe relative tree path before any Git object is
-    written.  The Work domain owns the path allowlist; this only rejects the
-    shapes that could corrupt a Git tree.
-    """
-
-    if type(files) is not MappingProxyType:
-        raise RepositoryError(
-            "work tree must be the normalized read-only mapping"
-        )
-    collected = []
-    for path, data in files.items():
-        if type(path) is not str or type(data) is not bytes:
-            raise RepositoryError(
-                "work tree entries must be plain str paths and bytes values"
-            )
-        if not _is_safe_tree_path(path):
-            raise RepositoryError("work tree path is not allowed")
-        collected.append((path, data))
-    collected.sort(key=lambda item: item[0])
-    return collected
-
-
-def write_work_commit(
-    repository,
-    playground_id,
-    student_id,
-    playground_commit_id,
-    base_commit_id,
-    files,
-    metadata,
-):
-    """Create or append one Server-owned Work commit and CAS the Work ref.
-
-    ``files`` must be the complete, server-assembled read-only mapping of the
-    Playground content plus the submitted ``work/**`` snapshot and the
-    Server-created ``.picopg/work.json``.  The ref is always derived from
-    ``playground_id`` and ``student_id`` and can never be chosen by a caller.
-
-    When ``base_commit_id`` is ``None`` the ref must not exist yet and the
-    commit's parent is exactly ``playground_commit_id``.  Otherwise
-    ``base_commit_id`` must equal the current Work HEAD, which becomes the
-    parent.  A missing, moved, or mismatched ref surfaces as
-    :class:`WorkHeadChangedError` and is never overwritten.
-    """
-
-    if not isinstance(repository, Repository):
-        raise RepositoryError("repository handle required")
-    _validate_commit_metadata(metadata)
-    playground_commit_id = _require_object_id(playground_commit_id)
-    if base_commit_id is not None:
-        base_commit_id = _require_object_id(base_commit_id)
-
-    ref = repository.work_ref(playground_id, student_id)
-    head = _resolve_head(repository, ref)
-
-    if base_commit_id is None:
-        if head is not None:
-            raise WorkHeadChangedError()
-        parent = playground_commit_id
-        old_id = _zero_object_id(repository)
-    else:
-        if head != base_commit_id:
-            raise WorkHeadChangedError()
-        parent = base_commit_id
-        old_id = base_commit_id
-
-    tree_id = _write_bundle_tree(
-        repository, _bundle_tree(_snapshot_tree_files(files))
-    )
-    commit_id = _create_commit(
-        repository,
-        tree_id,
-        parent,
-        metadata,
-        error_message="could not create work commit",
-    )
-    _compare_and_swap(repository, ref, commit_id, old_id, WorkHeadChangedError)
-    return commit_id
-
-
-# --- Read-only commit tree access ------------------------------------------
-#
-# Callers that distribute content need to enumerate a commit's blobs and read
-# their exact bytes.  Both helpers take an explicit full object id, never a ref
-# or a branch name, so they can never fall back to the current HEAD of a
-# branch.  Nothing is checked out, extracted, or copied to a temporary tree.
+# A commit id alone never reaches Git content: the caller checks that the
+# commit belongs to a Playground's published history first, then these helpers
+# list that commit's tree and read its blobs.  Nothing here writes.
 
 
 @dataclass(frozen=True)
@@ -689,6 +559,26 @@ class TreeEntry:
     kind: str
     object_id: str
     size: int | None
+
+
+def commit_in_playground_history(repository, playground_id, commit_id):
+    """Return whether ``commit_id`` belongs to the named Playground history.
+
+    A published Playground is the only visibility rule left: its ref history
+    is the whole set of commits any caller may read, so an unpublished or
+    unknown commit and a missing Playground get the same answer.
+    """
+
+    try:
+        ref = repository.playground_ref(playground_id)
+    except RepositoryError:
+        return False
+    if _resolve_head(repository, ref) is None:
+        return False
+    completed = _run_git(
+        ("merge-base", "--is-ancestor", commit_id, ref), cwd=repository.path
+    )
+    return completed.returncode == 0
 
 
 def resolve_commit(repository, commit_id):
@@ -712,23 +602,6 @@ def resolve_commit(repository, commit_id):
     return resolved
 
 
-def resolve_work_head(repository, playground_id, student_id):
-    """Return the exact commit at the derived Work ref, or ``None``.
-
-    The ref is always derived from ``playground_id`` and ``student_id``, so a
-    caller can never name an arbitrary ref.  A missing ref yields ``None``; a
-    ref that does not point at a commit also yields ``None``.
-    """
-    if not isinstance(repository, Repository):
-        raise RepositoryError("repository handle required")
-    ref = repository.work_ref(playground_id, student_id)
-    head = _resolve_head(repository, ref)
-    if head is None:
-        return None
-    return resolve_commit(repository, head)
-
-
-@dataclass(frozen=True)
 class CommitInfo:
     """One commit of a linear first-parent history walk.
 
@@ -739,75 +612,6 @@ class CommitInfo:
     commit_id: str
     parent_commit_id: str | None
     committed_at: int
-
-
-def list_first_parent_commits(
-    repository, start_commit_id, stop_commit_id, limit
-):
-    """Return up to ``limit`` first-parent commits, newest first.
-
-    The walk starts at ``start_commit_id`` and never includes
-    ``stop_commit_id`` (exclusive), so a Work history stops exactly at its
-    pinned Playground commit.  Every returned commit must have exactly one
-    parent; a merge commit would make the history ambiguous and is rejected.
-    """
-
-    if not isinstance(repository, Repository):
-        raise RepositoryError("repository handle required")
-    start = _require_object_id(start_commit_id)
-    stop = (
-        None
-        if stop_commit_id is None
-        else _require_object_id(stop_commit_id)
-    )
-    if type(limit) is not int or limit <= 0:
-        raise RepositoryError("history limit must be a positive integer")
-    if stop is not None and start == stop:
-        return []
-
-    completed = _run_git(
-        (
-            "log",
-            "--first-parent",
-            "-n",
-            str(limit),
-            "--format=%H%x1f%P%x1f%ct",
-            start,
-        ),
-        cwd=repository.path,
-    )
-    if completed.returncode != 0:
-        raise RepositoryError("could not read commit history")
-
-    entries = []
-    for line in completed.stdout.decode("ascii", "replace").splitlines():
-        if not line:
-            continue
-        commit_id, separator, rest = line.partition("\x1f")
-        parents_field, separator_two, timestamp_field = rest.partition(
-            "\x1f"
-        )
-        if not separator or not separator_two:
-            raise RepositoryError("malformed commit history")
-        if stop is not None and commit_id == stop:
-            break
-        if _OBJECT_ID_PATTERN.match(commit_id) is None:
-            raise RepositoryError("malformed commit history")
-        parents = parents_field.split()
-        if len(parents) != 1:
-            raise RepositoryError("commit history is not linear")
-        try:
-            committed_at = int(timestamp_field)
-        except ValueError:
-            raise RepositoryError("malformed commit history") from None
-        entries.append(
-            CommitInfo(
-                commit_id=commit_id,
-                parent_commit_id=parents[0],
-                committed_at=committed_at,
-            )
-        )
-    return entries
 
 
 def list_commit_tree(repository, commit_id):
@@ -935,50 +739,3 @@ def _parse_batch_output(payload, requested):
 
 
 # --- Offline maintenance ---------------------------------------------------
-
-
-def list_refs(repository):
-    """Return every ref name in the repository, or raise on a Git failure.
-
-    Only ref *names* are returned; this is used by offline maintenance to
-    reject an unexpected ref outside the documented namespaces.
-    """
-
-    if not isinstance(repository, Repository):
-        raise RepositoryError("repository handle required")
-    completed = _run_git(
-        (
-            "for-each-ref",
-            f"--count={_MAX_MAINTENANCE_REFS + 1}",
-            "--format=%(refname)",
-        ),
-        cwd=repository.path,
-    )
-    if completed.returncode != 0:
-        raise RepositoryError("could not list references")
-    try:
-        lines = completed.stdout.decode("utf-8").splitlines()
-    except UnicodeDecodeError as error:
-        raise RepositoryError("reference names are not valid UTF-8") from error
-    if len(lines) > _MAX_MAINTENANCE_REFS:
-        raise RepositoryError("repository has too many references")
-    names = []
-    for line in lines:
-        name = line.strip()
-        if name:
-            names.append(name)
-    return names
-
-
-def compact(repository):
-    """Run a normal, non-destructive ``git gc`` through the sanitized bridge.
-
-    No aggressive mode, no immediate pruning, and no force update is used, so
-    an unreachable object is never discarded before its grace period.
-    """
-
-    if not isinstance(repository, Repository):
-        raise RepositoryError("repository handle required")
-    completed = _run_git(("gc",), cwd=repository.path)
-    if completed.returncode != 0:
-        raise RepositoryError("repository compaction failed")
