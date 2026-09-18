@@ -118,14 +118,6 @@ class CommitManifest:
     files: tuple
 
 
-def _optional_text(value, maximum, *, nonblank=False):
-    if type(value) is not str or len(value) > maximum:
-        return None
-    if nonblank and not value.strip():
-        return None
-    return value
-
-
 def _path_is_allowed(path):
     """Return whether ``path`` is one of the exact allowed manifest paths."""
 
