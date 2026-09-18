@@ -55,6 +55,22 @@ ssh picopg.cn 'cd ~/picopg && systemctl --user stop picopg.service \
 
 起来后 catalog 会暂时为空（`playgrounds` 表是空的），用第 2 节重新登记每个 id 即可，commitId 不变。
 
+如果 `data/picopg.git/` 或 `data/runtime/` 也一起丢了（两者都不在数据库里），内容就得重新发布：Git 历史没了，`commitId` 会变，客户端把新课当新版本重下。
+
+### 1.2 nginx 必须允许大 body
+
+nginx 默认只接受 1 MiB 请求体，课程 ZIP 会直接吃到 `413`（app 自己的上限是 10 MiB）。在站点的 `location /` 里加一行再 reload：
+
+```bash
+sudo sed -i 's|# *client_max_body_size 50m;|client_max_body_size 50m;|' /etc/nginx/sites-available/picopg
+sudo nginx -t && sudo systemctl reload nginx
+curl -sS -o /dev/null -w "%{http_code}\n" -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/zip" -H "Idempotency-Key: probe" \
+  --data-binary @/dev/null https://picopg.cn/api/v1/playgrounds/hello/commits   # 400/201 都说明通了，413 说明还没生效
+```
+
+判断卡在哪一层：`--url http://127.0.0.1:8001/...` 直连应用能成功、走域名返回 413，就是 nginx 限额，不是应用的。
+
 ## 2. 发一门课
 
 ```bash
@@ -65,7 +81,8 @@ ls dist/publish/hello.zip dist/publish/runtime
 
 ```bash
 # 线上：登记（新 id 才需要）+ 上传
-TOKEN=$(sed 's/.*=//' ~/.config/systemd/user/picopg.service.d/token.conf)
+TOKEN=$(sed -n 's/^Environment=PICOPG_OPERATOR_TOKEN=//p' \
+  ~/.config/systemd/user/picopg.service.d/token.conf)
 curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"id":"hello"}' https://picopg.cn/api/v1/playgrounds
 curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/zip" \
@@ -82,7 +99,8 @@ scp -r dist/publish/runtime/. picopg.cn:~/picopg/data/runtime/
 ## 3. 收作业
 
 ```bash
-TOKEN=$(sed 's/.*=//' ~/.config/systemd/user/picopg.service.d/token.conf)
+TOKEN=$(sed -n 's/^Environment=PICOPG_OPERATOR_TOKEN=//p' \
+  ~/.config/systemd/user/picopg.service.d/token.conf)
 curl -fsS -H "Authorization: Bearer $TOKEN" https://picopg.cn/api/v1/submissions \
   | jq '.submissions[] | {id, student, playgroundId, createdAt}'
 curl -fsS -H "Authorization: Bearer $TOKEN" https://picopg.cn/api/v1/submissions/<id> \
