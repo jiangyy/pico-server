@@ -4,7 +4,7 @@ Web 与桌面端共享路由、组件、状态与 API 类型。平台能力集�
 
 ## 产品入口与产物
 
-`learn-python` 拥有 Client UI 源码及 Web/桌面构建；`picopg` 拥有 Server API 和 Web 静态产物的部署。Server 只接收构建产物，不维护第二份 Client 源码。
+`learn-python` 拥有 Client UI 源码及 Web/桌面构建；`picopg` 只拥有 Server API 与远程资源分发，不接收或托管 Client 产品壳。
 
 - Student 视图是 Web 与 Windows Client 的真实 consumer；两端使用同一份路由、组件、状态与 API 类型，只替换 host adapter。
 - Teacher 和 Admin 视图在 v0.1 只进入 Web 产物，不进入 Windows EXE。它们只共享已被多个视图证明的 UI primitive 和 API data type，不共享角色业务状态。

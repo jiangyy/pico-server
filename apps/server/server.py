@@ -123,27 +123,12 @@ PORT = 8001
 DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
-WEB_DIRECTORY_NAME = "web"
-WEB_RUNTIME_DIRECTORY_NAME = "runtime"
+RUNTIME_DIRECTORY_NAME = "runtime"
 BOOTSTRAP_PATH = "/api/v1/bootstrap"
 COURSES_PATH = "/courses"
 SESSION_COOKIE_NAME = "picopg_session"
 SESSION_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
 
-# The Web bundle is four files: one startup document plus the three assets it
-# references.  Serving is a closed table rather than a directory walk, so no
-# caller-supplied name is ever joined onto a path and no other file in the
-# directory can become reachable by guessing a URL.  A missing bundle keeps
-# the historical placeholder for ``/`` so an un-provisioned Server still
-# answers its health probe, but every other bundle path is a plain 404.
-WEB_BUNDLE = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/index.html": ("index.html", "text/html; charset=utf-8"),
-    "/main.js": ("main.js", "text/javascript; charset=utf-8"),
-    "/picopg.css": ("picopg.css", "text/css; charset=utf-8"),
-    "/pico.svg": ("pico.svg", "image/svg+xml"),
-}
-WEB_BUNDLE_CACHE_CONTROL = "public, max-age=300"
 ARTIFACTS_PATH = "/api/v1/artifacts"
 MAX_JSON_BODY_BYTES = 16 * 1024
 # A Comment body may use the full Comment-domain byte ceiling, and JSON string
@@ -933,8 +918,10 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self, head_only=False):
         path = urlsplit(self.path).path
 
-        if path in WEB_BUNDLE:
-            self._get_web_file(path, head_only=head_only)
+        if path == "/":
+            self._respond(
+                200, "Pico service is running\n", head_only=head_only
+            )
         elif _match_course_file(path) is not None:
             self._get_course_file(*_match_course_file(path), head_only=head_only)
         elif path == "/healthz":
@@ -1392,43 +1379,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._headers_sent = True
         self._audit_status = 304
-
-    def _get_web_file(self, path, head_only=False):
-        """Serve one file from the installed Web bundle.
-
-        The bundle is optional: an operator who has not copied the Web build
-        onto this host still gets the historical placeholder on ``/`` and a
-        404 everywhere else, and no read ever escapes ``web_path``.  The
-        content hash doubles as the ETag so a reload reuses the bytes the
-        browser already has.
-        """
-
-        filename, content_type = WEB_BUNDLE[path]
-        try:
-            target = (self.server.web_path / filename).resolve()
-        except OSError:
-            target = None
-        if target is None or not target.is_file():
-            if path == "/":
-                self._respond(
-                    200, "Pico service is running\n", head_only=head_only
-                )
-                return
-            self._api_error(404, "not_found", head_only=head_only)
-            return
-        try:
-            data = target.read_bytes()
-        except OSError:
-            self._api_error(404, "not_found", head_only=head_only)
-            return
-        self._respond_bytes(
-            200,
-            data,
-            content_type=content_type,
-            etag=hashlib.sha256(data).hexdigest(),
-            cache_control=WEB_BUNDLE_CACHE_CONTROL,
-            head_only=head_only,
-        )
 
     def _get_course_file(
         self, playground_id, commit_id, encoded_path, head_only=False
@@ -3587,20 +3537,20 @@ def make_server(
     repository_path=DEFAULT_REPOSITORY_PATH,
     artifacts_path=None,
     generated_path=None,
-    web_path=None,
+    runtime_path=None,
     audit_output=None,
     audit_clock=None,
     audit_request_ids=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
-    ``artifacts_path``, ``generated_path`` and ``web_path`` are injected
+    ``artifacts_path``, ``generated_path`` and ``runtime_path`` are injected
     runtime directories.  When omitted they default to sibling directories of
     the database, which keeps every deployment path under one data directory.
     The directories are created lazily by the artifact index and
     generated-cache code instead of at startup, so a read-only or unused
-    cache never becomes a start-up failure.  ``web_path`` is the installed
-    Web bundle (see ``WEB_BUNDLE``); an absent directory is not an error.
+    cache never becomes a start-up failure.  ``runtime_path`` contains the
+    shared files loaded on demand by authorized course pages.
     """
     database_path = Path(database_path)
     database = open_database(database_path)
@@ -3615,10 +3565,10 @@ def make_server(
     else:
         generated_path = Path(generated_path)
 
-    if web_path is None:
-        web_path = database_path.parent / WEB_DIRECTORY_NAME
+    if runtime_path is None:
+        runtime_path = database_path.parent / RUNTIME_DIRECTORY_NAME
     else:
-        web_path = Path(web_path)
+        runtime_path = Path(runtime_path)
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
@@ -3632,8 +3582,7 @@ def make_server(
     server.repository = repository
     server.artifacts_path = artifacts_path
     server.generated_path = generated_path
-    server.web_path = web_path
-    server.runtime_path = web_path / WEB_RUNTIME_DIRECTORY_NAME
+    server.runtime_path = runtime_path
     server.audit = audit.AuditLog(
         output=audit_output,
         clock=audit_clock,

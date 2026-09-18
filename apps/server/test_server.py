@@ -64,6 +64,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body, b"not found\n")
 
+    def test_web_client_bundle_is_not_served(self):
+        for path in ("/index.html", "/main.js", "/picopg.css", "/pico.svg"):
+            with self.subTest(path=path):
+                status, _, _ = self.request("GET", path)
+                self.assertEqual(status, 404)
+
     def test_head_mirrors_get_headers_without_body(self):
         status, headers, body = self.request("HEAD", "/")
         self.assertEqual(status, 200)
