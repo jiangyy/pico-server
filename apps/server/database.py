@@ -63,20 +63,6 @@ _TABLE_COLUMNS = {
     },
 }
 
-# Tables that a previous schema had and this one must not have: a durable row
-# here would mean the database was never migrated to the current model.
-_FORBIDDEN_TABLES = frozenset(
-    {
-        "users",
-        "sessions",
-        "classes",
-        "class_memberships",
-        "publisher_grants",
-        "releases",
-        "comments",
-    }
-)
-
 # ``(table, column, referenced table, referenced column, on-delete action)``
 _FOREIGN_KEYS = (
     ("submissions", "playground_id", "playgrounds", "id", "RESTRICT"),
@@ -126,10 +112,10 @@ def open_database(path):
 def _initialize_schema(connection):
     """Create the current schema in one step.
 
-    The model is small enough that one version describes it exactly: there is
-    no account, class, or release history to migrate forward.  A database from
-    an earlier model is rejected by :func:`validate_schema` instead of being
-    silently half-migrated.
+    The model is small enough that one version describes it exactly, so there is
+    no migration chain to walk.  A database from any other model carries a
+    different version number and is rejected here instead of being silently
+    half-migrated.
     """
 
     with connection:
@@ -231,9 +217,6 @@ def validate_schema(connection):
 
     tables = _table_names(connection)
     _validate_migrations(connection, tables)
-    for table in _FORBIDDEN_TABLES:
-        if table in tables:
-            raise SchemaValidationError("table")
     for table, columns in _TABLE_COLUMNS.items():
         if table not in tables:
             raise SchemaValidationError("table")

@@ -602,18 +602,6 @@ def resolve_commit(repository, commit_id):
     return resolved
 
 
-class CommitInfo:
-    """One commit of a linear first-parent history walk.
-
-    ``parent_commit_id`` is the commit's single Git parent, or ``None`` for a
-    root commit.  ``committed_at`` is the committer time as Unix seconds.
-    """
-
-    commit_id: str
-    parent_commit_id: str | None
-    committed_at: int
-
-
 def list_commit_tree(repository, commit_id):
     """Recursively list one exact commit's tree without any checkout.
 

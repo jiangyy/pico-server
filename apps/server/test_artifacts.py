@@ -46,10 +46,10 @@ class ArtifactIndexTest(unittest.TestCase):
         self.assertEqual([item.version for item in entries], ["v1", "v2"])
         self.assertEqual(entries[0], self.entry("v1", "runtime.exe", first))
         self.assertEqual(
-            artifacts.serve_artifact(self.root, entries[0]), first
+            artifacts.verify_artifact(self.root, entries[0]).read_bytes(), first
         )
         self.assertEqual(
-            artifacts.serve_artifact(self.root, entries[1]), second
+            artifacts.verify_artifact(self.root, entries[1]).read_bytes(), second
         )
 
     def test_missing_directory_is_an_empty_index(self):
@@ -63,7 +63,7 @@ class ArtifactIndexTest(unittest.TestCase):
         self.write_artifact("v1", "runtime.exe", b"tampered-runtime!")
 
         with self.assertRaises(artifacts.ArtifactError) as caught:
-            artifacts.serve_artifact(self.root, entries[0])
+            artifacts.verify_artifact(self.root, entries[0]).read_bytes()
         self.assertEqual(
             caught.exception.reason, artifacts.REASON_CHECKSUM_MISMATCH
         )
@@ -91,7 +91,7 @@ class ArtifactIndexTest(unittest.TestCase):
         self.write_artifact("v1", "runtime.exe", data + b"!")
 
         with self.assertRaises(artifacts.ArtifactError) as caught:
-            artifacts.serve_artifact(self.root, entry)
+            artifacts.verify_artifact(self.root, entry).read_bytes()
         self.assertEqual(
             caught.exception.reason, artifacts.REASON_CHECKSUM_MISMATCH
         )
@@ -185,7 +185,7 @@ class ArtifactIndexTest(unittest.TestCase):
         entry = self.entry("v1", "runtime.exe", data)
 
         with self.assertRaises(artifacts.ArtifactError) as caught:
-            artifacts.serve_artifact(self.root, entry)
+            artifacts.verify_artifact(self.root, entry).read_bytes()
         self.assertEqual(
             caught.exception.reason, artifacts.REASON_MISSING_ARTIFACT
         )
@@ -201,7 +201,7 @@ class ArtifactIndexTest(unittest.TestCase):
             with self.subTest(version=version, filename=filename):
                 entry = self.entry(version, filename, data)
                 with self.assertRaises(artifacts.ArtifactError) as caught:
-                    artifacts.serve_artifact(self.root, entry)
+                    artifacts.verify_artifact(self.root, entry).read_bytes()
                 self.assertEqual(caught.exception.reason, reason)
 
     def test_serving_never_executes_the_artifact(self):
@@ -210,7 +210,7 @@ class ArtifactIndexTest(unittest.TestCase):
         self.write_artifact("v1", "runtime.sh", data)
         entry = artifacts.index_artifacts(self.root)[0]
 
-        self.assertEqual(artifacts.serve_artifact(self.root, entry), data)
+        self.assertEqual(artifacts.verify_artifact(self.root, entry).read_bytes(), data)
         self.assertFalse(sentinel.exists())
 
     def test_index_mapping_round_trips(self):

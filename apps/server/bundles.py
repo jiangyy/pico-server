@@ -277,7 +277,7 @@ _RESERVED_DEVICE_NAMES = frozenset(
 def portable_segment_reason(segment) -> str | None:
     """Return a stable reason if ``segment`` is not a portable path segment.
 
-    This one policy is shared by Playground bundles, Work snapshots, and
+    This one policy is shared by published bundles, submitted file sets, and
     manifest generation.  It returns ``None`` for a segment that can be
     installed on both Web and Windows filesystems.
     """

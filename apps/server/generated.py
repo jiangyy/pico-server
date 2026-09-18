@@ -2,10 +2,9 @@
 
 Everything under the injected generated directory is disposable.  The caches
 are built only from the authoritative sources: the private Git repository, the
-SQLite database, and the immutable artifacts directory.  They are caches,
-never authority: an access-control decision is always made against the live
-database and repository, so a stale, forged, or deleted cache can neither
-grant nor remove access to private content.
+SQLite database, and the immutable artifacts directory.  They are derived
+copies, never authority: every read of a commit is generated from Git, so a
+stale, forged, or deleted cache can neither publish nor hide a commit.
 
 On disk a completed cache is exactly::
 
@@ -164,12 +163,8 @@ def public_catalog(connection, repository):
     return catalog
 
 
-def _build_manifests(connection, repository, catalog):
-    """Return the deterministic manifests of every published commit.
-
-    ``connection`` is unused here and kept only because the generation builder
-    passes one database connection to every step.
-    """
+def _build_manifests(repository, catalog):
+    """Return the deterministic manifests of every published commit."""
 
     manifest_index = []
     for item in catalog:
@@ -212,7 +207,7 @@ def build_payloads(generated_path, *, connection, repository, artifacts_path):
     previous = _previous_entries(generated_path)
     entries = artifacts.index_artifacts(artifacts_path, previous)
     catalog = public_catalog(connection, repository)
-    manifest_index = _build_manifests(connection, repository, catalog)
+    manifest_index = _build_manifests(repository, catalog)
 
     artifact_mappings = [entry.to_mapping() for entry in entries]
     return {

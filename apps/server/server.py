@@ -23,7 +23,6 @@ import generated
 import manifests
 import pagination
 import permissions
-import submissions
 import works
 from bundles import (
     MAX_ARCHIVE_BYTES,
@@ -33,6 +32,7 @@ from bundles import (
 )
 from database import open_database
 from idempotency import (
+    MAX_REQUEST_KEY_LENGTH,
     IdempotencyConflict,
     IdempotencyRequestError,
     execute as execute_idempotent,
@@ -97,9 +97,6 @@ COURSE_CSP = (
 )
 
 ALLOWED_METHODS = ("GET", "HEAD")
-ROUTE_METHODS = {
-    "/healthz": ALLOWED_METHODS,
-}
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
 COMMITS_SEGMENT = "commits"
@@ -107,7 +104,6 @@ FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
 CATALOG_PATH = "/api/v1/catalog"
 SUBMISSIONS_PATH = "/api/v1/submissions"
-MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
 # The idempotency scope of the single operator that publishes bundles.  A
 # submission uses the self-reported student name instead, so two students can
@@ -233,10 +229,7 @@ def _match_course_file(path):
 
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
-    methods = ROUTE_METHODS.get(path)
-    if methods is not None:
-        return methods
-    if path in (BOOTSTRAP_PATH, ARTIFACTS_PATH, CATALOG_PATH):
+    if path in ("/healthz", BOOTSTRAP_PATH, ARTIFACTS_PATH, CATALOG_PATH):
         return ALLOWED_METHODS
     if path == SUBMISSIONS_PATH:
         return ALLOWED_METHODS
@@ -358,7 +351,7 @@ def _commit_metadata():
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Route public pages and the first account API."""
+    """Route the public reads and the two writes."""
 
     def do_GET(self):
         self._dispatch(self._route_get)
@@ -485,13 +478,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _respond_generation_file(self, name, head_only=False):
-        if self._reject_query_or_body(head_only=head_only):
-            return
-        generation = self._current_generation()
+        generation = self._generation(head_only)
         if generation is None:
-            self._api_error(
-                503, "generated_unavailable", head_only=head_only
-            )
             return
         data = (
             generation.bootstrap
@@ -506,14 +494,26 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
-    def _get_artifact(self, version, head_only=False):
+    def _generation(self, head_only=False):
+        """Return the current generation, or answer 503 and return ``None``.
+
+        Both generated-cache reads start here: the cache is a derived copy, so
+        an unavailable one is a service problem (503), never a 404.
+        """
+
         if self._reject_query_or_body(head_only=head_only):
-            return
+            return None
         generation = self._current_generation()
         if generation is None:
             self._api_error(
                 503, "generated_unavailable", head_only=head_only
             )
+            return None
+        return generation
+
+    def _get_artifact(self, version, head_only=False):
+        generation = self._generation(head_only)
+        if generation is None:
             return
         try:
             entries = artifacts.mapping_to_index(
@@ -526,9 +526,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         entry = artifacts.entries_by_version(entries).get(version)
         if entry is None:
-            self._respond_json(
-                404, {"code": "not_found"}, head_only=head_only
-            )
+            self._api_error(404, "not_found", head_only=head_only)
             return
         try:
             target = artifacts.verify_artifact(
@@ -729,13 +727,7 @@ class Handler(BaseHTTPRequestHandler):
                     after_commit,
                 ):
                     continue
-                items.append(
-                    {
-                        "playgroundId": key[0],
-                        "commitId": key[1],
-                        "releaseIds": [],
-                    }
-                )
+                items.append({"playgroundId": key[0], "commitId": key[1]})
                 if len(items) >= limit:
                     break
 
@@ -1079,7 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
         if request_key is None or not request_key.strip():
             self._api_error(400, "invalid_request")
             return None
-        if len(request_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+        if len(request_key) > MAX_REQUEST_KEY_LENGTH:
             self._api_error(400, "invalid_request")
             return None
         return request_key
@@ -1189,20 +1181,6 @@ class Handler(BaseHTTPRequestHandler):
             content_type="application/json; charset=utf-8",
         )
 
-    def _respond_file(self, data, sha256, head_only=False):
-        """Answer a content download with exact bytes and a SHA-256 ETag."""
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("ETag", f'"{sha256}"')
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self._headers_sent = True
-        if not head_only:
-            self.wfile.write(data)
-
     def _respond(
         self,
         status,
@@ -1223,8 +1201,6 @@ class Handler(BaseHTTPRequestHandler):
         self._headers_sent = True
         if not head_only:
             self.wfile.write(body)
-        # Only a completed response is audited as a success.  A failed write
-        # leaves the status unset so the error path emits the single event.
 
     # Route-aware method boundary for unsupported verbs.
     def do_OPTIONS(self):

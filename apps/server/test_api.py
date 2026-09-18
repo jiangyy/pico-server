@@ -22,7 +22,6 @@ from pathlib import Path
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import server  # noqa: E402
 from server import (  # noqa: E402
     MAX_SUBMISSION_JSON_BODY_BYTES,
     make_server,
@@ -160,7 +159,7 @@ class DistributionTest(ServerTestCase):
         status, _, body = self.request("GET", "/api/v1/catalog")
         self.assertEqual(status, 200)
         self.assertIn(
-            {"playgroundId": playground_id, "commitId": commit_id, "releaseIds": []},
+            {"playgroundId": playground_id, "commitId": commit_id},
             body["catalog"],
         )
 

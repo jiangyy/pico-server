@@ -24,10 +24,6 @@ class PlaygroundConflictError(Exception):
     """A playground identifier is already in use."""
 
 
-class StoredPlaygroundError(Exception):
-    """A durable Playground row cannot be represented by the API."""
-
-
 @dataclass(frozen=True)
 class Playground:
     id: str

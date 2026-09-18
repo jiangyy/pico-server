@@ -38,7 +38,6 @@ __all__ = [
     "index_artifacts",
     "index_to_mapping",
     "mapping_to_index",
-    "serve_artifact",
     "verify_artifact",
 ]
 
@@ -230,10 +229,10 @@ def verify_artifact(root, entry):
 
     if not isinstance(entry, ArtifactEntry):
         raise TypeError("entry must be an ArtifactEntry")
-    if not _validate_segment(entry.version) or not _validate_segment(
-        entry.filename
-    ):
+    if not _validate_segment(entry.version):
         raise ArtifactError(REASON_INVALID_VERSION)
+    if not _validate_segment(entry.filename):
+        raise ArtifactError(REASON_PATH_ESCAPE)
 
     resolved_root = _real_directory(root)
     if resolved_root is None:
@@ -251,41 +250,6 @@ def verify_artifact(root, entry):
     if _digest(target) != entry.sha256:
         raise ArtifactError(REASON_CHECKSUM_MISMATCH)
     return target
-
-
-def serve_artifact(root, entry):
-    """Return the exact bytes of ``entry`` after verifying size and SHA-256.
-
-    The caller must already hold the trusted entry (for example the generated
-    artifact index).  A file that is missing, changed, resized or replaced
-    raises :class:`ArtifactError` instead of returning unverified bytes.
-    """
-
-    if not isinstance(entry, ArtifactEntry):
-        raise TypeError("entry must be an ArtifactEntry")
-    if not _validate_segment(entry.version):
-        raise ArtifactError(REASON_INVALID_VERSION)
-    if not _validate_segment(entry.filename):
-        raise ArtifactError(REASON_PATH_ESCAPE)
-
-    resolved_root = _real_directory(root)
-    if resolved_root is None:
-        raise ArtifactError(REASON_MISSING_ARTIFACT)
-
-    target = Path(root) / entry.version / entry.filename
-    if target.is_symlink():
-        raise ArtifactError(REASON_PATH_ESCAPE)
-    if not target.is_file():
-        raise ArtifactError(REASON_MISSING_ARTIFACT)
-    if not _contained(resolved_root, target):
-        raise ArtifactError(REASON_PATH_ESCAPE)
-
-    data = target.read_bytes()
-    if len(data) != entry.size:
-        raise ArtifactError(REASON_CHECKSUM_MISMATCH)
-    if hashlib.sha256(data).hexdigest() != entry.sha256:
-        raise ArtifactError(REASON_CHECKSUM_MISMATCH)
-    return data
 
 
 def entries_by_version(entries):

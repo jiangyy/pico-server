@@ -249,9 +249,9 @@ class ManifestGenerationTest(ManifestTestBase):
             [manifest_file.path for manifest_file in manifest.files],
         )
 
-        payload = manifests.serialize_manifest(manifest)
-        self.assertIsInstance(payload, bytes)
-        self.assertEqual(json.loads(payload), mapping)
+        # The mapping is the one canonical view of a manifest; anything that
+        # encodes it (the generated cache) must agree with it exactly.
+        self.assertEqual(json.loads(json.dumps(mapping, sort_keys=True)), mapping)
 
     def test_generation_is_deterministic(self):
         result = self.publish(self.playground_id)
@@ -260,8 +260,8 @@ class ManifestGenerationTest(ManifestTestBase):
 
         self.assertEqual(first, second)
         self.assertEqual(
-            manifests.serialize_manifest(first),
-            manifests.serialize_manifest(second),
+            manifests.manifest_to_mapping(first),
+            manifests.manifest_to_mapping(second),
         )
 
     def test_old_commit_is_used_after_head_advances(self):

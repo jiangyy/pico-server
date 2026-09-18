@@ -45,7 +45,7 @@ class GeneratedCacheTest(unittest.TestCase):
 
     # ----- fixtures ------------------------------------------------------
 
-    def publish(self, playground_id, policy=None):
+    def publish(self, playground_id):
         playground = playgrounds.create_playground(
             self.connection, playground_id
         )

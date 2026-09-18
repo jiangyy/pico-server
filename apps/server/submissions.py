@@ -169,13 +169,7 @@ def _require_published_commit(connection, repository, request):
         raise UnknownPlaygroundError("commit is not published")
 
 
-def create_submission(
-    connection,
-    repository,
-    request,
-    request_key,
-    now=None,
-):
+def create_submission(connection, repository, request, request_key):
     """Create one immutable Submission, idempotently, in one transaction.
 
     The Playground row and the published-commit check run inside the same
@@ -200,7 +194,7 @@ def create_submission(
         _require_published_commit(business_connection, repository, request)
 
         submission_id = uuid.uuid4().hex
-        created_at = now or _now()
+        created_at = _now()
         business_connection.execute(
             """
             INSERT INTO submissions (

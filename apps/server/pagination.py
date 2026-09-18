@@ -6,10 +6,9 @@ object::
     {"key": "<value>" | ["<value>", ...], "route": "<route name>", "v": 1}
 
 The decoded fields are validated exactly, and the cursor is bound to one route
-name and one format version.  A cursor from another route or another parent
-filter is therefore rejected: filtered routes embed the parent id in the route
-name (for example ``class.releases:<classId>``).  Untrusted cursor text only
-ever becomes a bound SQL parameter; it is never interpolated into SQL.
+name and one format version, so a cursor minted for one list is rejected by
+another.  Untrusted cursor text only ever becomes a bound SQL parameter; it is
+never interpolated into SQL.
 """
 
 import base64
@@ -30,7 +29,6 @@ __all__ = [
     "decode_cursor",
     "encode_cursor",
     "parse_pagination",
-    "scoped_route",
 ]
 
 
@@ -82,12 +80,6 @@ class Page:
 
     def __hash__(self):
         return hash((self.items, tuple(self.next_key) if isinstance(self.next_key, list) else self.next_key))
-
-
-def scoped_route(base, parent_id):
-    """Return the route name for one parent-filtered list endpoint."""
-
-    return f"{base}:{parent_id}"
 
 
 def _canonical_key(key):

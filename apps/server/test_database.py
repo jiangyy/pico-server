@@ -160,12 +160,6 @@ class ValidateSchemaTest(unittest.TestCase):
         with self.assertRaises(SchemaValidationError):
             validate_schema(self.connection)
 
-    def test_a_forbidden_table_is_reported(self):
-        with self.connection:
-            self.connection.execute("CREATE TABLE users (id TEXT PRIMARY KEY)")
-        with self.assertRaises(SchemaValidationError):
-            validate_schema(self.connection)
-
     def test_a_missing_index_is_reported(self):
         with self.connection:
             self.connection.execute("DROP INDEX submissions_playground_idx")
