@@ -1,173 +1,103 @@
-# Deployment guide — Server on `picopg.cn`
+# Deployment — Server on `picopg.cn`
 
-This file is the only thing the operator needs to read to keep `picopg.cn`
-alive and to ship a new Playground from the `learn-python` repo.
+运维手册：这台机器上跑什么、怎么更新、怎么发课、怎么收作业。
 
-## What is running on the server
-
-| Layer | What | Where | Started by |
+| 层 | 是什么 | 位置 | 谁启动 |
 |---|---|---|---|
-| Reverse proxy | nginx 1.x + Let's Encrypt certs | `/etc/nginx/sites-enabled/picopg` | systemd (`nginx.service`) |
-| Application | Python 3 standard library only, no framework | `/home/xiaoci/picopg/apps/server/server.py` | user systemd (`picopg.service`) |
-| Code | git working tree | `/home/xiaoci/picopg/` | operator pulls |
-| Mutable data | SQLite + bare git repo + generated cache + artifacts + runtime | `/home/xiaoci/picopg/data/` | the application |
+| 反代 | nginx + Let's Encrypt | `/etc/nginx/sites-enabled/picopg` | `nginx.service` |
+| 应用 | 纯标准库 Python 3 | `~/picopg/apps/server/server.py` | user `picopg.service` |
+| 代码 | git 工作树 | `~/picopg/` | 运维 pull |
+| 数据 | SQLite + 裸仓库 + 缓存 + runtime | `~/picopg/data/` | 应用自己 |
 
-Nothing else belongs on this machine: the box has 2 GiB of RAM and no swap,
-and the original 22:02 OOM on Sep 16 was caused by VS Code Remote Node
-processes consuming ~290 MiB after the xiaoci session ended.
+这台机器只有 2 GiB 内存、无 swap，不要装 VS Code Remote 之类的东西（9 月 16 日的 OOM 就是它）。
 
-## 0. The operator token
+## 0. Operator token
 
-Every write endpoint is authorized by one token, supplied to the service and
-never stored in the database. Generate it once:
-
-```bash
-openssl rand -hex 24          # at least 16 bytes; store it in your password manager
-```
-
-Put it in the unit's environment, not in the repository:
+所有写端点由同一个 token 授权，存在 unit 的环境里，不入库：
 
 ```bash
 ssh picopg.cn
 mkdir -p ~/.config/systemd/user/picopg.service.d
-cat > ~/.config/systemd/user/picopg.service.d/token.conf <<'EOF'
-[Service]
-Environment=PICOPG_OPERATOR_TOKEN=<the token>
-EOF
+printf '[Service]\nEnvironment=PICOPG_OPERATOR_TOKEN=%s\n' "$(openssl rand -hex 24)" \
+  > ~/.config/systemd/user/picopg.service.d/token.conf
 chmod 600 ~/.config/systemd/user/picopg.service.d/token.conf
-systemctl --user daemon-reload
-systemctl --user restart picopg.service
+systemctl --user daemon-reload && systemctl --user restart picopg.service
+cat ~/.config/systemd/user/picopg.service.d/token.conf   # 抄进密码管理器
 ```
 
-The Server refuses to start when the token is missing or shorter than 16
-bytes, because without it every write endpoint would be public.
+缺 token 或短于 16 字节时服务拒绝启动（否则每个写端点都会变成公开的）。
 
-## 1. Keep the application up to date
+## 1. 更新应用
 
-The Server is plain Python on the standard library, so "deployment" means
-"git fetch + restart":
+线上拿不到 GitHub，所以打包传过去：
 
 ```bash
-ssh picopg.cn
-cd ~/picopg
-git fetch origin master
-git merge --ff-only origin/master
-systemctl --user restart picopg.service
-systemctl --user status picopg.service
-curl -sS -o /dev/null -w "%{http_code}\n" https://picopg.cn/api/v1/bootstrap
+# 本机
+git -C ~/Documents/picopg bundle create /tmp/picopg.bundle <旧sha>..master
+scp /tmp/picopg.bundle picopg.cn:/tmp/
+
+# 线上
+ssh picopg.cn 'cd ~/picopg && git fetch /tmp/picopg.bundle master \
+  && git merge --ff-only FETCH_HEAD && rm /tmp/picopg.bundle \
+  && systemctl --user restart picopg.service'
 ```
 
-`git status` must be clean before the merge. If the working tree is dirty,
-the dirty files are operator leftovers; stash them, merge, drop the stash,
-restart.
+`git status` 必须干净；脏文件是运维遗留，先 stash。
 
-### 1.1 A data directory from the older model must be recreated
+### 1.1 schema 变了就重建 app.db
 
-There are no accounts, classes, or releases any more, and the schema is one
-version describing three tables. A database written by the previous model is
-rejected at startup instead of being half-migrated. Move it aside and start
-clean:
+`app.db` 只有一个版本号，版本不符时启动即报错（不会半迁移）。重建只影响数据库，Git 历史留在 `data/picopg.git/`：
 
 ```bash
-ssh picopg.cn
-cd ~/picopg
-systemctl --user stop picopg.service
-mv data data.previous
-systemctl --user start picopg.service   # recreates data/ and the caches
-curl -sS -o /dev/null -w "%{http_code}\n" https://picopg.cn/api/v1/catalog
+ssh picopg.cn 'cd ~/picopg && systemctl --user stop picopg.service \
+  && mv data/app.db /tmp/app.db.old && systemctl --user start picopg.service'
 ```
 
-Courses are published again from `learn-python` (section 2); the repository
-history is not copied forward.
+起来后 catalog 会暂时为空（`playgrounds` 表是空的），用第 2 节重新登记每个 id 即可，commitId 不变。
 
-## 2. Ship a new Playground from `learn-python`
-
-The supported helper is `node scripts/publish.mjs <id>`; it emits the course
-ZIP and the shared runtime overlay from the same build. It does not upload.
-
-### 2.1 Build the artifacts locally
+## 2. 发一门课
 
 ```bash
-cd ~/Documents/learn-python
-node scripts/publish.mjs hello
+# 本机：构建（不联网）
+cd ~/Documents/learn-python && node scripts/publish.mjs hello
 ls dist/publish/hello.zip dist/publish/runtime
 ```
 
-### 2.2 Push the runtime once per host (almost never)
-
-The runtime is served from `data/runtime/`. Re-upload it only when the runtime
-version changes:
-
 ```bash
-scp -r dist/publish/runtime/. \
-  picopg.cn:/home/xiaoci/picopg/data/runtime/
-```
-
-### 2.3 Pre-create Playground metadata if it is new
-
-The commit endpoint requires the Playground to exist:
-
-```bash
-curl -fsS -X POST \
-  -H "Authorization: Bearer $OPERATOR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"hello"}' \
-  https://picopg.cn/api/v1/playgrounds
-```
-
-Existing Playgrounds skip this step.
-
-### 2.4 Push every new Playground ZIP
-
-```bash
-curl -fsS -X POST \
-  -H "Authorization: Bearer $OPERATOR_TOKEN" \
-  -H "Content-Type: application/zip" \
-  -H "Idempotency-Key: hello-$(date +%s)" \
-  --data-binary @dist/publish/hello.zip \
+# 线上：登记（新 id 才需要）+ 上传
+TOKEN=$(sed 's/.*=//' ~/.config/systemd/user/picopg.service.d/token.conf)
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"id":"hello"}' https://picopg.cn/api/v1/playgrounds
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/zip" \
+  -H "Idempotency-Key: hello-$(date +%s)" --data-binary @dist/publish/hello.zip \
   https://picopg.cn/api/v1/playgrounds/hello/commits
 ```
 
-The Server validates every member of the ZIP: only `course/**`,
-`starter/**`, and `picopg.json` at the root are allowed, no absolute paths,
-no `..`, no symlinks, no unknown schemas or runtimes. An unchanged tree is a
-no-op (`noOp: true`) and returns the current `commitId`.
-
-### 2.5 Verify the publish landed
+runtime 只在版本变化时上传一次（18 MiB）：
 
 ```bash
-curl -fsS https://picopg.cn/api/v1/catalog | jq '.catalog[] | select(.playgroundId=="hello")'
-curl -fsS https://picopg.cn/api/v1/playgrounds/hello/commits/<commitId>/manifest | jq '.manifest.files | length'
+scp -r dist/publish/runtime/. picopg.cn:~/picopg/data/runtime/
 ```
 
-If `hello` is missing, the upload silently turned into a `noOp`: the tree
-matched the existing HEAD. Change the bundle and upload again with a fresh
-`Idempotency-Key`.
-
-## 3. Read what students handed in
+## 3. 收作业
 
 ```bash
-curl -fsS -H "Authorization: Bearer $OPERATOR_TOKEN" \
-  https://picopg.cn/api/v1/submissions | jq '.submissions[] | {id, student, playgroundId, createdAt}'
-
-curl -fsS -H "Authorization: Bearer $OPERATOR_TOKEN" \
-  https://picopg.cn/api/v1/submissions/<id> | jq '.submission.files'
+TOKEN=$(sed 's/.*=//' ~/.config/systemd/user/picopg.service.d/token.conf)
+curl -fsS -H "Authorization: Bearer $TOKEN" https://picopg.cn/api/v1/submissions \
+  | jq '.submissions[] | {id, student, playgroundId, createdAt}'
+curl -fsS -H "Authorization: Bearer $TOKEN" https://picopg.cn/api/v1/submissions/<id> \
+  | jq '.submission.files'
 ```
 
-Submissions are append-only: there is no update, delete, or status, and the
-Server never copies a submission into the Git repository.
+提交只追加，服务器不把它写进 Git。
 
-## 4. Operations checklist
-
-After every restart or deploy:
+## 4. 每次重启/发布后
 
 ```bash
-systemctl --user status picopg.service   # Active: active (running)
-free -h                                  # used ≤ 600 MiB, no swap pressure
-ss -lntp | grep ':8001 '                 # python3 listening on 8001
-curl -sS -o /dev/null -w "%{http_code}\n" https://picopg.cn/api/v1/bootstrap
+systemctl --user status picopg.service        # active (running)
+free -h                                       # used ≤ 600 MiB
 curl -sS -o /dev/null -w "%{http_code}\n" https://picopg.cn/api/v1/catalog
+curl -sS -o /dev/null -w "%{http_code}\n" https://picopg.cn/api/v1/bootstrap
 ```
 
-Back up `data/app.db`, `data/picopg.git/`, and `data/artifacts/` as one set.
-`data/generated/` is disposable and rebuilds itself.
+备份 `data/app.db`、`data/picopg.git/`、`data/artifacts/` 三件套；`data/generated/` 删了会自己重建。
