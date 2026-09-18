@@ -45,7 +45,7 @@ _TABLE_COLUMNS = {
         "created_at": (0, 1),
     },
     "idempotency_results": {
-        "actor_id": (1, 1),
+        "scope": (1, 1),
         "endpoint": (2, 1),
         "request_key": (3, 1),
         "request_sha256": (0, 1),
@@ -152,8 +152,8 @@ def _initialize_schema(connection):
             connection.execute(
                 """
                 CREATE TABLE idempotency_results (
-                    actor_id TEXT NOT NULL
-                        CHECK (actor_id <> '' AND length(actor_id) <= 255),
+                    scope TEXT NOT NULL
+                        CHECK (scope <> '' AND length(scope) <= 255),
                     endpoint TEXT NOT NULL
                         CHECK (endpoint <> '' AND length(endpoint) <= 255),
                     request_key TEXT NOT NULL
@@ -164,7 +164,7 @@ def _initialize_schema(connection):
                         CHECK (response_status BETWEEN 100 AND 599),
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    PRIMARY KEY (actor_id, endpoint, request_key)
+                    PRIMARY KEY (scope, endpoint, request_key)
                 )
                 """
             )

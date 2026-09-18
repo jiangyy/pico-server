@@ -1,9 +1,11 @@
 """Persistent, transactional idempotency for create operations.
 
 The module stores results in ``idempotency_results`` keyed by
-``(actor_id, endpoint, request_key)``. A caller supplies a logical request that
-is canonicalized and hashed before storage; raw bodies and secrets never reach
-the database.
+``(scope, endpoint, request_key)``.  A scope is a caller-chosen name — the
+operator for a publish, the student's own name for a submission — so two callers
+never share a key space and no account model is implied.  A caller supplies a
+logical request that is canonicalized and hashed before storage; raw bodies and
+secrets never reach the database.
 
 ``execute`` runs the supplied callback inside the caller's database
 transaction. The callback receives the open connection and must perform its
@@ -61,7 +63,7 @@ def request_digest(request):
     return hashlib.sha256(canonicalize_request(request)).hexdigest()
 
 
-def execute(connection, actor_id, endpoint, request_key, request, callback):
+def execute(connection, scope, endpoint, request_key, request, callback):
     """Run ``callback`` once per scope and return its recorded result.
 
     ``callback(connection)`` must return ``(status, response)`` where ``status``
@@ -70,10 +72,10 @@ def execute(connection, actor_id, endpoint, request_key, request, callback):
     again. Reusing a key with a different request raises
     :class:`IdempotencyConflict`.
     """
-    _validate_scope(actor_id, endpoint, request_key)
+    _validate_scope(scope, endpoint, request_key)
     digest = request_digest(request)
 
-    existing = _lookup(connection, actor_id, endpoint, request_key)
+    existing = _lookup(connection, scope, endpoint, request_key)
     if existing is not None:
         return _existing_result(existing, digest)
 
@@ -84,7 +86,7 @@ def execute(connection, actor_id, endpoint, request_key, request, callback):
             connection.execute(
                 """
                 INSERT INTO idempotency_results (
-                    actor_id, endpoint, request_key, request_sha256,
+                    scope, endpoint, request_key, request_sha256,
                     response_status, response_json, created_at
                 )
                 VALUES (
@@ -93,7 +95,7 @@ def execute(connection, actor_id, endpoint, request_key, request, callback):
                 )
                 """,
                 (
-                    actor_id,
+                    scope,
                     endpoint,
                     request_key,
                     digest,
@@ -105,7 +107,7 @@ def execute(connection, actor_id, endpoint, request_key, request, callback):
             # A concurrent request with the same scope won through the primary
             # key. Discard this attempt's business rows and serve the winner.
             connection.rollback()
-            existing = _lookup(connection, actor_id, endpoint, request_key)
+            existing = _lookup(connection, scope, endpoint, request_key)
             if existing is None:
                 raise
             return _existing_result(existing, digest)
@@ -113,8 +115,8 @@ def execute(connection, actor_id, endpoint, request_key, request, callback):
     return status, json.loads(response_json)
 
 
-def _validate_scope(actor_id, endpoint, request_key):
-    _validate_identifier(actor_id, "actor_id", None)
+def _validate_scope(scope, endpoint, request_key):
+    _validate_identifier(scope, "scope", None)
     _validate_identifier(endpoint, "endpoint", MAX_ENDPOINT_LENGTH)
     _validate_identifier(request_key, "request_key", MAX_REQUEST_KEY_LENGTH)
 
@@ -150,14 +152,14 @@ def _serialize_response(response):
         ) from error
 
 
-def _lookup(connection, actor_id, endpoint, request_key):
+def _lookup(connection, scope, endpoint, request_key):
     return connection.execute(
         """
         SELECT request_sha256, response_status, response_json
         FROM idempotency_results
-        WHERE actor_id = ? AND endpoint = ? AND request_key = ?
+        WHERE scope = ? AND endpoint = ? AND request_key = ?
         """,
-        (actor_id, endpoint, request_key),
+        (scope, endpoint, request_key),
     ).fetchone()
 
 

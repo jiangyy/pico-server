@@ -57,7 +57,7 @@ class IdempotencyTest(unittest.TestCase):
 
         first = execute(
             connection,
-            "actor-1",
+            "scope-1",
             "/playgrounds",
             "key-1",
             {"name": "A", "policy": "release_only"},
@@ -73,7 +73,7 @@ class IdempotencyTest(unittest.TestCase):
 
         second = execute(
             connection,
-            "actor-1",
+            "scope-1",
             "/playgrounds",
             "key-1",
             {"policy": "release_only", "name": "A"},
@@ -94,35 +94,35 @@ class IdempotencyTest(unittest.TestCase):
             return 201, {"id": "playground-1"}
 
         execute(
-            connection, "actor-1", "/playgrounds", "key-1",
+            connection, "scope-1", "/playgrounds", "key-1",
             {"name": "A"}, callback,
         )
 
         with self.assertRaises(IdempotencyConflict):
             execute(
-                connection, "actor-1", "/playgrounds", "key-1",
+                connection, "scope-1", "/playgrounds", "key-1",
                 {"name": "B"}, callback,
             )
         self.assertEqual(calls, [1])
         self.assertEqual(self.count(connection, "idempotency_results"), 1)
 
-    def test_actor_scope_is_isolated(self):
+    def test_scope_isolation(self):
         connection = self.open()
         self.create_playground(connection, "pg-1")
         self.create_playground(connection, "pg-2")
         connection.commit()
 
         first = execute(
-            connection, "actor-1", "/playgrounds", "key-1",
-            {"name": "A"}, lambda conn: (201, {"actor": "actor-1"}),
+            connection, "scope-1", "/playgrounds", "key-1",
+            {"name": "A"}, lambda conn: (201, {"scope": "scope-1"}),
         )
         second = execute(
-            connection, "actor-2", "/playgrounds", "key-1",
-            {"name": "B"}, lambda conn: (201, {"actor": "actor-2"}),
+            connection, "scope-2", "/playgrounds", "key-1",
+            {"name": "B"}, lambda conn: (201, {"scope": "scope-2"}),
         )
 
-        self.assertEqual(first, (201, {"actor": "actor-1"}))
-        self.assertEqual(second, (201, {"actor": "actor-2"}))
+        self.assertEqual(first, (201, {"scope": "scope-1"}))
+        self.assertEqual(second, (201, {"scope": "scope-2"}))
         self.assertEqual(self.count(connection, "idempotency_results"), 2)
 
     def test_endpoint_scope_is_isolated(self):
@@ -131,11 +131,11 @@ class IdempotencyTest(unittest.TestCase):
         connection.commit()
 
         first = execute(
-            connection, "actor-1", "/playgrounds", "key-1",
+            connection, "scope-1", "/playgrounds", "key-1",
             {"name": "A"}, lambda conn: (201, {"endpoint": "playgrounds"}),
         )
         second = execute(
-            connection, "actor-1", "/submissions", "key-1",
+            connection, "scope-1", "/submissions", "key-1",
             {"name": "B"}, lambda conn: (201, {"endpoint": "submissions"}),
         )
 
@@ -153,7 +153,7 @@ class IdempotencyTest(unittest.TestCase):
             return 201, {"id": "business-1"}
 
         result = execute(
-            connection, "actor-1", "/playgrounds", "key-1",
+            connection, "scope-1", "/playgrounds", "key-1",
             {"name": "A"}, callback,
         )
 
@@ -172,7 +172,7 @@ class IdempotencyTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             execute(
-                connection, "actor-1", "/playgrounds", "key-1",
+                connection, "scope-1", "/playgrounds", "key-1",
                 {"name": "A"}, callback,
             )
 
@@ -189,12 +189,12 @@ class IdempotencyTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             execute(
-                connection, "actor-1", "/playgrounds", "key-1",
+                connection, "scope-1", "/playgrounds", "key-1",
                 {"name": "A"}, failing,
             )
 
         result = execute(
-            connection, "actor-1", "/playgrounds", "key-1",
+            connection, "scope-1", "/playgrounds", "key-1",
             {"name": "A"}, lambda conn: (201, {"id": "playground-1"}),
         )
         self.assertEqual(result, (201, {"id": "playground-1"}))
@@ -211,7 +211,7 @@ class IdempotencyTest(unittest.TestCase):
 
         with self.assertRaises(IdempotencyRequestError):
             execute(
-                connection, "actor-1", "/playgrounds", "key-1",
+                connection, "scope-1", "/playgrounds", "key-1",
                 {"name": "A"}, callback,
             )
 
@@ -237,7 +237,7 @@ class IdempotencyTest(unittest.TestCase):
         for endpoint, request_key in invalid_scopes:
             with self.assertRaises(IdempotencyRequestError):
                 execute(
-                    connection, "actor-1", endpoint, request_key,
+                    connection, "scope-1", endpoint, request_key,
                     {"name": "A"}, callback,
                 )
 
@@ -251,7 +251,7 @@ class IdempotencyTest(unittest.TestCase):
 
         result = execute(
             connection,
-            "actor-1",
+            "scope-1",
             "e" * MAX_ENDPOINT_LENGTH,
             "k" * MAX_REQUEST_KEY_LENGTH,
             {"name": "A"},
@@ -273,7 +273,7 @@ class IdempotencyTest(unittest.TestCase):
         oversized = {"data": "x" * (MAX_REQUEST_BYTES + 1)}
         with self.assertRaises(IdempotencyRequestError):
             execute(
-                connection, "actor-1", "/playgrounds", "key-1",
+                connection, "scope-1", "/playgrounds", "key-1",
                 oversized, callback,
             )
 
@@ -305,7 +305,7 @@ class IdempotencyTest(unittest.TestCase):
 
         execute(
             connection,
-            "actor-1",
+            "scope-1",
             "/playgrounds",
             "key-1",
             {"name": "Lesson", "authorization": "Bearer super-secret-token"},
@@ -342,14 +342,14 @@ class IdempotencyTest(unittest.TestCase):
             # Simulate a competing request committing after this attempt's
             # initial lookup but before it records its own result.
             execute(
-                other, "actor-1", "/playgrounds", "key-1",
+                other, "scope-1", "/playgrounds", "key-1",
                 {"name": "A"}, winner,
             )
             self.create_playground(conn, "pg-business-1")
             return 500, {"id": "loser"}
 
         result = execute(
-            connection, "actor-1", "/playgrounds", "key-1",
+            connection, "scope-1", "/playgrounds", "key-1",
             {"name": "A"}, loser,
         )
 
@@ -369,14 +369,14 @@ class IdempotencyTest(unittest.TestCase):
 
         def loser(conn):
             execute(
-                other, "actor-1", "/playgrounds", "key-1",
+                other, "scope-1", "/playgrounds", "key-1",
                 {"name": "A"}, lambda inner: (201, {"id": "winner"}),
             )
             return 201, {"id": "loser"}
 
         with self.assertRaises(IdempotencyConflict):
             execute(
-                connection, "actor-1", "/playgrounds", "key-1",
+                connection, "scope-1", "/playgrounds", "key-1",
                 {"name": "B"}, loser,
             )
 
