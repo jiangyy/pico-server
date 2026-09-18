@@ -1,18 +1,17 @@
 # Client 契约
 
-Web 与桌面端共享路由、组件、状态与 API 类型。平台能力集中在 host adapter：Web 使用浏览器存储和 Pyodide，桌面使用文件缓存与隔离 bridge。
+Client 只有一个平台：Windows 桌面（Electron）。平台能力集中在 host adapter：桌面使用文件缓存与隔离 bridge。
 
 ## 产品入口与产物
 
-`learn-python` 拥有 Client UI 源码及 Web/桌面构建；`picopg` 只拥有 Server API 与远程资源分发，不接收或托管 Client 产品壳。官网 Portal 是独立静态产物，不是 Client。
+`learn-python` 拥有 Client UI 源码及桌面构建；`picopg` 只拥有 Server API 与远程资源分发，不接收或托管 Client 产品壳。官网 Portal 是独立静态产物，不是 Client。
 
-- Student 视图是 Web 与 Windows Client 的真实 consumer；两端使用同一份路由、组件、状态与 API 类型，只替换 host adapter。
-- Teacher 和 Admin 视图在 v0.1 只进入 Web 产物，不进入 Windows EXE。它们只共享已被多个视图证明的 UI primitive 和 API data type，不共享角色业务状态。
-- Web 产物只有一个启动文档；登录后依据 Server 返回的角色进入 Student、Teacher 或 Admin 路由。Client 不从 URL 或本地标记推导授权。
-- Windows EXE 的启动文档只加载 Student 视图和 desktop host adapter。官网/下载页是独立 Portal 产物，不进入 Client。
-- Playground `course/index.html` 是发布器从课程源码生成的不可变内容 artifact，不是 Student/Teacher/Admin 产品壳入口。
+- Student 视图是桌面 Client 的真实 consumer。
+- Teacher 和 Admin 没有 Client。两个角色仍存在于 Server（授权、发布 Release、点评都归它），由运维通过 Server API 使用；客户端不实现这两个视图，也不做角色路由。
+- Client 不从 URL 或本地标记推导授权，只接受 Server 返回的 `role`：非 `student` 会话在进入界面之前就被拒绝。
+- Playground `course/index.html` 是发布器从课程源码生成的不可变内容 artifact，不是产品壳入口。
 
-单文件 Student/Teacher/Admin HTML 只作为迁移期设计参考，不是发布 contract；视图接入真实 API consumer 并验收后归档。
+单文件 Student/Teacher/Admin HTML 是迁移期的设计参考，随 Web 产物一起归档，不是发布 contract。
 
 ## Local-first
 
@@ -20,7 +19,9 @@ Client 启动时先读取本地 manifest、内容、Draft 和 runtime，再增�
 
 Draft 按用户和 Playground 隔离，记录 Playground commit、base Work commit、文件、dirty 状态和保存时间。本地保存失败必须显式展示；缓存清理不得删除 manifest 或 Draft 引用的 blob。
 
-下载的 blob/runtime 通过 size 与 SHA-256 校验。manifest 在依赖完整后原子替换，保证中断后旧版本仍可打开。
+下载的 blob 通过 size 与 SHA-256 校验。manifest 在依赖完整后原子替换，保证中断后旧版本仍可打开。Python runtime 随 Client 一起分发，不属于课程内容（`mount.ts` 的 `runtimeDir`），因此内容的清理与安装都不影响它。
+
+内容是可以随时丢弃的派生副本：删除本地内容根只会让课程重新回到“未安装”，打开时按需重新下载；Draft、Work HEAD、提交收据与幂等键不在内容根内，不随内容一起消失。
 
 ## 编辑、同步与提交
 

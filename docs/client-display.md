@@ -8,6 +8,10 @@
 本文只列**尚未由 server 实现**的部分，并注明已完成的 S1/S2/S3 与 Work 读取 API，避免重复。
 字段一律可选、旧客户端忽略、新客户端对缺失回退；不提升 `schemaVersion`。
 
+> **适用范围（2026-09-18）**：客户端只剩桌面一个（见 `client.md`）。本文里凡是指明「Web 端」的
+> 条目（卡片标题的每次请求、玩具的独立 origin、Web 课程 origin 的 `../pyodide/` 要求）都只对
+> 已归档的 Web 产物成立，不要照它们给 Server 排期。
+
 ## 0. 已完成（不要重复实现）
 
 - S1：客户端读该 commit 的 `picopg.json` 可选 `title`/`summary`（server 忽略未知字段，无需改动即可用）。
