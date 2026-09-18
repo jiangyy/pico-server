@@ -39,13 +39,11 @@ class ServerTestCase(unittest.TestCase):
         cls.temporary_directory = tempfile.TemporaryDirectory()
         base = Path(cls.temporary_directory.name)
         cls.database_path = base / "app.db"
-        cls.generated_path = base / "generated"
         cls.server = make_server(
             host="127.0.0.1",
             port=0,
             database_path=cls.database_path,
             repository_path=base / "picopg.git",
-            generated_path=cls.generated_path,
             operator_token=OPERATOR_TOKEN,
         )
         cls.port = cls.server.server_address[1]
@@ -261,16 +259,6 @@ class DistributionTest(ServerTestCase):
             "/files/course/../picopg.json",
         )
         self.assertEqual(status, 404)
-
-    def test_bootstrap_and_artifact_index_are_anonymous(self):
-        self.seed()
-
-        bootstrap = self.request("GET", "/api/v1/bootstrap")
-        self.assertEqual(bootstrap[0], 200)
-        self.assertIn("catalog", bootstrap[2])
-
-        index = self.request("GET", "/api/v1/artifacts")
-        self.assertEqual(index[0], 200)
 
 
 class PublishTest(ServerTestCase):
@@ -753,7 +741,6 @@ class OperatorTokenTest(unittest.TestCase):
             port=0,
             database_path=self.base / "app.db",
             repository_path=self.base / "picopg.git",
-            generated_path=self.base / "generated",
             operator_token=token,
         )
         server_instance.server_close()

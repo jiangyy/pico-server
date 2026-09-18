@@ -26,7 +26,6 @@ from unittest import mock  # noqa: E402
 from database import open_database  # noqa: E402
 
 MANIFEST_BYTES = b'{"schemaVersion":1,"runtime":"python"}'
-OPERATOR = "operator"
 
 
 class SubmissionTestBase(unittest.TestCase):

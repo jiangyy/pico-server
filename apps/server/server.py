@@ -18,8 +18,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-import artifacts
-import generated
 import manifests
 import pagination
 import permissions
@@ -72,12 +70,8 @@ from submissions import (
 HOST = "127.0.0.1"
 PORT = 8001
 DATABASE_PATH = Path("data/app.db")
-ARTIFACTS_DIRECTORY_NAME = "artifacts"
-GENERATED_DIRECTORY_NAME = "generated"
 SUBMISSIONS_DIRECTORY_NAME = "submissions"
-BOOTSTRAP_PATH = "/api/v1/bootstrap"
 
-ARTIFACTS_PATH = "/api/v1/artifacts"
 MAX_JSON_BODY_BYTES = 16 * 1024
 
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -208,25 +202,9 @@ def _match_submission(path):
     return submission_id
 
 
-def _match_artifact_version(path):
-    """Return the single decoded version segment for an artifact path.
-
-    The version is taken from the raw path exactly once; an encoded slash or
-    backslash stays literal text and can never become a path separator.
-    """
-
-    prefix = ARTIFACTS_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-    version = path[len(prefix):]
-    if not version or "/" in version:
-        return None
-    return version
-
-
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
-    if path in ("/healthz", BOOTSTRAP_PATH, ARTIFACTS_PATH, CATALOG_PATH):
+    if path in ("/healthz", CATALOG_PATH):
         return ALLOWED_METHODS
     if path == SUBMISSIONS_PATH:
         return ALLOWED_METHODS
@@ -236,8 +214,6 @@ def _allowed_methods(path):
         return ("DELETE",)
     if _match_playground_commit(path) is not None:
         return ("POST",)
-    if _match_artifact_version(path) is not None:
-        return ALLOWED_METHODS
     if _match_manifest(path) is not None:
         return ALLOWED_METHODS
     if _match_commit_files(path) is not None:
@@ -285,20 +261,6 @@ def _decode_content_path(encoded_path):
         return None
 
 
-def _content_disposition(filename):
-    """Return a safe attachment disposition for an indexed artifact name."""
-
-    safe = "".join(
-        character
-        for character in filename
-        if character.isascii()
-        and (character.isalnum() or character in "._-")
-    )
-    if not safe:
-        safe = "artifact"
-    return f'attachment; filename="{safe}"'
-
-
 def _commit_metadata():
     """Build the fixed, server-owned identity every published commit carries.
 
@@ -315,7 +277,7 @@ def _commit_metadata():
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Route the public reads and the two writes."""
+    """Route the public reads and the writes."""
 
     def do_GET(self):
         self._dispatch(self._route_get)
@@ -326,8 +288,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch(self._route_post)
 
-    # The service has no PUT, PATCH, or DELETE.  Implementing them as the
-    # shared method-not-allowed answer keeps one 405 vocabulary instead of the
+    # The service has no PUT or PATCH.  Implementing them as the shared
+    # method-not-allowed answer keeps one 405 vocabulary instead of the
     # standard library's 501 HTML page.
     def do_PUT(self):
         self._dispatch(self._method_not_allowed)
@@ -365,14 +327,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             self._respond(200, "ok\n", head_only=head_only)
-        elif path == BOOTSTRAP_PATH:
-            self._get_bootstrap(head_only=head_only)
-        elif path == ARTIFACTS_PATH:
-            self._get_artifact_index(head_only=head_only)
-        elif _match_artifact_version(path) is not None:
-            self._get_artifact(
-                _match_artifact_version(path), head_only=head_only
-            )
         elif path == CATALOG_PATH:
             self._get_catalog(head_only=head_only)
         elif _match_manifest(path) is not None:
@@ -467,120 +421,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(500, "internal_error")
             return
 
-        if not self._refresh_generated():
-            # Authority is the ref, which is already gone; the next read rebuilds.
-            pass
         self._respond_json(
             200, {"playgroundId": playground_id, "retired": retired}
-        )
-
-    def _current_generation(self):
-        """Resolve the current generation, rebuilding at most once."""
-
-        try:
-            return generated.resolve_current_generation(
-                self.server.generated_path
-            )
-        except generated.GeneratedCacheError:
-            pass
-        try:
-            with self._database() as connection:
-                generated.rebuild(
-                    self.server.generated_path,
-                    connection=connection,
-                    repository=self.server.repository,
-                    artifacts_path=self.server.artifacts_path,
-                )
-            return generated.resolve_current_generation(
-                self.server.generated_path
-            )
-        except Exception:
-            return None
-
-    def _get_bootstrap(self, head_only=False):
-        self._respond_generation_file(
-            generated.BOOTSTRAP_FILENAME, head_only=head_only
-        )
-
-    def _get_artifact_index(self, head_only=False):
-        self._respond_generation_file(
-            generated.ARTIFACT_INDEX_FILENAME, head_only=head_only
-        )
-
-    def _respond_generation_file(self, name, head_only=False):
-        generation = self._generation(head_only)
-        if generation is None:
-            return
-        data = (
-            generation.bootstrap
-            if name == generated.BOOTSTRAP_FILENAME
-            else generation.artifact_index
-        )
-        self._respond_bytes(
-            200,
-            data,
-            content_type="application/json; charset=utf-8",
-            etag=hashlib.sha256(data).hexdigest(),
-            head_only=head_only,
-        )
-
-    def _generation(self, head_only=False):
-        """Return the current generation, or answer 503 and return ``None``.
-
-        Both generated-cache reads start here: the cache is a derived copy, so
-        an unavailable one is a service problem (503), never a 404.
-        """
-
-        if self._reject_query_or_body(head_only=head_only):
-            return None
-        generation = self._current_generation()
-        if generation is None:
-            self._api_error(
-                503, "generated_unavailable", head_only=head_only
-            )
-            return None
-        return generation
-
-    def _get_artifact(self, version, head_only=False):
-        generation = self._generation(head_only)
-        if generation is None:
-            return
-        try:
-            entries = artifacts.mapping_to_index(
-                json.loads(generation.artifact_index)
-            )
-        except (ValueError, artifacts.ArtifactError):
-            self._api_error(
-                503, "generated_unavailable", head_only=head_only
-            )
-            return
-        entry = artifacts.entries_by_version(entries).get(version)
-        if entry is None:
-            self._api_error(404, "not_found", head_only=head_only)
-            return
-        try:
-            target = artifacts.verify_artifact(
-                self.server.artifacts_path, entry
-            )
-        except artifacts.ArtifactError:
-            self._api_error(
-                503, "artifact_unavailable", head_only=head_only
-            )
-            return
-        self._respond_bytes(
-            200,
-            None,
-            content_type="application/octet-stream",
-            etag=entry.sha256,
-            extra_headers=(
-                (
-                    "Content-Disposition",
-                    _content_disposition(entry.filename),
-                ),
-            ),
-            stream_path=target,
-            stream_size=entry.size,
-            head_only=head_only,
         )
 
     def _respond_bytes(
@@ -591,18 +433,15 @@ class Handler(BaseHTTPRequestHandler):
         content_type,
         etag=None,
         extra_headers=(),
-        stream_path=None,
-        stream_size=None,
         cache_control="no-store",
         head_only=False,
     ):
         if etag is not None and self._if_none_match(etag):
             self._respond_not_modified(head_only=head_only)
             return
-        length = stream_size if stream_path is not None else len(data)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
+        self.send_header("Content-Length", str(len(data)))
         if etag is not None:
             self.send_header("ETag", f'"{etag}"')
         self.send_header("Cache-Control", cache_control)
@@ -612,14 +451,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._headers_sent = True
         if not head_only:
-            if stream_path is not None:
-                with open(stream_path, "rb") as handle:
-                    for chunk in iter(
-                        lambda: handle.read(1024 * 1024), b""
-                    ):
-                        self.wfile.write(chunk)
-            else:
-                self.wfile.write(data)
+            self.wfile.write(data)
 
     def _if_none_match(self, etag):
         header = self.headers.get("If-None-Match")
@@ -846,10 +678,6 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(500, "internal_error")
             return
 
-        if not self._refresh_generated():
-            # Authority is already committed, so a cache failure must not change
-            # the publish result.  The next read rebuilds from authority.
-            pass
         self._respond_json(status, body)
 
     def _publish_bundle(self, connection, playground_id, bundle):
@@ -865,26 +693,6 @@ class Handler(BaseHTTPRequestHandler):
             "commitId": result.commit_id,
             "noOp": result.no_op,
         }
-
-    def _refresh_generated(self):
-        """Rebuild disposable caches after an authoritative mutation.
-
-        Authority is already committed, so a cache write failure never rolls
-        it back and never changes the mutation's response.  ``rebuild`` itself
-        preserves the previous complete generation on failure.
-        """
-
-        try:
-            with self._database() as connection:
-                generated.rebuild(
-                    self.server.generated_path,
-                    connection=connection,
-                    repository=self.server.repository,
-                    artifacts_path=self.server.artifacts_path,
-                )
-            return True
-        except Exception:
-            return False
 
     def _post_submission(self):
         """Accept one bounded submission from a client.
@@ -1054,7 +862,6 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     @staticmethod
-    @staticmethod
     def _playground_payload(playground):
         return {
             "id": playground.id,
@@ -1108,23 +915,6 @@ class Handler(BaseHTTPRequestHandler):
         if next_key is None:
             return None
         return pagination.encode_cursor(route, next_key)
-
-    def _reject_query_or_body(self, head_only=False):
-        if urlsplit(self.path).query:
-            self._api_error(400, "invalid_request", head_only=head_only)
-            return True
-        raw_length = self.headers.get("Content-Length")
-        if raw_length is None:
-            return False
-        try:
-            length = int(raw_length)
-        except ValueError:
-            self._api_error(400, "invalid_request", head_only=head_only)
-            return True
-        if length > 0:
-            self._api_error(400, "invalid_request", head_only=head_only)
-            return True
-        return False
 
     def _not_found(self, head_only=False):
         if urlsplit(self.path).path.startswith("/api/"):
@@ -1225,31 +1015,6 @@ class SlimHTTPServer(ThreadingHTTPServer):
         return
 
 
-def _initialize_generated(server):
-    """Build the first complete generation, or fail startup closed.
-
-    Startup never runs with absent bootstrap data.  ``generated.rebuild``
-    preserves a previously valid generation when a rebuild fails, but startup
-    still fails closed so a broken authoritative source cannot be masked by a
-    stale cache.
-    """
-
-    try:
-        with closing(open_database(server.database_path)) as connection:
-            generated.rebuild(
-                server.generated_path,
-                connection=connection,
-                repository=server.repository,
-                artifacts_path=server.artifacts_path,
-            )
-    except generated.GeneratedCacheError:
-        raise
-    except Exception as error:
-        raise generated.GeneratedCacheError(
-            "generated cache could not be initialized"
-        ) from error
-
-
 def _validate_operator_token(token):
     """Return the operator token, refusing to start without a strong one.
 
@@ -1273,36 +1038,24 @@ def make_server(
     port=PORT,
     database_path=DATABASE_PATH,
     repository_path=DEFAULT_REPOSITORY_PATH,
-    artifacts_path=None,
-    generated_path=None,
     submissions_path=None,
     operator_token=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
-    ``artifacts_path``, ``generated_path`` and ``submissions_path`` are injected
-    runtime directories.  When omitted they
-    default to sibling directories of the database, which keeps every
-    deployment path under one data directory.  The directories are created
-    lazily by the artifact index, generated-cache code and submission writer
+    ``submissions_path`` is the injected directory holding one directory per
+    handed-in piece of work.  When omitted it
+    defaults to a sibling directory of the database, which keeps every
+    deployment path under one data directory.  The directory is created
+    lazily by the submission writer
     instead of at startup, so a read-only or unused directory never becomes a
-    start-up failure.  ``submissions_path`` holds one directory per handed-in
-    piece of work.
+    start-up failure.
     """
     operator_token = _validate_operator_token(operator_token)
 
     database_path = Path(database_path)
     database = open_database(database_path)
     database.close()
-
-    if artifacts_path is None:
-        artifacts_path = database_path.parent / ARTIFACTS_DIRECTORY_NAME
-    else:
-        artifacts_path = Path(artifacts_path)
-    if generated_path is None:
-        generated_path = database_path.parent / GENERATED_DIRECTORY_NAME
-    else:
-        generated_path = Path(generated_path)
 
     if submissions_path is None:
         submissions_path = database_path.parent / SUBMISSIONS_DIRECTORY_NAME
@@ -1312,18 +1065,12 @@ def make_server(
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
 
-    if artifacts_path.exists():
-        permissions.ensure_private_directory(artifacts_path)
-
     server = SlimHTTPServer((host, port), Handler)
     server.database_path = database_path
     server.repository_path = repository_path
     server.repository = repository
-    server.artifacts_path = artifacts_path
-    server.generated_path = generated_path
     server.submissions_path = submissions_path
     server.operator_token = operator_token
-    _initialize_generated(server)
     return server
 
 
