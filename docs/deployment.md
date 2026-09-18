@@ -75,6 +75,19 @@ It prints `{"status": "ok", ...}` on success and
 one-shot and never a second door into a running deployment. Only an existing
 *Admin* blocks it; student accounts registered through the public API do not.
 
+### 1.2 Install the Portal
+
+The public home page is a static Portal artifact, not the Web Client. Copy its
+four source-owned files into `data/portal/`; the Server serves only this closed
+set of paths and reads updates without a restart.
+
+```bash
+ssh picopg.cn 'mkdir -p /home/xiaoci/picopg/data/portal'
+scp apps/portal/{index.html,styles.css} tokens.css public/pico.svg \
+  picopg.cn:/home/xiaoci/picopg/data/portal/
+curl -fsS https://picopg.cn/ | grep 'Pico'
+```
+
 ## 2. Ship a new Playground from `learn-python`
 
 The Server accepts a validated ZIP through `POST /api/v1/playgrounds/{id}/commits`.

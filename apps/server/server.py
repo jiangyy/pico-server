@@ -124,6 +124,7 @@ DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
 RUNTIME_DIRECTORY_NAME = "runtime"
+PORTAL_DIRECTORY_NAME = "portal"
 BOOTSTRAP_PATH = "/api/v1/bootstrap"
 COURSES_PATH = "/courses"
 SESSION_COOKIE_NAME = "picopg_session"
@@ -137,6 +138,23 @@ MAX_JSON_BODY_BYTES = 16 * 1024
 MAX_COMMENT_JSON_BODY_BYTES = 6 * MAX_COMMENT_BODY_BYTES + 1024
 
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+PORTAL_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/tokens.css": ("tokens.css", "text/css; charset=utf-8"),
+    "/pico.svg": ("pico.svg", "image/svg+xml"),
+}
+PORTAL_HEADERS = (
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; img-src 'self'; style-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    ),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Content-Type-Options", "nosniff"),
+)
 
 # The policy every ``/courses/**`` response carries.  A course page is one
 # published HTML file that carries its **own inline ``<script>`` and
@@ -157,6 +175,10 @@ COURSE_CSP = (
 ALLOWED_METHODS = ("GET", "HEAD")
 ROUTE_METHODS = {
     "/": ALLOWED_METHODS,
+    "/index.html": ALLOWED_METHODS,
+    "/styles.css": ALLOWED_METHODS,
+    "/tokens.css": ALLOWED_METHODS,
+    "/pico.svg": ALLOWED_METHODS,
     "/healthz": ALLOWED_METHODS,
     "/api/v1/me": ALLOWED_METHODS,
     "/api/v1/register": ("POST",),
@@ -918,10 +940,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self, head_only=False):
         path = urlsplit(self.path).path
 
-        if path == "/":
-            self._respond(
-                200, "Pico service is running\n", head_only=head_only
-            )
+        if path in PORTAL_FILES:
+            self._get_portal_file(path, head_only=head_only)
         elif _match_course_file(path) is not None:
             self._get_course_file(*_match_course_file(path), head_only=head_only)
         elif path == "/healthz":
@@ -1379,6 +1399,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._headers_sent = True
         self._audit_status = 304
+
+    def _get_portal_file(self, path, head_only=False):
+        filename, content_type = PORTAL_FILES[path]
+        target = self.server.portal_path / filename
+        try:
+            data = target.read_bytes()
+        except OSError:
+            if path == "/":
+                self._respond(
+                    200, "Pico service is running\n", head_only=head_only
+                )
+                return
+            self._not_found(head_only=head_only)
+            return
+        self._respond_bytes(
+            200,
+            data,
+            content_type=content_type,
+            etag=hashlib.sha256(data).hexdigest(),
+            extra_headers=PORTAL_HEADERS,
+            cache_control="no-cache",
+            head_only=head_only,
+        )
 
     def _get_course_file(
         self, playground_id, commit_id, encoded_path, head_only=False
@@ -3538,14 +3581,16 @@ def make_server(
     artifacts_path=None,
     generated_path=None,
     runtime_path=None,
+    portal_path=None,
     audit_output=None,
     audit_clock=None,
     audit_request_ids=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
-    ``artifacts_path``, ``generated_path`` and ``runtime_path`` are injected
-    runtime directories.  When omitted they default to sibling directories of
+    ``artifacts_path``, ``generated_path``, ``runtime_path`` and
+    ``portal_path`` are injected runtime directories.  When omitted they
+    default to sibling directories of
     the database, which keeps every deployment path under one data directory.
     The directories are created lazily by the artifact index and
     generated-cache code instead of at startup, so a read-only or unused
@@ -3569,6 +3614,10 @@ def make_server(
         runtime_path = database_path.parent / RUNTIME_DIRECTORY_NAME
     else:
         runtime_path = Path(runtime_path)
+    if portal_path is None:
+        portal_path = database_path.parent / PORTAL_DIRECTORY_NAME
+    else:
+        portal_path = Path(portal_path)
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
@@ -3583,6 +3632,7 @@ def make_server(
     server.artifacts_path = artifacts_path
     server.generated_path = generated_path
     server.runtime_path = runtime_path
+    server.portal_path = portal_path
     server.audit = audit.AuditLog(
         output=audit_output,
         clock=audit_clock,

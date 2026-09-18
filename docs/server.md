@@ -11,6 +11,7 @@ data/
   artifacts/        不可变 runtime/EXE
   generated/        可重建的 manifest/bootstrap/index
   runtime/          课程页面按需加载的共享运行时
+  portal/           官网的独立静态产物
 ```
 
 v0.1 使用一个仓库和一个数据库；只有出现经测量的容量或锁问题时才拆分。

@@ -22,11 +22,21 @@ class ServerTest(unittest.TestCase):
         cls.temporary_directory = tempfile.TemporaryDirectory()
         database_path = Path(cls.temporary_directory.name) / "app.db"
         cls.repository_path = Path(cls.temporary_directory.name) / "picopg.git"
+        cls.portal_path = Path(cls.temporary_directory.name) / "portal"
+        cls.portal_path.mkdir()
+        for name, data in {
+            "index.html": b"<!doctype html><title>Pico portal</title>",
+            "styles.css": b"body{margin:0}",
+            "tokens.css": b":root{color-scheme:light}",
+            "pico.svg": b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+        }.items():
+            cls.portal_path.joinpath(name).write_bytes(data)
         cls.server = make_server(
             host="127.0.0.1",
             port=0,
             database_path=database_path,
             repository_path=cls.repository_path,
+            portal_path=cls.portal_path,
         )
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -50,9 +60,10 @@ class ServerTest(unittest.TestCase):
         return status, headers, data
 
     def test_homepage(self):
-        status, _, body = self.request("GET", "/")
+        status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertEqual(body, b"Pico service is running\n")
+        self.assertEqual(body, b"<!doctype html><title>Pico portal</title>")
+        self.assertIn("default-src 'none'", headers["content-security-policy"])
 
     def test_healthz(self):
         status, _, body = self.request("GET", "/healthz")
@@ -64,18 +75,21 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body, b"not found\n")
 
-    def test_web_client_bundle_is_not_served(self):
-        for path in ("/index.html", "/main.js", "/picopg.css", "/pico.svg"):
+    def test_portal_assets_are_served_but_client_bundle_is_not(self):
+        for path in ("/index.html", "/styles.css", "/tokens.css", "/pico.svg"):
             with self.subTest(path=path):
-                status, _, _ = self.request("GET", path)
-                self.assertEqual(status, 404)
+                self.assertEqual(self.request("GET", path)[0], 200)
+        for path in ("/main.js", "/picopg.css"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request("GET", path)[0], 404)
 
     def test_head_mirrors_get_headers_without_body(self):
         status, headers, body = self.request("HEAD", "/")
         self.assertEqual(status, 200)
         self.assertEqual(body, b"")
         self.assertEqual(
-            int(headers["content-length"]), len(b"Pico service is running\n")
+            int(headers["content-length"]),
+            len(b"<!doctype html><title>Pico portal</title>"),
         )
 
     def test_unsupported_methods_are_405(self):
