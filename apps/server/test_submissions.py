@@ -21,6 +21,7 @@ import idempotency  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
 import submissions  # noqa: E402
+from unittest import mock  # noqa: E402
 from database import open_database  # noqa: E402
 
 MANIFEST_BYTES = b'{"schemaVersion":1,"runtime":"python"}'
@@ -83,7 +84,7 @@ class DecodeSubmissionTest(SubmissionTestBase):
         self.assertEqual(request.playground_id, self.playground_id)
         self.assertEqual(request.playground_commit_id, self.commit_id)
         self.assertEqual(request.student, "2026-001")
-        self.assertEqual(request.files, (("work/main.py", "print(1)\n"),))
+        self.assertEqual(dict(request.files), {"work/main.py": "print(1)\n"})
 
     def test_the_student_name_is_trimmed_and_bounded(self):
         self.assertEqual(
@@ -135,7 +136,122 @@ class DecodeSubmissionTest(SubmissionTestBase):
 
     def test_a_file_set_without_files_is_allowed(self):
         request = submissions.decode_submission_request(self.payload(files={}))
-        self.assertEqual(request.files, ())
+        self.assertEqual(dict(request.files), {})
+
+
+class FileSetValidationTest(unittest.TestCase):
+    """The one place a client contributes bytes: which file sets are refused.
+
+    Each case names the exact reason the API reports, because that string is
+    what a caller gets in `details.reason` and nothing else.
+    """
+
+    def reason(self, files):
+        with self.assertRaises(submissions.InvalidSubmissionRequestError) as caught:
+            submissions.decode_submission_request(
+                {
+                    "playgroundId": "pg-one",
+                    "commitId": "0" * 40,
+                    "student": "2026-001",
+                    "files": files,
+                }
+            )
+        return str(caught.exception).split(": ", 1)[-1]
+
+    def test_only_work_paths_are_accepted(self):
+        for path, reason in [
+            (".picopg/work.json", "path_not_allowed"),
+            ("picopg.json", "path_not_allowed"),
+            ("course/module/app.py", "path_not_allowed"),
+            ("starter/setup.py", "path_not_allowed"),
+            ("work", "path_not_allowed"),
+            ("Work/main.py", "path_not_allowed"),
+            ("work/../escape.py", "path_dot_segment"),
+            ("work/./same.py", "path_dot_segment"),
+            ("work//empty.py", "path_empty_segment"),
+            ("/work/absolute.py", "path_absolute"),
+            ("work\\windows.py", "path_backslash"),
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(self.reason({path: "x"}), reason)
+
+    def test_non_portable_paths_are_refused_with_the_bundle_reason(self):
+        for path, reason in [
+            ("work/CON.py", "path_reserved_name"),
+            ("work/sub/LPT1.txt", "path_reserved_name"),
+            ("work/.git/config", "path_reserved_name"),
+            ("work/a:b.py", "path_portable_character"),
+            ("work/trailing.", "path_portable_character"),
+            ("work/trailing ", "path_portable_character"),
+            ("work/a\nb.py", "path_control"),
+            ("work/a\u0001b.py", "path_control"),
+            ("work/a\u007fb.py", "path_control"),
+            ("work/a\ud800b", "path_invalid_unicode"),
+            ("work/x/a\x00.py", "path_nul"),
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(self.reason({path: "x"}), reason)
+
+    def test_portable_near_misses_are_accepted(self):
+        request = submissions.decode_submission_request(
+            {
+                "playgroundId": "pg-one",
+                "commitId": "0" * 40,
+                "student": "2026-001",
+                "files": {
+                    "work/console.py": "1",
+                    "work/com10.txt": "2",
+                    "work/a b.txt": "3",
+                    "work/café.py": "4",
+                },
+            }
+        )
+        self.assertEqual(
+            sorted(request.files),
+            ["work/a b.txt", "work/café.py", "work/com10.txt", "work/console.py"],
+        )
+
+    def test_a_case_colliding_set_is_refused(self):
+        self.assertEqual(
+            self.reason({"work/File.py": "1", "work/file.py": "2"}),
+            "path_case_collision",
+        )
+
+    def test_two_paths_that_normalize_alike_are_refused(self):
+        # JSON can carry the decomposed and the composed form of one name; only
+        # one of them may become the stored path.
+        self.assertEqual(
+            self.reason({"work/caf\u00e9.py": "1", "work/cafe\u0301.py": "2"}),
+            "duplicate_path",
+        )
+
+    def test_a_file_path_that_is_not_text_is_refused(self):
+        self.assertEqual(self.reason({"work/a.py": 7}), "entry_data_not_bytes")
+
+    def test_the_limits_are_the_bundle_limits(self):
+        import bundles
+
+        too_many = {f"work/f{index}.py": "x" for index in range(bundles.MAX_ENTRY_COUNT + 1)}
+        self.assertEqual(self.reason(too_many), "too_many_entries")
+
+        with mock.patch.object(bundles, "MAX_FILE_BYTES", 3):
+            self.assertEqual(self.reason({"work/a.py": "1234"}), "file_too_large")
+
+        with mock.patch.object(bundles, "MAX_TOTAL_BYTES", 3):
+            self.assertEqual(
+                self.reason({"work/a.py": "12", "work/b.py": "34"}), "work_too_large"
+            )
+
+    def test_the_file_set_is_returned_canonically(self):
+        request = submissions.decode_submission_request(
+            {
+                "playgroundId": "pg-one",
+                "commitId": "0" * 40,
+                "student": "2026-001",
+                "files": {"work/b.py": "2", "work/a.py": "1"},
+            }
+        )
+        self.assertEqual(list(request.files.items()), [("work/a.py", "1"), ("work/b.py", "2")])
 
 
 class CreateSubmissionTest(SubmissionTestBase):

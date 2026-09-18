@@ -8,6 +8,12 @@ Playground's own history, and only its id is stored.  A submission therefore
 cannot alter what other clients download, and re-submitting the same work is a
 new immutable row rather than an edit.
 
+The file set is the one place a client contributes bytes, so this module also
+owns the rule for what such a set may look like: only portable paths under
+``work/``, bounded in count, per-file bytes and total bytes.  The portability
+and collision rules are the shared ones in :mod:`bundles`, which is why a
+submitted path cannot be one a bundle would refuse.
+
 Submissions are append-only: this module exposes no update, delete, or status
 behavior.  Creation goes through the persistent idempotency layer, so an exact
 retry returns the original ``201`` body and a changed body conflicts.
@@ -15,14 +21,17 @@ retry returns the original ``201`` body and a changed body conflicts.
 
 import json
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import MappingProxyType
+from typing import Mapping
 
+import bundles
 import idempotency
 import playgrounds
 import repository as repository_module
-import works
 from pagination import Page
 
 
@@ -38,6 +47,10 @@ MAX_STUDENT_LENGTH = 128
 # form before any lookup stops a symbolic name such as ``HEAD`` from being
 # resolved as if it were the supplied commit.
 _COMMIT_ID_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
+
+# The only prefix a client may contribute under: everything else in a commit
+# (``course/**``, ``starter/**``, ``picopg.json``) belongs to the publisher.
+WORK_PREFIX = "work/"
 
 
 class SubmissionError(Exception):
@@ -67,7 +80,8 @@ class SubmissionRequest:
     playground_id: str
     playground_commit_id: str
     student: str
-    files: tuple
+    """Canonical ``work/**`` path to text, sorted; the files handed in."""
+    files: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -116,45 +130,84 @@ def _require_student(value):
     return student
 
 
+def _normalized_work_path(path):
+    """Return the canonical ``work/**`` path, or raise the reason it cannot be.
+
+    The segment rules are :func:`bundles.portable_segment_reason`, so a path a
+    bundle would refuse is refused here too, with the same reason code.  Only
+    the ``work/`` prefix is this module's own rule.
+    """
+
+    if type(path) is not str:
+        raise InvalidSubmissionRequestError("invalid files: path_not_str")
+
+    normalized = unicodedata.normalize("NFC", path)
+    if normalized.startswith("/"):
+        raise InvalidSubmissionRequestError("invalid files: path_absolute")
+
+    segments = normalized.split("/")
+    for segment in segments:
+        reason = bundles.portable_segment_reason(segment)
+        if reason is not None:
+            raise InvalidSubmissionRequestError(f"invalid files: {reason}")
+
+    if not normalized.startswith(WORK_PREFIX) or len(normalized) == len(WORK_PREFIX):
+        raise InvalidSubmissionRequestError("invalid files: path_not_allowed")
+    return normalized
+
+
+def _require_files(value):
+    """Validate the handed-in file set and return canonical ``path -> text``.
+
+    Nothing is returned unless the whole set passes: the entry count and the
+    per-file and total byte bounds are the bundle limits, and a path that
+    normalizes onto another one is a refusal rather than a silent overwrite.
+    """
+
+    if type(value) is not dict:
+        raise InvalidSubmissionRequestError("files must be an object of path to text")
+    if len(value) > bundles.MAX_ENTRY_COUNT:
+        raise InvalidSubmissionRequestError("invalid files: too_many_entries")
+
+    normalized = {}
+    total_bytes = 0
+    for path, text in value.items():
+        if type(text) is not str:
+            raise InvalidSubmissionRequestError("invalid files: entry_data_not_bytes")
+        canonical = _normalized_work_path(path)
+        encoded = len(text.encode("utf-8"))
+        if encoded > bundles.MAX_FILE_BYTES:
+            raise InvalidSubmissionRequestError("invalid files: file_too_large")
+        total_bytes += encoded
+        if total_bytes > bundles.MAX_TOTAL_BYTES:
+            raise InvalidSubmissionRequestError("invalid files: work_too_large")
+        if canonical in normalized:
+            raise InvalidSubmissionRequestError("invalid files: duplicate_path")
+        normalized[canonical] = text
+
+    if bundles.portable_path_collision(normalized):
+        raise InvalidSubmissionRequestError("invalid files: path_case_collision")
+
+    # Sorted for a deterministic stored order that does not depend on input.
+    return MappingProxyType(dict(sorted(normalized.items())))
+
+
 def decode_submission_request(payload):
     """Validate a submission body and return a normalized request.
 
-    The file set is checked with :func:`works.validate_work_files`: only
-    portable ``work/**`` paths, bounded count, bounded per-file and total
-    bytes, no duplicate or case-colliding path.  Nothing is returned unless
-    the whole body passes.
+    The playground id, the commit id and the student name are checked for the
+    exact shape the API promises; the file set is checked by
+    :func:`_require_files`.  Nothing is returned unless the whole body passes.
     """
 
     if type(payload) is not dict:
         raise InvalidSubmissionRequestError("body must be an object")
 
-    playground_id = _require_playground_id(payload.get("playgroundId"))
-    playground_commit_id = _require_commit_id(payload.get("commitId"))
-    student = _require_student(payload.get("student"))
-
-    files = payload.get("files")
-    if type(files) is not dict:
-        raise InvalidSubmissionRequestError("files must be an object")
-
-    entries = []
-    for path, text in files.items():
-        if type(text) is not str:
-            raise InvalidSubmissionRequestError("each file must be text")
-        entries.append(works.WorkEntry(path, text.encode("utf-8")))
-
-    try:
-        normalized = works.validate_work_files(entries)
-    except works.WorkValidationError as error:
-        raise InvalidSubmissionRequestError(
-            f"invalid files: {error.reason}"
-        ) from error
-
-    texts = {path: data.decode("utf-8") for path, data in normalized.items()}
     return SubmissionRequest(
-        playground_id=playground_id,
-        playground_commit_id=playground_commit_id,
-        student=student,
-        files=tuple(sorted(texts.items())),
+        playground_id=_require_playground_id(payload.get("playgroundId")),
+        playground_commit_id=_require_commit_id(payload.get("commitId")),
+        student=_require_student(payload.get("student")),
+        files=_require_files(payload.get("files")),
     )
 
 

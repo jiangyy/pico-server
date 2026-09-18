@@ -23,9 +23,9 @@ import generated
 import manifests
 import pagination
 import permissions
-import works
 from bundles import (
     MAX_ARCHIVE_BYTES,
+    MAX_TOTAL_BYTES,
     BundleValidationError,
     decode_bundle_zip,
     validate_bundle,
@@ -110,10 +110,10 @@ SUBMISSIONS_PATH = "/api/v1/submissions"
 # use the same key without colliding.
 OPERATOR_SCOPE = "operator"
 
-# A submission body is bounded JSON: base64-free text files plus the request
-# fields, and it must stay inside the file-set limits works.validate_work_files
-# enforces.  Twice the decoded total leaves room for JSON escaping.
-MAX_SUBMISSION_JSON_BODY_BYTES = 2 * works.MAX_WORK_TOTAL_BYTES
+# A submission body is bounded JSON: the request fields plus text files, and it
+# must stay inside the file-set limits the submission module enforces.  Twice
+# the decoded total leaves room for JSON escaping.
+MAX_SUBMISSION_JSON_BODY_BYTES = 2 * MAX_TOTAL_BYTES
 
 # The operator token is the whole write authorization: publishing a bundle and
 # reading what was handed in.  It is supplied at start-up, compared in constant
