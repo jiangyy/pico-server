@@ -1,6 +1,6 @@
 """HTTP tests for the two functions this service has.
 
-Reads are anonymous: catalog, manifest, exact files, and the shared runtime.
+Reads are anonymous: catalog, manifest and exact files.
 Writes are the operator's bundle upload and a client's bounded submission.
 Every test drives a real server over a real socket against a temporary data
 directory, so a passing test is evidence about the HTTP contract rather than
@@ -40,14 +40,12 @@ class ServerTestCase(unittest.TestCase):
         base = Path(cls.temporary_directory.name)
         cls.database_path = base / "app.db"
         cls.generated_path = base / "generated"
-        cls.runtime_path = base / "runtime"
         cls.server = make_server(
             host="127.0.0.1",
             port=0,
             database_path=cls.database_path,
             repository_path=base / "picopg.git",
             generated_path=cls.generated_path,
-            runtime_path=cls.runtime_path,
             operator_token=OPERATOR_TOKEN,
         )
         cls.port = cls.server.server_address[1]
@@ -264,37 +262,6 @@ class DistributionTest(ServerTestCase):
         )
         self.assertEqual(status, 404)
 
-    def test_course_file_carries_the_page_policy(self):
-        playground_id, commit_id = self.seed()
-
-        status, headers, body = self.request(
-            "GET",
-            f"/courses/{playground_id}/{commit_id}/course/module/app.py",
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"print(1)")
-        self.assertIn("wasm-unsafe-eval", headers["content-security-policy"])
-
-    def test_runtime_file_is_served_from_the_runtime_directory(self):
-        (self.runtime_path / "libs").mkdir(parents=True, exist_ok=True)
-        (self.runtime_path / "libs" / "react.js").write_bytes(b"// react")
-        playground_id, commit_id = self.seed()
-
-        status, headers, body = self.request(
-            "GET", f"/courses/{playground_id}/{commit_id}/libs/react.js"
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"// react")
-        self.assertEqual(headers["content-type"], "text/javascript; charset=utf-8")
-
-    def test_runtime_path_cannot_escape_the_runtime_directory(self):
-        playground_id, commit_id = self.seed()
-
-        status, _, _ = self.request(
-            "GET", f"/courses/{playground_id}/{commit_id}/libs/../../app.db"
-        )
-        self.assertEqual(status, 404)
-
     def test_bootstrap_and_artifact_index_are_anonymous(self):
         self.seed()
 
@@ -434,11 +401,13 @@ class RetiringTest(ServerTestCase):
 
         self.assertNotIn("pg-retire", self.catalog_ids())
         # Nothing is readable any more: the ref is what every read resolves first.
-        for path in (
-            f"/api/v1/playgrounds/pg-retire/commits/{commit_id}/manifest",
-            "/courses/pg-retire/{0}/course/index.html".format(commit_id),
-        ):
-            self.assertEqual(self.request("GET", path)[0], 404)
+        self.assertEqual(
+            self.request(
+                "GET",
+                f"/api/v1/playgrounds/pg-retire/commits/{commit_id}/manifest",
+            )[0],
+            404,
+        )
 
         # The record is untouched: publishing the same id brings the course back
         # and readable. The restored commit is a new one — the old ref is gone for
@@ -785,7 +754,6 @@ class OperatorTokenTest(unittest.TestCase):
             database_path=self.base / "app.db",
             repository_path=self.base / "picopg.git",
             generated_path=self.base / "generated",
-            runtime_path=self.base / "runtime",
             operator_token=token,
         )
         server_instance.server_close()

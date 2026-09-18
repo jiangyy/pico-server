@@ -1,8 +1,8 @@
 """PicoPG HTTP service using only the Python standard library.
 
 Two things live here.  Reads hand a client the published course content it
-asks for: the catalog, one commit's manifest, one file's exact bytes, and the
-shared runtime files.  Writes accept a bundle from the operator and a bounded
+asks for: the catalog, one commit's manifest and one file's exact bytes.
+Writes accept a bundle from the operator and a bounded
 submission from a client.  Everything a read needs is public, so the read path
 holds no session, no role, and no per-caller decision; every write is bounded
 and validated before it reaches the repository or the database.
@@ -74,32 +74,13 @@ PORT = 8001
 DATABASE_PATH = Path("data/app.db")
 ARTIFACTS_DIRECTORY_NAME = "artifacts"
 GENERATED_DIRECTORY_NAME = "generated"
-RUNTIME_DIRECTORY_NAME = "runtime"
 SUBMISSIONS_DIRECTORY_NAME = "submissions"
 BOOTSTRAP_PATH = "/api/v1/bootstrap"
-COURSES_PATH = "/courses"
 
 ARTIFACTS_PATH = "/api/v1/artifacts"
 MAX_JSON_BODY_BYTES = 16 * 1024
 
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
-
-
-# The policy every ``/courses/**`` response carries.  A course page is one
-# published HTML file that carries its **own inline ``<script>`` and
-# ``<style>``** (there is no separate asset pipeline to move them into files),
-# and Pyodide compiles its WASM under this same policy.  So ``script-src``
-# needs ``'unsafe-inline'`` for the page's own script and ``'wasm-unsafe-eval'``
-# for the WASM compile, and ``connect-src 'self'`` lets Pyodide fetch
-# ``pyodide.asm.wasm`` and the wheel from this origin.  This is deliberately the
-# same policy as the desktop host's ``COURSE_CSP``; a stricter one silently
-# renders an empty page, which is invisible to a status-code assertion.
-COURSE_CSP = (
-    "default-src 'self'; img-src 'self' data:; "
-    "style-src 'self' 'unsafe-inline'; "
-    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
-    "connect-src 'self'"
-)
 
 ALLOWED_METHODS = ("GET", "HEAD")
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
@@ -243,18 +224,6 @@ def _match_artifact_version(path):
     return version
 
 
-def _match_course_file(path):
-    """Return ``(playground_id, commit_id, encoded_path)`` for course files."""
-
-    prefix = COURSES_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-    parts = path[len(prefix):].split("/", 2)
-    if len(parts) != 3 or not all(parts):
-        return None
-    return tuple(parts)
-
-
 def _allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown."""
     if path in ("/healthz", BOOTSTRAP_PATH, ARTIFACTS_PATH, CATALOG_PATH):
@@ -267,8 +236,6 @@ def _allowed_methods(path):
         return ("DELETE",)
     if _match_playground_commit(path) is not None:
         return ("POST",)
-    if _match_course_file(path) is not None:
-        return ALLOWED_METHODS
     if _match_artifact_version(path) is not None:
         return ALLOWED_METHODS
     if _match_manifest(path) is not None:
@@ -330,39 +297,6 @@ def _content_disposition(filename):
     if not safe:
         safe = "artifact"
     return f'attachment; filename="{safe}"'
-
-
-# Suffix -> media type for the files a course bundle and the runtime contain.
-# The image types matter: a card cover is a plain ``<img src>``, and this Server
-# sends ``X-Content-Type-Options: nosniff``, so an unlisted suffix would be
-# handed to the browser as an opaque download.
-COURSE_CONTENT_TYPES = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-    ".mjs": "text/javascript; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".map": "application/json; charset=utf-8",
-    ".txt": "text/plain; charset=utf-8",
-    ".svg": "image/svg+xml",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".ico": "image/vnd.microsoft.icon",
-    ".wasm": "application/wasm",
-    ".zip": "application/zip",
-    ".whl": "application/zip",
-    ".woff2": "font/woff2",
-    ".woff": "font/woff",
-    ".ttf": "font/ttf",
-}
-
-
-def _course_content_type(path):
-    suffix = path.rpartition(".")[2].lower()
-    return COURSE_CONTENT_TYPES.get(f".{suffix}", "application/octet-stream")
 
 
 def _commit_metadata():
@@ -429,9 +363,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self, head_only=False):
         path = urlsplit(self.path).path
 
-        if _match_course_file(path) is not None:
-            self._get_course_file(*_match_course_file(path), head_only=head_only)
-        elif path == "/healthz":
+        if path == "/healthz":
             self._respond(200, "ok\n", head_only=head_only)
         elif path == BOOTSTRAP_PATH:
             self._get_bootstrap(head_only=head_only)
@@ -698,64 +630,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self._headers_sent = True
-
-    def _get_course_file(
-        self, playground_id, commit_id, encoded_path, head_only=False
-    ):
-        path = _decode_content_path(encoded_path)
-        if path is None:
-            self._not_found(head_only=head_only)
-            return
-
-        runtime = (
-            path in ("pico.css", "pico.js", "world.js", "pico.svg")
-            or path.startswith("libs/")
-            or path.startswith("pyodide/")
-        )
-        if runtime:
-            # The shared runtime is not part of a bundle, so it is served from
-            # the runtime directory instead of a commit tree.  The path is
-            # resolved inside that directory, so no request can escape it.
-            segments = path.split("/")
-            if any(not segment or segment in (".", "..") for segment in segments):
-                self._not_found(head_only=head_only)
-                return
-            target = (self.server.runtime_path / path).resolve()
-            root = self.server.runtime_path.resolve()
-            if root not in target.parents or not target.is_file():
-                self._not_found(head_only=head_only)
-                return
-            data = target.read_bytes()
-            self._respond_bytes(
-                200,
-                data,
-                content_type=_course_content_type(path),
-                etag=hashlib.sha256(data).hexdigest(),
-                cache_control=COURSE_FILE_CACHE_CONTROL,
-                extra_headers=(("Content-Security-Policy", COURSE_CSP),),
-                head_only=head_only,
-            )
-            return
-
-        try:
-            content = manifests.read_commit_file(
-                self.server.repository, playground_id, commit_id, path
-            )
-        except manifests.ManifestError:
-            self._not_found(head_only=head_only)
-            return
-        except RepositoryError:
-            self._api_error(500, "internal_error", head_only=head_only)
-            return
-        self._respond_bytes(
-            200,
-            content.data,
-            content_type=_course_content_type(path),
-            etag=content.sha256,
-            cache_control=COURSE_FILE_CACHE_CONTROL,
-            extra_headers=(("Content-Security-Policy", COURSE_CSP),),
-            head_only=head_only,
-        )
 
     def _get_catalog(self, head_only=False):
         parsed = self._list_query(pagination.CATALOG_ROUTE, head_only)
@@ -1401,21 +1275,19 @@ def make_server(
     repository_path=DEFAULT_REPOSITORY_PATH,
     artifacts_path=None,
     generated_path=None,
-    runtime_path=None,
     submissions_path=None,
     operator_token=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
-    ``artifacts_path``, ``generated_path``, ``runtime_path`` and
-    ``submissions_path`` are injected runtime directories.  When omitted they
+    ``artifacts_path``, ``generated_path`` and ``submissions_path`` are injected
+    runtime directories.  When omitted they
     default to sibling directories of the database, which keeps every
     deployment path under one data directory.  The directories are created
     lazily by the artifact index, generated-cache code and submission writer
     instead of at startup, so a read-only or unused directory never becomes a
-    start-up failure.  ``runtime_path`` contains the shared files loaded on
-    demand by course pages; ``submissions_path`` holds one directory per
-    handed-in piece of work.
+    start-up failure.  ``submissions_path`` holds one directory per handed-in
+    piece of work.
     """
     operator_token = _validate_operator_token(operator_token)
 
@@ -1431,11 +1303,6 @@ def make_server(
         generated_path = database_path.parent / GENERATED_DIRECTORY_NAME
     else:
         generated_path = Path(generated_path)
-
-    if runtime_path is None:
-        runtime_path = database_path.parent / RUNTIME_DIRECTORY_NAME
-    else:
-        runtime_path = Path(runtime_path)
 
     if submissions_path is None:
         submissions_path = database_path.parent / SUBMISSIONS_DIRECTORY_NAME
@@ -1454,7 +1321,6 @@ def make_server(
     server.repository = repository
     server.artifacts_path = artifacts_path
     server.generated_path = generated_path
-    server.runtime_path = runtime_path
     server.submissions_path = submissions_path
     server.operator_token = operator_token
     _initialize_generated(server)
