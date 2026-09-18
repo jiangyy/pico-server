@@ -425,11 +425,11 @@ class SubmissionTest(ServerTestCase):
         self.assertEqual(status, 201)
         submission_id = body["submission"]["id"]
 
-        # One directory per piece of work: <班级>/<姓名>/<时间>-<id8>/work/main.py
+        # One directory per piece of work: <班级>/<姓名>/<playgroundId>/work/main.py
         class_directory = Path(self.server.submissions_path) / "1 班" / "张三"
         self.assertTrue(class_directory.is_dir())
         (folder,) = list(class_directory.iterdir())
-        self.assertTrue(folder.name.endswith(submission_id[:8]))
+        self.assertEqual(folder.name, playground_id)
         self.assertEqual(
             (folder / "work/main.py").read_text(encoding="utf-8"), "print(1)\n"
         )
@@ -441,6 +441,7 @@ class SubmissionTest(ServerTestCase):
         self.assertEqual(manifest["playgroundId"], playground_id)
         self.assertEqual(manifest["commitId"], commit_id)
         self.assertEqual(manifest["files"], ["work/main.py"])
+        self.assertEqual(manifest["ordinal"], 1)
 
     def test_a_hostile_student_name_stays_inside_the_submissions_root(self):
         playground_id, commit_id = self.seed()
@@ -459,6 +460,35 @@ class SubmissionTest(ServerTestCase):
             self.assertIn(root, path.parents)
             self.assertNotIn("..", path.relative_to(root).parts)
         self.assertFalse((root.parent.parent / "etc").exists())
+
+    def test_handing_the_same_course_in_twice_numbers_the_folder(self):
+        playground_id, commit_id = self.seed()
+
+        # A student of their own: the class shares one database, so a name another
+        # test already used would start this one at a later ordinal.
+        first = self.submit(playground_id, commit_id, student="王五（7 班）")
+        second = self.submit(
+            playground_id,
+            commit_id,
+            student="王五（7 班）",
+            files={"work/main.py": "print(2)\n"},
+        )
+        self.assertEqual((first[0], second[0]), (201, 201))
+
+        student_directory = Path(self.server.submissions_path) / "7 班" / "王五"
+        self.assertEqual(
+            sorted(entry.name for entry in student_directory.iterdir()),
+            [playground_id, f"{playground_id}-2"],
+        )
+        # Each hand-in keeps its own work; the first one is not overwritten.
+        self.assertEqual(
+            (student_directory / playground_id / "work/main.py").read_text(encoding="utf-8"),
+            "print(1)\n",
+        )
+        self.assertEqual(
+            (student_directory / f"{playground_id}-2" / "work/main.py").read_text(encoding="utf-8"),
+            "print(2)\n",
+        )
 
     def test_an_exact_retry_rewrites_the_same_folder(self):
         playground_id, commit_id = self.seed()

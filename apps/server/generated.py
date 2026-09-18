@@ -148,8 +148,9 @@ def public_catalog(connection, repository):
     the exact current commit, so the cache holds no per-caller access.
     """
 
+    # The order a teacher published the courses in is the order a student sees.
     rows = connection.execute(
-        "SELECT id FROM playgrounds ORDER BY id"
+        "SELECT id FROM playgrounds ORDER BY created_at, id"
     ).fetchall()
 
     catalog = []

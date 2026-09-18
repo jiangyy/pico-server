@@ -291,8 +291,13 @@ def create_submission(connection, repository, request, request_key):
 # The database row is the record; these files are for whoever marks the work.
 # One submission lands at::
 #
-#     <root>/<班级>/<姓名>/<YYYYMMDD-HHMMSS>-<id8>/work/main.py
-#     <root>/<班级>/<姓名>/<YYYYMMDD-HHMMSS>-<id8>/submission.json
+#     <root>/<班级>/<姓名>/<playgroundId>/work/main.py
+#     <root>/<班级>/<姓名>/<playgroundId>/submission.json
+#
+# A second piece of work for the same course becomes ``<playgroundId>-2``, then
+# ``-3``.  The number is the submission's position in the record (see
+# :func:`submission_ordinal`), not a count of folders, so a replayed create lands
+# where it did the first time.
 #
 # A name with no 班级 is filed directly under ``<root>/<姓名>/``.
 #
@@ -343,17 +348,40 @@ def student_segments(student):
     return "", _safe_segment(student) or "student"
 
 
-def submission_directory(root, submission_id, student, created_at):
-    """Return the directory one submission's files belong in, as a path.
+def submission_ordinal(connection, student, submission_id, created_at):
+    """Return this submission's 1-based position among that student's work.
 
-    The timestamp keeps folders in the order the work arrived; the id suffix
-    keeps two submissions in the same second apart.
+    The number comes from the record, never from the filesystem: an idempotent
+    replay must land in the same folder, and counting existing directories would
+    hand it the next number instead. ``id`` breaks ties when two submissions
+    share a timestamp.
     """
 
-    digits = "".join(character for character in created_at if character.isdigit())
-    stamp = f"{digits[:8]}-{digits[8:14]}" if len(digits) >= 14 else digits
+    row = connection.execute(
+        """
+        SELECT COUNT(*) FROM submissions
+        WHERE student = ?
+          AND (created_at < ? OR (created_at = ? AND id <= ?))
+        """,
+        (student, created_at, created_at, submission_id),
+    ).fetchone()
+    return int(row[0]) if row is not None else 1
+
+
+def submission_directory(root, student, playground_id, ordinal):
+    """Return the directory one submission's files belong in, as a path.
+
+    One folder per handed-in course: ``<班级>/<姓名>/<playgroundId>``, and
+    ``<playgroundId>-2``, ``-3`` … for the same course handed in again.
+    """
+
+    folder = playground_id if ordinal <= 1 else f"{playground_id}-{ordinal}"
     class_room, name = student_segments(student)
-    parts = [part for part in (class_room, name, f"{stamp}-{submission_id[:8]}") if part]
+    parts = [
+        part
+        for part in (class_room, name, _safe_segment(folder) or folder)
+        if part
+    ]
 
     directory = Path(root)
     for part in parts:
@@ -369,6 +397,7 @@ def write_submission_files(
     playground_commit_id,
     created_at,
     files,
+    ordinal=1,
 ):
     """Write one submission's files under ``root`` and return the directory.
 
@@ -379,7 +408,7 @@ def write_submission_files(
     """
 
     directory = permissions.ensure_private_directory(
-        submission_directory(root, submission_id, student, created_at)
+        submission_directory(root, student, playground_id, ordinal)
     )
 
     for path, text in files.items():
@@ -394,6 +423,7 @@ def write_submission_files(
         "commitId": playground_commit_id,
         "student": student,
         "createdAt": created_at,
+        "ordinal": ordinal,
         "files": sorted(files),
     }
     manifest_path = directory / MANIFEST_NAME

@@ -422,7 +422,7 @@ class SubmissionFileLayoutTest(unittest.TestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name) / "submissions"
 
-    def write(self, student, files=None):
+    def write(self, student, files=None, ordinal=1):
         return submissions.write_submission_files(
             root=self.root,
             submission_id="abcdef1234567890",
@@ -431,6 +431,7 @@ class SubmissionFileLayoutTest(unittest.TestCase):
             playground_commit_id="c1" + "0" * 38,
             created_at="2026-09-18T10:11:12Z",
             files=files if files is not None else {"work/main.py": "print(1)\n"},
+            ordinal=ordinal,
         )
 
     def test_class_and_name_become_one_directory_each(self):
@@ -438,7 +439,7 @@ class SubmissionFileLayoutTest(unittest.TestCase):
 
         self.assertEqual(
             directory.relative_to(self.root),
-            Path("1 班") / "张三" / "20260918-101112-abcdef12",
+            Path("1 班") / "张三" / "pg-one",
         )
         self.assertEqual(
             (directory / "work/main.py").read_text(encoding="utf-8"), "print(1)\n"
@@ -446,10 +447,19 @@ class SubmissionFileLayoutTest(unittest.TestCase):
 
     def test_a_name_without_a_class_is_filed_directly_under_it(self):
         directory = self.write("张三")
+        self.assertEqual(directory.relative_to(self.root), Path("张三") / "pg-one")
+
+    def test_handing_the_same_course_in_again_is_numbered(self):
+        first = self.write("张三（1 班）", ordinal=1)
+        second = self.write("张三（1 班）", ordinal=2)
+        third = self.write("张三（1 班）", ordinal=3)
+
         self.assertEqual(
-            directory.relative_to(self.root),
-            Path("张三") / "20260918-101112-abcdef12",
+            [d.name for d in (first, second, third)], ["pg-one", "pg-one-2", "pg-one-3"]
         )
+        # Same course, same student, and each hand-in keeps its own copy of the work.
+        self.assertEqual(first.parent, second.parent)
+        self.assertEqual((second / "work/main.py").read_text(encoding="utf-8"), "print(1)\n")
 
     def test_the_folder_says_whose_work_it_is(self):
         directory = self.write("张三（1 班）")
@@ -463,6 +473,7 @@ class SubmissionFileLayoutTest(unittest.TestCase):
                 "createdAt": "2026-09-18T10:11:12Z",
                 "files": ["work/main.py"],
                 "id": "abcdef1234567890",
+                "ordinal": 1,
                 "playgroundId": "pg-one",
                 "student": "张三（1 班）",
             },

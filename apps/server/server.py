@@ -61,6 +61,7 @@ from submissions import (
     decode_submission_request,
     get_submission,
     list_submissions,
+    submission_ordinal,
     submission_to_mapping,
     write_submission_files,
 )
@@ -688,32 +689,38 @@ class Handler(BaseHTTPRequestHandler):
     def _build_catalog_page(self, connection, limit, after):
         """Return one bounded page of published Playground commits.
 
-        The page is read as an ordered batch of ``limit + 1`` playground ids
-        and trimmed to ``limit``, so the cursor is stable and a page never
-        grows past the caller's limit.  A playground whose id violates the
-        identifier rules fails closed instead of being skipped silently.
+        The order is the order a teacher published the courses in
+        (``created_at``, then ``id`` as the tie-break), which is also the cursor's
+        key.  The page is read as an ordered batch of ``limit + 1`` rows and
+        trimmed to ``limit``, so the cursor is stable and a page never grows past
+        the caller's limit.  A playground whose id violates the identifier rules
+        fails closed instead of being skipped silently.
         """
 
-        after_playground = after[0] if after is not None else None
-        after_commit = after[1] if after is not None else None
+        after_key = tuple(after) if after is not None else None
 
         items = []
-        cursor = after_playground
+        next_key = None
         while len(items) < limit:
-            parameters = []
             where = ""
-            if cursor is not None:
-                where = " WHERE id > ?"
-                parameters.append(cursor)
+            parameters = []
+            if after_key is not None:
+                # Row-value comparison: the ordering key and the cursor key are the
+                # same pair, so a page can neither skip nor repeat a playground.
+                where = " WHERE (created_at, id) > (?, ?)"
+                parameters.extend(after_key)
             parameters.append(limit + 1 - len(items))
             rows = connection.execute(
-                f"SELECT id FROM playgrounds{where} ORDER BY id LIMIT ?",
+                f"SELECT id, created_at FROM playgrounds{where} "
+                "ORDER BY created_at, id LIMIT ?",
                 parameters,
             ).fetchall()
             if not rows:
                 break
             for row in rows:
-                cursor = row["id"]
+                # The cursor follows the last row *read*, not the last one returned:
+                # a row skipped for having no commit must not be offered again.
+                after_key = (row["created_at"], row["id"])
                 if not valid_playground_id(row["id"]):
                     raise RepositoryError(
                         "stored playground identifier is invalid"
@@ -723,22 +730,12 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if commit_id is None:
                     continue
-                key = (row["id"], commit_id)
-                if after is not None and key <= (
-                    after_playground,
-                    after_commit,
-                ):
-                    continue
-                items.append({"playgroundId": key[0], "commitId": key[1]})
+                items.append({"playgroundId": row["id"], "commitId": commit_id})
                 if len(items) >= limit:
                     break
 
-        next_key = None
-        if len(items) >= limit and items:
-            next_key = [
-                items[-1]["playgroundId"],
-                items[-1]["commitId"],
-            ]
+        if len(items) >= limit and next_key is None and after_key is not None:
+            next_key = list(after_key)
         return pagination.Page(items=tuple(items), next_key=next_key)
 
     def _get_manifest(self, playground_id, commit_id, head_only=False):
@@ -947,6 +944,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        ordinal = 1
         try:
             with self._database() as connection:
                 status, body = create_submission(
@@ -955,6 +953,13 @@ class Handler(BaseHTTPRequestHandler):
                     request,
                     request_key,
                 )
+                # The folder number is the submission's position in the record, so
+                # a replayed create names the same folder as the first attempt.
+                submission = body.get("submission") if isinstance(body, dict) else None
+                if status == 201 and submission is not None:
+                    ordinal = submission_ordinal(
+                        connection, request.student, submission["id"], submission["createdAt"]
+                    )
         except IdempotencyConflict:
             self._api_error(409, "idempotency_conflict")
             return
@@ -983,6 +988,7 @@ class Handler(BaseHTTPRequestHandler):
                     request.playground_commit_id,
                     submission["createdAt"],
                     dict(request.files),
+                    ordinal=ordinal,
                 )
             except (KeyError, TypeError, OSError, permissions.PermissionPolicyError):
                 self._api_error(500, "submission_storage_failed")
