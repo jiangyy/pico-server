@@ -42,7 +42,17 @@ ssh picopg.cn 'cd ~/picopg && git fetch /tmp/picopg.bundle master \
   && systemctl --user restart picopg.service'
 ```
 
-`git status` 必须干净；脏文件是运维遗留，先 stash。
+`git status` 必须干净；脏文件是运维遗留，先 stash。（`data/` 在 `.gitignore` 里，所以它不会让
+状态变脏。）
+
+起来后三个探针，缺一条就是没起来或代理不对：
+
+```bash
+curl -sS -o /dev/null -w 'healthz %{http_code}\n' https://picopg.cn/healthz
+curl -sS -o /dev/null -w '目录 %{http_code}\n' https://picopg.cn/api/v1/catalog
+# 不带 token 的 DELETE：新代码答 401（路由在、先验权），旧代码答 404
+curl -sS -o /dev/null -w 'DELETE %{http_code}\n' -X DELETE https://picopg.cn/api/v1/playgrounds/__probe__
+```
 
 ### 1.1 schema 变了就重建 app.db
 
