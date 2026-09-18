@@ -4,47 +4,38 @@
 
 | 对象 | 存储 | 含义 |
 | --- | --- | --- |
-| `Playground` | Git | Admin 创建并上传的不可变课程版本 |
-| `Work` | Git | 学生对一个 Playground 的线性编辑历史 |
-| `Class` | 数据库 | 一位教师拥有的教学范围 |
-| `ClassMembership` | 数据库 | 学生当前所属的一个 Class |
-| `Release` | 数据库 | 教师向一个 Class 开放的确切 Playground commit |
-| `Submission` | 数据库 | 一次提交，固定 Release 与 Work commit |
-| `Comment` | 数据库 | 附属于 Submission 的不可变反馈 |
-
-账号、会话和访问策略是普通数据库数据。师生关系由 ClassMembership 推导，不另存一份名单。
+| `Playground` | Git + 一行数据库记录 | 一个不透明的课程 id，加它的提交历史 |
+| `Submission` | 数据库 | 一次提交：学生交上来的有界文件集合，固定一个已发布的 Playground commit |
 
 ## Git
 
-Server 独占一个私有裸仓库：
+Server 独占一个私有裸仓库，只有一类 ref：
 
 ```text
 refs/heads/playgrounds/<playgroundId>
-refs/heads/works/<playgroundId>/<studentId>
 ```
 
-Playground tree 只含 `course/**`、`starter/**` 和 `picopg.json`。Work tree 在此基础上增加学生拥有的 `work/**`；Server 写入 `.picopg/work.json`，记录固定的 `playgroundCommitId`。
+一个 Playground tree 只含 `course/**`、`starter/**` 和 `picopg.json`。发布用 compare-and-swap 更新 ref：tree 不变时是 no-op，tree 变了就追加一个 commit，历史永不重写。
 
-首个 Work commit 的 parent 是其 Playground commit；后续 commit 以当前 Work HEAD 为 parent。发布与同步都以 compare-and-swap 更新 ref。恢复历史也创建新 commit，不回退 ref。
-
-v0.1 不升级 Work 的 Playground 版本，也不产生 merge commit。
+提交不进 Git。学生交上来的是一个 JSON 文件集合，它记录在数据库里；Server 从不把学生内容写进仓库，所以一次提交无法改变别的 client 下载到的东西。
 
 ## 权威来源
 
 | 事实 | 权威来源 |
 | --- | --- |
-| Playground、Work 的内容与历史 | Git object/ref |
-| 账号、策略、Class、Release、Submission、Comment | 数据库 |
-| manifest、bootstrap、索引 | 可重建缓存 |
-| 安装内容、Draft、运行环境 | Client 本地存储或不可变 artifact |
+| Playground 内容与历史 | Git object/ref |
+| Playground 是否存在 | 数据库的一行 |
+| Submission | 数据库 |
+| manifest、bootstrap、artifact index | 可重建缓存 |
+| 已安装内容、草稿、运行环境 | Client 本地存储或不可变 artifact |
 
 ## 不变量
 
 1. API 中的 ID（包括 commit ID）都是不透明字符串。
-2. Release 与 Submission 固定不可变 commit；更正会创建新记录。
-3. 学生只能写自己的 `work/**`；只有 Admin 能写 Playground tree；`.picopg/**` 只由 Server 写。
-4. Sync 仅在 `baseCommitId` 等于 Work HEAD 时成功；冲突不丢 Draft、不自动合并。
-5. commit ID 不代表授权；`release_only` 内容始终检查身份与当前 ClassMembership。
-6. 教师只读自己 Class 的 Release 下的 Submission；Admin 默认不读学生 Work。
-7. 转班改变后续可见的 Release，不修改既有 Submission 与 Comment。
-8. Git 只保存源码快照，数据库只保存业务状态。
+2. 只有 operator token 能写 Playground tree；请求体里的任何值都不能决定 ref、parent 或作者身份。
+3. 一个 commit 只有落在它那个 Playground 的已发布历史里才可读；知道 commit ID 本身不构成可读性。
+4. 读取一律公开：没有会话、没有角色、没有请求级判断。
+5. Submission 只记录一个已发布的 `(playgroundId, commitId)`；它不复制课程内容。
+6. Submission 只追加：没有更新、删除、状态。重交是第二条记录。
+7. 同一 `Idempotency-Key` 与同一 body 返回原结果；body 不同返回 `409`。
+8. Git 只保存课程快照，数据库只保存业务状态。

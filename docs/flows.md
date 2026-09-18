@@ -4,37 +4,30 @@
 
 ## 发布
 
-1. `learn-python` 构建 `course/**`、`starter/**` 和 `picopg.json`，以幂等请求上传 bundle。
-2. Server 校验内容与限制，写 Git commit，并以 compare-and-swap 更新 Playground ref。
-3. Server 重建 manifest 和公开 bootstrap 缓存。
+1. `learn-python` 构建 `course/**`、`starter/**` 和 `picopg.json`，打包成 ZIP。
+2. Operator 用 operator token 调用 `POST /api/v1/playgrounds/{id}/commits`（ZIP + `Idempotency-Key`）；新 Playground 先 `POST /api/v1/playgrounds`。
+3. Server 校验 bundle 的每个成员与限额，写 Git commit，并以 compare-and-swap 更新 Playground ref。
+4. Server 重建公开缓存。缓存失败不回滚发布：权威已经在 Git 里，下一次读取会重建。
 
-发布不授予访问权。新 Playground 默认 `release_only`；相同 tree 的重复发布是 no-op。
+相同 tree 的重复发布是 no-op，返回同一个 `commitId`。
 
 ## 安装与运行
 
-1. Client 先展示本地内容，再合并公开目录与当前 Class 可见的 Release。
-2. Client 按 commit manifest 下载缺失 blob/runtime，校验 size 与 SHA-256 后原子安装。
-3. Client 在隔离 renderer 中打开课程；Pyodide 与执行输出留在本地。
-4. 每次编辑立即保存到当前用户的本地 Draft。
+1. Client 读 `GET /api/v1/catalog` 拿到 `(playgroundId, commitId)` 列表。
+2. Client 读该 commit 的 manifest，只下载本地缺的 blob，校验 size 与 SHA-256 后原子安装。
+3. Client 打开课程页面；页面按 `../` 引用共享 runtime（`../libs/…`、`../pyodide/…`、`../pico.css`），这些由 `/courses/**` 从 runtime 目录提供。
+4. 编辑立即落到本地草稿；Python 在本地跑。
 
-离线时只使用已安装内容。刷新或安装失败不得隐藏旧版本或丢失 Draft。
+离线时只使用已安装内容。刷新失败不得隐藏旧版本或丢失草稿。
 
-## 同步与恢复
+## 过期与重下
 
-1. Client 上传完整且有界的 `work/**` 快照、`playgroundCommitId` 与 `baseCommitId`。
-2. Server 校验所有权、内容授权和当前 Work HEAD，创建 commit 后以 compare-and-swap 更新 ref。
-3. Client 记录返回的 commit ID；仅当 Draft 未在请求期间变化时将其标为 clean。
+本地安装内容是可以随时丢弃的派生副本：删掉内容根，课程就回到"未安装"，下次打开按需重下。草稿不在内容根里，所以清内容不会丢草稿。
 
-HEAD 不匹配时返回冲突和最新 HEAD。Client 保留 Draft，由用户 reload、基于最新 HEAD 再次 overwrite，或在本地 merge。
+## 提交
 
-恢复历史时，Server 以历史 tree 为内容、当前 HEAD 为 parent 创建新 commit。
+1. Client 把草稿整理成一个有界的 `work/**` 文件集合，连同它基于的 `(playgroundId, commitId)` 和学生自称的名字，`POST /api/v1/submissions`（带 `Idempotency-Key`）。
+2. Server 校验字段与文件集合、确认该 commit 已发布，然后插入一条不可变记录。
+3. 同一 key 的重试返回原来的记录；两名学生可以用同一个 key，因为幂等作用域是学生名字。
 
-## 发布作业与审阅
-
-1. Teacher 为自己拥有的 Class 创建固定 Playground commit 的 Release；学生仅在 `openAt` 后且仍是当前成员时可见。
-2. Client 提交前先同步脏 Draft，再以同一 Playground 版本的 Work commit 创建 Submission；Server 同时校验当前 ClassMembership。
-3. Teacher 读取该快照并添加 Comment；授权的 AI/system 也使用 Comment，且显式记录 source。
-
-Release、Submission 和 Comment 均为不可变记录。`requiresSubmission` 为真时，`dueAt` 后拒绝新 Submission。Client 重连后重新读取当前 canonical 数据，不依赖实时通知。
-
-转班后，学生按新 Class 获取 Release；已经创建的 Submission 与 Comment 保持不变。
+Operator 用 `GET /api/v1/submissions`（分页）看有哪些提交，用 `GET /api/v1/submissions/{id}` 取回完整文件内容。
