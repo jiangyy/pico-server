@@ -46,3 +46,14 @@
 
 `data/picopg.git` —— 一个 bare 仓库，每门课一条 ref（`refs/heads/playgrounds/<id>`）。
 一个 Version 就是一个 commit，内容不可变、天然去重。
+
+`data/submissions/` —— 交上来的作业的人可读副本，一行记录对应一个目录：
+
+```
+data/submissions/<班级>/<姓名>/<playgroundId>[-N]/work/main.py
+                                                   /submission.json
+```
+
+`-N` 是同一个人对同一门课再交一次时的编号；`submission.json` 记着这份是谁的、基于
+哪个 Version。学生名来自请求（`work/main.py` 首行），所以每一段都做了过滤——名字
+不能变成路径。**真正的记录是数据库**，这份副本可以整份删掉再从 API 重新读。

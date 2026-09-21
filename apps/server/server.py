@@ -64,7 +64,9 @@ from submissions import (
     StoredSubmissionError,
     get_submission,
     list_submissions,
+    submission_ordinal,
     submission_to_mapping,
+    write_submission_files,
 )
 
 
@@ -73,6 +75,9 @@ PORT = 8001
 DATABASE_PATH = Path("data/app.db")
 
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+#: The readable copy of each handed-in work lives here, beside the database.
+SUBMISSIONS_DIRECTORY_NAME = "submissions"
 
 
 # One sync round may carry at most this many pending events. The body is
@@ -277,7 +282,62 @@ class Handler(ApiHandler):
             self._api_error(400, "invalid_request")
             return
 
+        # Only once the round has committed: the folder is a projection of a
+        # stored record, never a second thing to keep consistent. A failure here
+        # answers 500, and the client's retry of the same event repaints it.
+        self._write_submitted_work(request, response)
         self._respond_json(200, json.loads(response.to_json()))
+
+    def _write_submitted_work(self, request, response):
+        """Write a folder per accepted hand-in, for a human to open.
+
+        The row is the record and the folder is a copy of it, so this never
+        runs inside the sync transaction: an aborted round must not leave a
+        folder behind, and a folder must not be able to fail a stored hand-in.
+        It runs on replays too, which is what makes a lost folder self-healing.
+        """
+        accepted = {
+            result.event_id
+            for result in response.event_results
+            if result.status == "accepted"
+        }
+        pending = [
+            envelope
+            for envelope in request.pending_events
+            if envelope.kind == events_types.EVENT_KIND_SUBMIT_CODE
+            and envelope.event_id in accepted
+        ]
+        if not pending:
+            return
+
+        with self._database() as connection:
+            for envelope in pending:
+                stored = events.read_event(connection, envelope.event_id)
+                if stored is None:
+                    continue
+                try:
+                    body = json.loads(stored[3])
+                    submission = body["submission"]
+                except (TypeError, ValueError, KeyError):
+                    # A stored response this build cannot read is not a reason to
+                    # fail a round that already committed; the folder is a copy.
+                    continue
+                ordinal = submission_ordinal(
+                    connection,
+                    submission["student"],
+                    submission["id"],
+                    submission["created_at"],
+                )
+                write_submission_files(
+                    self.server.submissions_path,
+                    submission["id"],
+                    submission["student"],
+                    submission["playground_id"],
+                    submission["version_id"],
+                    submission["created_at"],
+                    envelope.payload["files"],
+                    ordinal,
+                )
 
     def _route_delete(self):
         path = urlsplit(self.path).path
@@ -740,14 +800,26 @@ def make_server(
     port=PORT,
     database_path=DATABASE_PATH,
     repository_path=DEFAULT_REPOSITORY_PATH,
+    submissions_path=None,
     operator_token=None,
 ):
-    """Return an initialized HTTP server bound to ``host:port``."""
+    """Return an initialized HTTP server bound to ``host:port``.
+
+    ``submissions_path`` is where the readable copy of each handed-in work goes.
+    It defaults to a sibling of the database, so every deployment path stays
+    under one data directory; the directory is created lazily by the writer, so
+    a read-only or unused one never becomes a start-up failure.
+    """
     operator_token = _validate_operator_token(operator_token)
 
     database_path = Path(database_path)
     database = open_database(database_path)
     database.close()
+
+    if submissions_path is None:
+        submissions_path = database_path.parent / SUBMISSIONS_DIRECTORY_NAME
+    else:
+        submissions_path = Path(submissions_path)
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
@@ -767,6 +839,7 @@ def make_server(
     server.database_path = database_path
     server.repository_path = repository_path
     server.repository = repository
+    server.submissions_path = submissions_path
     server.operator_token = operator_token
     return server
 

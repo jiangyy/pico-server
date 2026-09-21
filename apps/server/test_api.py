@@ -834,6 +834,118 @@ class ProtocolVersionTest(ServerTestCase):
         self.assertEqual(status, 200)
 
 
+class SubmittedWorkOnDiskTest(ServerTestCase):
+    """交上来的作业在磁盘上是一份人能直接打开的东西。
+
+    行是记录，文件夹是给老师看的那份副本。学生名是这条路径上唯一来自请求的
+    部分，所以这里既验证老师会读到的布局，也验证一个恶意名字做不到什么。
+    """
+
+    def root(self):
+        return Path(self.server.submissions_path)
+
+    def hand_in(self, student, files=None, course=None):
+        # 每个用例一门新课：`ServerTestCase` 共享一个库，同名 id 会撞幂等键。
+        playground_id, version_id = self.seed(course)
+        text = files or {"work/main.py": f"# 姓名：{student}\nprint(1)\n"}
+        result = self.hand_in_event(playground_id, version_id, text)
+        return playground_id, version_id, result
+
+    def hand_in_event(self, playground_id, version_id, files):
+        event = {
+            "event_id": uuid.uuid4().hex,
+            "kind": "submit_code",
+            "payload": {"playground_id": playground_id, "version_id": version_id, "files": files},
+        }
+        status, _, body = self.request("POST", "/api/v1/sync", payload={"pending_events": [event], "after_seq": 0})
+        self.assertEqual(status, 200, body)
+        return body["event_results"][0]
+
+    def test_an_accepted_hand_in_lands_in_a_folder(self):
+        playground_id, version_id, result = self.hand_in("张三（1 班）")
+        self.assertEqual(result["status"], "accepted")
+
+        folder = self.root() / "1 班" / "张三" / playground_id
+        self.assertTrue(folder.is_dir(), f"没有这个目录：{folder}")
+        self.assertEqual(
+            (folder / "work" / "main.py").read_text(encoding="utf-8"),
+            "# 姓名：张三（1 班）\nprint(1)\n",
+        )
+
+        # 文件夹里还有一张条，说明这份是谁的、基于哪个版本
+        manifest = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["student"], "张三（1 班）")
+        self.assertEqual(manifest["commitId"], version_id)
+        self.assertEqual(manifest["playgroundId"], playground_id)
+        self.assertEqual(manifest["files"], ["work/main.py"])
+
+    def test_a_second_hand_in_of_the_same_course_is_numbered(self):
+        playground_id, version_id = self.seed("hello-twice")
+        first = self.hand_in_event(playground_id, version_id, {"work/main.py": "# 姓名：李四\nprint(1)\n"})
+        second = self.hand_in_event(playground_id, version_id, {"work/main.py": "# 姓名：李四\nprint(2)\n"})
+        self.assertEqual([first["status"], second["status"]], ["accepted", "accepted"])
+
+        base = self.root() / "李四"
+        self.assertEqual(sorted(p.name for p in base.iterdir()), [playground_id, f"{playground_id}-2"])
+        self.assertEqual(
+            (base / f"{playground_id}-2" / "work" / "main.py").read_text(encoding="utf-8"),
+            "# 姓名：李四\nprint(2)\n",
+        )
+
+    def test_a_replay_repaints_the_same_folder(self):
+        # 响应丢了、客户端原样重试：不能多出一个编号文件夹。
+        playground_id, version_id = self.seed("hello-replay")
+        event = {
+            "event_id": "disk-replay-1",
+            "kind": "submit_code",
+            "payload": {
+                "playground_id": playground_id,
+                "version_id": version_id,
+                "files": {"work/main.py": "# 姓名：王五\nprint(1)\n"},
+            },
+        }
+        for _ in range(2):
+            status, _, body = self.request("POST", "/api/v1/sync", payload={"pending_events": [event], "after_seq": 0})
+            self.assertEqual(status, 200)
+            self.assertEqual(body["event_results"][0]["status"], "accepted")
+
+        base = self.root() / "王五"
+        self.assertEqual([p.name for p in base.iterdir()], [playground_id])
+
+    def test_a_rejected_hand_in_writes_nothing(self):
+        playground_id, version_id = self.seed("hello-rejected")
+        result = self.hand_in_event(playground_id, version_id, {"course/index.html": "x"})
+        self.assertEqual(result["status"], "rejected")
+        # 只有目录被建出来（或根本没有），不该有内容
+        for path in self.root().rglob("*") if self.root().exists() else []:
+            self.assertNotIn("course", path.parts)
+
+    def test_a_hostile_student_name_stays_inside_the_root(self):
+        playground_id, version_id = self.seed("hello-hostile")
+        result = self.hand_in_event(
+            playground_id,
+            version_id,
+            {"work/main.py": "# 姓名：../../etc/passwd 班级：../../..\nprint(1)\n"},
+        )
+        self.assertEqual(result["status"], "accepted")
+
+        root = self.root()
+        created = list(root.rglob("*"))
+        self.assertTrue(created)
+        for path in created:
+            self.assertIn(root, path.parents)
+            self.assertNotIn("..", path.relative_to(root).parts)
+        self.assertFalse((root.parent.parent / "etc").exists())
+
+    def test_the_folder_is_not_world_readable(self):
+        # 独立的姓名：同一个人同一门课再交一次会被编号成 `-2`，那是另一条用例在测的
+        # 行为，不该在这里悄悄影响路径。
+        playground_id, _, _ = self.hand_in("权限（9 班）")
+        folder = self.root() / "9 班" / "权限" / playground_id
+        mode = folder.stat().st_mode & 0o777
+        self.assertEqual(mode & 0o077, 0, f"目录权限 {oct(mode)} 对同组/其他用户开放了")
+
+
 class ConditionalReadTest(ServerTestCase):
     """`If-None-Match` on the byte routes.
 

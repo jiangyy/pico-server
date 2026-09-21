@@ -381,5 +381,85 @@ class ReadSubmissionTest(SubmissionTestBase):
         )
 
 
+class SubmissionFileLayoutTest(unittest.TestCase):
+    """Where a handed-in file set lands on disk.
+
+    The student string is the only caller-controlled part of that path, so
+    these tests are as much about what a hostile name cannot do as about the
+    layout a teacher reads.
+    """
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name) / "submissions"
+
+    def write(self, student, files=None, ordinal=1):
+        return submissions.write_submission_files(
+            root=self.root,
+            submission_id="abcdef1234567890",
+            student=student,
+            playground_id="pg-one",
+            playground_commit_id="c1" + "0" * 38,
+            created_at="2026-09-18T10:11:12Z",
+            files=files if files is not None else {"work/main.py": "print(1)\n"},
+            ordinal=ordinal,
+        )
+
+    def test_class_and_name_become_one_directory_each(self):
+        directory = self.write("张三（1 班）")
+        self.assertEqual(directory.relative_to(self.root), Path("1 班") / "张三" / "pg-one")
+        self.assertEqual((directory / "work/main.py").read_text(encoding="utf-8"), "print(1)\n")
+
+    def test_a_name_without_a_class_is_filed_directly_under_it(self):
+        self.assertEqual(
+            self.write("张三").relative_to(self.root), Path("张三") / "pg-one"
+        )
+
+    def test_handing_the_same_course_in_again_is_numbered(self):
+        first = self.write("张三（1 班）", ordinal=1)
+        second = self.write("张三（1 班）", ordinal=2)
+        third = self.write("张三（1 班）", ordinal=3)
+        self.assertEqual(
+            [d.name for d in (first, second, third)], ["pg-one", "pg-one-2", "pg-one-3"]
+        )
+        self.assertEqual(first.parent, second.parent, "同一个学生的同一门课在同一目录下")
+
+    def test_the_folder_says_whose_work_it_is(self):
+        directory = self.write("张三（1 班）")
+        manifest = json.loads((directory / submissions.MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest,
+            {
+                "commitId": "c1" + "0" * 38,
+                "createdAt": "2026-09-18T10:11:12Z",
+                "files": ["work/main.py"],
+                "id": "abcdef1234567890",
+                "ordinal": 1,
+                "playgroundId": "pg-one",
+                "student": "张三（1 班）",
+            },
+        )
+
+    def test_a_name_cannot_reach_outside_the_root(self):
+        for hostile in ("../../etc/passwd", "..", "/etc/passwd", "a/b", "a\\b", "..（..）"):
+            with self.subTest(hostile=hostile):
+                directory = self.write(hostile)
+                self.assertIn(self.root, directory.parents)
+                for part in directory.relative_to(self.root).parts:
+                    self.assertNotIn("/", part)
+                    self.assertNotIn("\\", part)
+                    self.assertNotIn(part, ("", ".", ".."))
+
+    def test_a_nameless_student_still_gets_a_directory(self):
+        # 一个只剩点号的名字不能产生无名目录：目录名是老师唯一的抓手。
+        self.assertIn("student", self.write("...").relative_to(self.root).parts)
+
+    def test_a_long_name_is_truncated_per_segment(self):
+        directory = self.write(f"{'长' * 200}（{'班' * 200}）")
+        for part in directory.relative_to(self.root).parts:
+            self.assertLessEqual(len(part), submissions.MAX_SEGMENT_LENGTH)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

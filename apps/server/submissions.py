@@ -23,10 +23,12 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 import bundles
+import permissions
 import repository as repository_module
 from pagination import Page
 
@@ -34,6 +36,11 @@ from pagination import Page
 # A self-reported student name is a display string, not an identity: it is
 # bounded, trimmed, and never used for authorization.
 MAX_STUDENT_LENGTH = 128
+
+# One directory name may be this long. Long enough for a class and a name,
+# short enough that a path built from client-supplied text stays inside what a
+# filesystem accepts.
+MAX_SEGMENT_LENGTH = 64
 
 # Git object IDs are lowercase hexadecimal.  Requiring the exact full-width
 # form before any lookup stops a symbolic name such as ``HEAD`` from being
@@ -260,6 +267,131 @@ def _header_fields(line):
                 end = other_position
         fields[label] = rest[:end].strip()
     return fields
+
+
+# --- The copy a teacher reads -------------------------------------------
+#
+# The database is the record; these folders are a projection of it, written so
+# that a human can open a piece of work without going through the API. The
+# student string is the only caller-controlled part of the path, so it is
+# sanitized segment by segment: a name may not become a path.
+
+_STUDENT_PATTERN = re.compile(r"\A(.+?)（(.+?)）\Z")
+
+MANIFEST_NAME = "submission.json"
+
+
+def _safe_segment(value):
+    """Return ``value`` as one filesystem-safe path segment (possibly empty)."""
+
+    normalized = unicodedata.normalize("NFC", value)
+    printable = "".join(
+        " " if character in "/\\\u0000" else character
+        for character in normalized
+        if character.isprintable() or character == "\u0000"
+    )
+    return " ".join(printable.split()).strip(". ")[:MAX_SEGMENT_LENGTH]
+
+
+def student_segments(student):
+    """Return ``(class_room, name)`` for a self-reported name.
+
+    ``张三（1 班）`` becomes ``("1 班", "张三")``; anything else is a bare name
+    with no class. Both parts are sanitized, and an empty result falls back to
+    the whole string so a submission never lands in an unnamed directory.
+    """
+
+    match = _STUDENT_PATTERN.match(student)
+    if match is not None:
+        name = _safe_segment(match.group(1))
+        class_room = _safe_segment(match.group(2))
+        if name and class_room:
+            return class_room, name
+    return "", _safe_segment(student) or "student"
+
+
+def submission_ordinal(connection, student, submission_id, created_at):
+    """Return this submission's 1-based position among that student's work.
+
+    The number comes from the record, never from the filesystem: an idempotent
+    replay must land in the same folder, and counting existing directories would
+    hand it the next number instead. ``id`` breaks ties when two submissions
+    share a timestamp.
+    """
+
+    row = connection.execute(
+        """
+        SELECT COUNT(*) FROM submissions
+        WHERE student = ?
+          AND (created_at < ? OR (created_at = ? AND id <= ?))
+        """,
+        (student, created_at, created_at, submission_id),
+    ).fetchone()
+    return int(row[0]) if row is not None else 1
+
+
+def submission_directory(root, student, playground_id, ordinal):
+    """Return the directory one submission's files belong in, as a path.
+
+    One folder per handed-in course: ``<班级>/<姓名>/<playgroundId>``, and
+    ``<playgroundId>-2``, ``-3`` … for the same course handed in again.
+    """
+
+    folder = playground_id if ordinal <= 1 else f"{playground_id}-{ordinal}"
+    class_room, name = student_segments(student)
+    parts = [part for part in (class_room, name, _safe_segment(folder) or folder) if part]
+
+    directory = Path(root)
+    for part in parts:
+        directory = directory / part
+    return directory
+
+
+def write_submission_files(
+    root,
+    submission_id,
+    student,
+    playground_id,
+    playground_commit_id,
+    created_at,
+    files,
+    ordinal=1,
+):
+    """Write one submission's files under ``root`` and return the directory.
+
+    Nothing here decides whether a submission is valid: the caller has already
+    stored the row, so these bytes are a copy of an accepted submission. A
+    failure raises, because a record whose folder is missing is exactly the
+    state this function exists to prevent — and the caller's retry writes the
+    same path, so the projection converges.
+    """
+
+    directory = permissions.ensure_private_directory(
+        submission_directory(root, student, playground_id, ordinal)
+    )
+
+    for path, text in files.items():
+        target = directory.joinpath(*path.split("/"))
+        permissions.ensure_private_directory(target.parent)
+        target.write_text(text, encoding="utf-8")
+        permissions.ensure_private_file(target)
+
+    manifest = {
+        "id": submission_id,
+        "playgroundId": playground_id,
+        "commitId": playground_commit_id,
+        "student": student,
+        "createdAt": created_at,
+        "ordinal": ordinal,
+        "files": sorted(files),
+    }
+    manifest_path = directory / MANIFEST_NAME
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    permissions.ensure_private_file(manifest_path)
+    return directory
 
 
 def _submission_from_row(row):
