@@ -19,6 +19,8 @@ guessing at a path.
 import json
 import os
 import shutil
+import socket
+import uuid
 import subprocess
 import sys
 import tempfile
@@ -98,10 +100,18 @@ class ClientContractTest(unittest.TestCase):
             with urllib.request.urlopen(request) as response:
                 return response.status, json.loads(response.read() or b"null")
         except urllib.error.HTTPError as error:
-            return error.code, json.loads(error.read() or b"null")
+            # The body has to be read *and* closed: an unclosed error response
+            # (the 409 from registering a course a second time, say) is a
+            # ResourceWarning in the test output.
+            with error:
+                return error.code, json.loads(error.read() or b"null")
 
-    def publish(self, playground_id, files=None):
-        """Register and publish one course, returning its new version id."""
+    def publish(self, playground_id, files=None, base=None):
+        """Register and publish one course, returning its new version id.
+
+        ``base`` is the Version this bundle was built on (``X-Base-Version-Id``);
+        every publish after the first one has to name it.
+        """
         files = files or {
             "picopg.json": json.dumps({"schemaVersion": 1, "runtime": "python"}),
             "course/index.html": "<html>hello</html>",
@@ -117,11 +127,19 @@ class ClientContractTest(unittest.TestCase):
             json.dumps({"id": playground_id}).encode(),
             {"Content-Type": "application/json"},
         )
+        headers = {
+            "Content-Type": "application/zip",
+            # A fresh key per publish: the key identifies one publish, and a
+            # second publish of the same course is a different request.
+            "Idempotency-Key": uuid.uuid4().hex,
+        }
+        if base is not None:
+            headers["X-Base-Version-Id"] = base
         status, body = self.operator(
             "POST",
             f"/api/v1/playgrounds/{playground_id}/versions",
             buffer.getvalue(),
-            {"Content-Type": "application/zip", "Idempotency-Key": "e2e-publish"},
+            headers,
         )
         self.assertIn(status, (200, 201), body)
         return body["version_id"]
@@ -246,6 +264,50 @@ class ClientContractTest(unittest.TestCase):
         )
         self.assertEqual(self.client("sync")["installed"], [])
 
+    def test_a_hand_in_written_offline_is_still_accepted_after_the_course_moves_on(self):
+        """断网时写好的作业，等联网时课程已经发了新版本 —— 这份作业仍然收。
+
+        protocol.md §2 SubmitCode 只要求 ``version_id`` 属于该 Playground，
+        实现里就是「在该课程已发布的 history 里」。而 history 不会被删（Archive
+        只改 state），所以一份钉在旧版本上、隔了一段时间才送到的作业仍然有效，
+        并且被记在它真正依据的那个版本上 —— 这一点很重要：学生是按那个版本做的。
+        """
+        first = self.publish("pg-offline")
+        self.client("bootstrap")
+
+        # 断网：驱动指向一个没有监听的端口，所以本地入队成功、上传失败。
+        self.write_hand_in("# 姓名：王五\nprint(3)\n")
+        offline = self.client_on(self.dead_port(), "submit", "pg-offline", first, "王五")
+        self.assertEqual(offline["pending"], 1, "断网时作业必须留在队列里")
+
+        # 网络不在的这段时间，课程往前走了一个版本
+        second = self.publish(
+            "pg-offline",
+            files={
+                "picopg.json": json.dumps({"schemaVersion": 1, "runtime": "python"}),
+                "course/index.html": "<html>second</html>",
+            },
+            base=first,
+        )
+        self.assertNotEqual(second, first)
+
+        # 联网后一次常规同步：先把作业送上去，再把新版本拉下来
+        after = self.client("sync")
+        self.assertEqual(after["accepted"].__len__(), 1, after)
+        self.assertEqual(after["rejected"], [])
+        self.assertEqual(after["pending"], 0)
+        self.assertEqual(after["installed"], ["pg-offline"], "新版本要自动拉下来")
+        self.assertEqual(after["cursor"], after["upto_seq"])
+        self.assertEqual(after["retired"], [])
+
+        (stored,) = self.stored_submissions("pg-offline")
+        self.assertEqual(stored["student"], "王五")
+        self.assertEqual(stored["commitId"], first, "记在它依据的那个版本上，不是当前版本")
+
+        # 而本地现在钉在新版本上
+        manifest = self.read_local_manifest("pg-offline", second)
+        self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>second</html>")
+
     def test_a_second_launch_only_pulls_what_it_missed(self):
         self.publish("pg-e2e")
         first = self.client("bootstrap")
@@ -286,6 +348,24 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(stored["commitId"], version_id)
 
     # --- helpers -------------------------------------------------------------
+
+    def dead_port(self):
+        """A port nothing is listening on: the machine this client runs on has
+        no route to the server. Cheaper and more honest than stopping the
+        server, which the test needs up to publish the next Version."""
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def client_on(self, port, step, *args):
+        """Run one driver step against another port, expecting it to fail."""
+        subprocess.run(
+            [NODE, str(DRIVER), str(port), str(CLIENT_DIR), str(self.client_data), step, *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return {"pending": self.pending_count()}
 
     def run_driver_expecting_failure(self, step, *args):
         subprocess.run(
