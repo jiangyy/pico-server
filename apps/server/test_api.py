@@ -365,8 +365,10 @@ class PublishTest(ServerTestCase):
 class RetiringTest(ServerTestCase):
     """Operator takes a course out of the catalog: students stop seeing it.
 
-    Retiring is not a delete: the row, the submissions that reference it and the
-    commits all stay, so the same id can be published again.
+    Archive is not a delete: the row, the commits and the submissions stay,
+    the Git ref stays reachable, and the catalog filters the playground out
+    by ``state = stopped``. Re-archiving is a no-op; republishing an
+    archived course is rejected.
     """
 
     def catalog_ids(self):
@@ -380,71 +382,52 @@ class RetiringTest(ServerTestCase):
         )
 
     def test_retiring_a_playground_takes_it_out_of_the_catalog(self):
-        playground_id, commit_id = self.seed("pg-retire")
-        self.assertIn("pg-retire", self.catalog_ids())
+        playground_id, commit_id = self.seed("pg-archive-catalog")
+        self.assertIn("pg-archive-catalog", self.catalog_ids())
 
-        status, _, body = self.retire("pg-retire")
+        status, _, body = self.retire("pg-archive-catalog")
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"playgroundId": "pg-retire", "retired": True})
+        self.assertEqual(body, {"playgroundId": "pg-archive-catalog", "status": "accepted"})
 
-        self.assertNotIn("pg-retire", self.catalog_ids())
-        # Nothing is readable any more: the ref is what every read resolves first.
-        self.assertEqual(
-            self.request(
-                "GET",
-                f"/api/v1/playgrounds/pg-retire/commits/{commit_id}/manifest",
-            )[0],
-            404,
-        )
-
-        # The record is untouched: publishing the same id brings the course back
-        # and readable. The restored commit is a new one — the old ref is gone for
-        # good, so any client pinned to the retired commit would 404.
-        status, _, body = self.publish("pg-retire")
-        self.assertEqual(status, 201)
-        self.assertIn("pg-retire", self.catalog_ids())
-        restored = self.request(
+        self.assertNotIn("pg-archive-catalog", self.catalog_ids())
+        # The Git ref is left intact: a pinned client can still read the
+        # manifest for the version it had installed before the archive.
+        status, _, _ = self.request(
             "GET",
-            f"/api/v1/playgrounds/pg-retire/commits/{body['commitId']}/manifest",
+            f"/api/v1/playgrounds/pg-archive-catalog/commits/{commit_id}/manifest",
         )
-        self.assertEqual(restored[0], 200)
+        self.assertEqual(status, 200)
 
-    def test_a_publish_replayed_after_a_retire_publishes_again(self):
-        playground_id, _ = self.seed("pg-retire")
-        self.assertEqual(self.retire(playground_id)[0], 200)
-
-        # The very same idempotency key as the first publish. The retire dropped
-        # the recorded result, so this is a real publish: replaying it would
-        # answer 201 with a commit that no longer exists.
-        status, _, body = self.publish(playground_id, key="key-1")
-        self.assertEqual(status, 201)
-        self.assertIn(playground_id, self.catalog_ids())
-        manifest = self.request(
-            "GET",
-            f"/api/v1/playgrounds/{playground_id}/commits/{body['commitId']}/manifest",
-        )
-        self.assertEqual(manifest[0], 200)
+        # Publishing an archived course is rejected.
+        status, _, body = self.publish("pg-archive-catalog")
+        self.assertEqual(status, 409)
+        self.assertEqual(body.get("code"), "playground_head_changed")
 
     def test_retiring_needs_the_operator_token(self):
-        self.seed("pg-retire")
+        self.seed("pg-archive-token")
 
-        self.assertEqual(self.retire("pg-retire", token=None)[0], 401)
-        self.assertEqual(self.retire("pg-retire", token="wrong-token-000000")[0], 401)
-        self.assertIn("pg-retire", self.catalog_ids())
+        self.assertEqual(self.retire("pg-archive-token", token=None)[0], 401)
+        self.assertEqual(
+            self.retire("pg-archive-token", token="wrong-token-000000")[0], 401
+        )
+        self.assertIn("pg-archive-token", self.catalog_ids())
 
     def test_retiring_an_unknown_playground_is_not_found(self):
         self.assertEqual(self.retire("pg-never-published")[0], 404)
 
-    def test_retiring_twice_reports_that_it_was_already_gone(self):
-        self.seed("pg-retire")
+    def test_retiring_twice_is_a_no_op(self):
+        self.seed("pg-archive-twice")
 
-        self.assertEqual(self.retire("pg-retire")[2]["retired"], True)
-        status, _, body = self.retire("pg-retire")
+        status, _, body = self.retire("pg-archive-twice")
         self.assertEqual(status, 200)
-        self.assertEqual(body["retired"], False)
+        self.assertEqual(body["status"], "accepted")
+
+        status, _, body = self.retire("pg-archive-twice")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "no_op")
 
     def test_a_retired_course_keeps_the_work_already_handed_in(self):
-        playground_id, commit_id = self.seed("pg-retire")
+        playground_id, commit_id = self.seed("pg-archive-keeps")
         submission_id = self.submit(playground_id, commit_id)[2]["submission"]["id"]
 
         self.assertEqual(self.retire(playground_id)[0], 200)

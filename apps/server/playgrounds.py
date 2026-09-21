@@ -31,6 +31,8 @@ class PlaygroundConflictError(Exception):
 class Playground:
     id: str
     created_at: str
+    state: str = "active"
+    current_version_id: str = ""
 
 
 def _now():
@@ -46,13 +48,19 @@ def _require_opaque_id(value):
 def _playground_row(connection, playground_id):
     playground_id = _require_opaque_id(playground_id)
     return connection.execute(
-        "SELECT id, created_at FROM playgrounds WHERE id = ?",
+        "SELECT id, created_at, state, current_version_id "
+        "FROM playgrounds WHERE id = ?",
         (playground_id,),
     ).fetchone()
 
 
 def _playground_from_row(row):
-    return Playground(id=row["id"], created_at=row["created_at"])
+    return Playground(
+        id=row["id"],
+        created_at=row["created_at"],
+        state=row["state"],
+        current_version_id=row["current_version_id"],
+    )
 
 
 def get_playground(connection, playground_id):

@@ -49,7 +49,6 @@ from repository import (
     PlaygroundHeadChangedError,
     RepositoryError,
     open_repository,
-    retire_playground,
     valid_playground_id,
 )
 from submissions import (
@@ -374,18 +373,17 @@ class Handler(BaseHTTPRequestHandler):
     def _delete_playground(self, playground_id):
         """Take a Playground out of the catalog.
 
-        Students stop seeing it on their next refresh; nothing else changes.  The
-        database row stays (the submissions that reference it keep a valid
-        parent) and the commits stay in the repository, so publishing the same id
-        again restores it.  Reading a retired commit is already refused, because
-        every read path resolves the ref first.
+        Students stop seeing it on their next refresh; nothing else changes.
+        The database row stays (submissions keep a valid parent) and the
+        commits stay in the repository, so publishing the same id again
+        restores it. The playground is marked ``state = stopped`` and an
+        ``archive_playground`` event is emitted so clients learn about the
+        change through their next sync; the Git ref is left intact so
+        history remains reachable.
 
-        The recorded publishes of this Playground are dropped, because a recorded
-        result is only true while the ref it describes is still there: an exact
-        replay answers with the stored response without touching Git, so an old
-        idempotency key would report a 201 for a course nobody can read.  The rows
-        go before the ref does, so a failure here leaves the Playground published
-        rather than silently unrepeatable.
+        Re-archiving a stopped playground is a no-op: the existing event
+        is replayed by the events table, the database row keeps the same
+        state and the response carries the same status.
         """
 
         if not self._require_operator():
@@ -394,35 +392,36 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with self._database() as connection:
                 stored = get_playground(connection, playground_id)
-                if stored is not None:
-                    with connection:
-                        connection.execute(
-                            "DELETE FROM idempotency_results "
-                            "WHERE scope = ? AND endpoint = ?",
-                            (
-                                OPERATOR_SCOPE,
-                                _playground_commits_endpoint(playground_id),
-                            ),
-                        )
+                if stored is None:
+                    self._not_found()
+                    return
+                # Drop the recorded publishes so an exact replay of an old
+                # idempotency key cannot report a 201 for a course nobody can
+                # read. The events table keeps the archive record intact, so
+                # a Sync round can still see what happened.
+                connection.execute(
+                    "DELETE FROM idempotency_results "
+                    "WHERE scope = ? AND endpoint = ?",
+                    (
+                        OPERATOR_SCOPE,
+                        _playground_commits_endpoint(playground_id),
+                    ),
+                )
+                if stored.state == "stopped":
+                    self._respond_json(
+                        200,
+                        {"playgroundId": playground_id, "status": "no_op"},
+                    )
+                    return
+                from playgrounds import record_archive_event
+
+                record_archive_event(connection, playground_id)
         except InvalidRequestError:
             self._api_error(400, "invalid_request")
             return
 
-        if stored is None:
-            self._not_found()
-            return
-
-        try:
-            retired = retire_playground(self.server.repository, playground_id)
-        except PlaygroundHeadChangedError:
-            self._api_error(409, "playground_head_changed")
-            return
-        except RepositoryError:
-            self._api_error(500, "internal_error")
-            return
-
         self._respond_json(
-            200, {"playgroundId": playground_id, "retired": retired}
+            200, {"playgroundId": playground_id, "status": "accepted"}
         )
 
     def _respond_bytes(
@@ -503,12 +502,12 @@ class Handler(BaseHTTPRequestHandler):
         items = []
         next_key = None
         while len(items) < limit:
-            where = ""
+            where = " WHERE state = 'active'"
             parameters = []
             if after_key is not None:
                 # Row-value comparison: the ordering key and the cursor key are the
                 # same pair, so a page can neither skip nor repeat a playground.
-                where = " WHERE (created_at, id) > (?, ?)"
+                where += " AND (created_at, id) > (?, ?)"
                 parameters.extend(after_key)
             parameters.append(limit + 1 - len(items))
             rows = connection.execute(
@@ -681,6 +680,13 @@ class Handler(BaseHTTPRequestHandler):
         self._respond_json(status, body)
 
     def _publish_bundle(self, connection, playground_id, bundle):
+        existing = get_playground(connection, playground_id)
+        if existing is None:
+            raise MissingPlaygroundError("playground does not exist")
+        if existing.state == "stopped":
+            # An archived playground is read-only; the operator must publish
+            # under a fresh id (or restore the row by hand) to publish again.
+            raise PlaygroundHeadChangedError("playground is archived")
         result = publish_playground(
             connection,
             playground_id,

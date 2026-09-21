@@ -216,8 +216,14 @@ def decode_submission_request(payload):
 def _require_published_commit(connection, repository, request):
     """Fail unless the named commit is in that Playground's own history."""
 
-    if playgrounds.get_playground(connection, request.playground_id) is None:
+    row = playgrounds.get_playground(connection, request.playground_id)
+    if row is None:
         raise UnknownPlaygroundError("playground does not exist")
+    if row.state == "stopped":
+        # An archived playground is read-only. The client may still pin
+        # to a previously installed version, but no new hand-in is
+        # accepted against it.
+        raise UnknownPlaygroundError("playground is archived")
     if not repository_module.commit_in_playground_history(
         repository, request.playground_id, request.playground_commit_id
     ):
