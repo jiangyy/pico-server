@@ -544,33 +544,6 @@ def publish_playground(repository, playground_id, bundle, metadata):
     )
 
 
-def retire_playground(repository, playground_id):
-    """Remove a Playground's published ref and report whether one was there.
-
-    This is the whole of "students no longer see it": every read path resolves the
-    ref first, so a Playground without one is simply not in the catalog.  Nothing
-    else is touched — the commits stay in the object store (publishing the id
-    again restores it), and the database row with the submissions that reference
-    it is left alone, which is why retiring works even for a course students have
-    already handed work in for.
-
-    The delete is a compare-and-swap like a publish, so a concurrent publish of
-    the same id surfaces as :class:`PlaygroundHeadChangedError` instead of being
-    silently discarded.
-    """
-
-    if not isinstance(repository, Repository):
-        raise RepositoryError("repository handle required")
-
-    ref = repository.playground_ref(playground_id)
-    head = _resolve_head(repository, ref)
-    if head is None:
-        return False
-
-    _compare_and_swap(repository, ref, _zero_object_id(repository), head)
-    return True
-
-
 # --- Read-only access to published commits ---------------------------------
 #
 # A commit id alone never reaches Git content: the caller checks that the

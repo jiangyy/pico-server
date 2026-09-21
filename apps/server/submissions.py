@@ -53,10 +53,6 @@ class InvalidSubmissionRequestError(SubmissionError, ValueError):
     """A Submission request carried a malformed field."""
 
 
-class UnknownPlaygroundError(SubmissionError):
-    """The named Playground has no such published commit."""
-
-
 class MissingSubmissionError(SubmissionError):
     """No readable Submission exists for the requested identifier."""
 
