@@ -22,6 +22,7 @@ import events
 import events_types
 import manifests
 import pagination
+import routes
 import sync
 import sync_handlers
 from bundles import (
@@ -73,15 +74,6 @@ MAX_JSON_BODY_BYTES = 16 * 1024
 
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
-ALLOWED_METHODS = ("GET", "HEAD")
-PLAYGROUNDS_PATH = "/api/v1/playgrounds"
-PLAYGROUND_VERSIONS_SUFFIX = "/versions"
-VERSIONS_SEGMENT = "versions"
-FILES_SEGMENT = "files"
-MANIFEST_SEGMENT = "manifest"
-CATALOG_PATH = "/api/v1/catalog"
-SUBMISSIONS_PATH = "/api/v1/submissions"
-SYNC_PATH = "/api/v1/sync"
 
 # protocol.md §4: every request states which protocol the client speaks. It
 # cannot travel in a payload — a catalog request has no parameters and a file
@@ -104,129 +96,6 @@ OPERATOR_SCOPE = "operator"
 # no session, and no password.
 OPERATOR_ENVIRONMENT_VARIABLE = "PICOPG_OPERATOR_TOKEN"
 MIN_OPERATOR_TOKEN_BYTES = 16
-
-
-def _match_playground_versions(path):
-    """Return the playground ID in a commit upload path, else None."""
-    prefix = PLAYGROUNDS_PATH + "/"
-    if not path.startswith(prefix) or not path.endswith(
-        PLAYGROUND_VERSIONS_SUFFIX
-    ):
-        return None
-
-    playground_id = path[len(prefix): -len(PLAYGROUND_VERSIONS_SUFFIX)]
-    if not playground_id or "/" in playground_id:
-        return None
-    return playground_id
-
-
-def _match_playground(path):
-    """Return the playground ID in ``/api/v1/playgrounds/<id>``, else None."""
-
-    prefix = PLAYGROUNDS_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-
-    playground_id = path[len(prefix):]
-    if not playground_id or "/" in playground_id:
-        return None
-    return playground_id
-
-
-def _playground_versions_endpoint(playground_id):
-    """The idempotency endpoint of a Playground's bundle publish.
-
-    One spelling, used by both the publish that records a result and the retire
-    that has to forget it, so the two can never drift apart.
-    """
-
-    return f"POST {PLAYGROUNDS_PATH}/{playground_id}{PLAYGROUND_VERSIONS_SUFFIX}"
-
-
-def _version_route_parts(path):
-    """Split ``.../<playground>/versions/<version>/<tail>`` for read routes.
-
-    Returns ``(playground_id, version_id, tail)`` where ``tail`` is
-    everything after ``<version>/`` and may still contain literal slashes.
-    Returns ``None`` for any other shape, so a missing or extra segment never
-    matches. ``version_id`` is a Git commit id in this implementation; the
-    protocol only promises it addresses a Version.
-    """
-
-    prefix = PLAYGROUNDS_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-
-    parts = path[len(prefix):].split("/", 3)
-    if len(parts) != 4:
-        return None
-    playground_id, segment, version_id, tail = parts
-    if segment != VERSIONS_SEGMENT or not playground_id or not version_id:
-        return None
-    return playground_id, version_id, tail
-
-
-def _match_manifest(path):
-    """Return ``(playground_id, version_id)`` for a manifest read path."""
-
-    parts = _version_route_parts(path)
-    if parts is None:
-        return None
-    playground_id, version_id, tail = parts
-    if tail != MANIFEST_SEGMENT:
-        return None
-    return playground_id, version_id
-
-
-def _match_version_files(path):
-    """Return ``(playground_id, version_id, encoded_path)`` for a file path."""
-
-    parts = _version_route_parts(path)
-    if parts is None:
-        return None
-    playground_id, version_id, tail = parts
-    prefix = FILES_SEGMENT + "/"
-    if not tail.startswith(prefix):
-        return None
-    encoded_path = tail[len(prefix):]
-    if not encoded_path:
-        return None
-    return playground_id, version_id, encoded_path
-
-
-def _match_submission(path):
-    """Return the opaque submission ID in a submission path, else None."""
-    prefix = SUBMISSIONS_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-
-    submission_id = path[len(prefix):]
-    if not submission_id or "/" in submission_id:
-        return None
-    return submission_id
-
-
-def _allowed_methods(path):
-    """Return the methods a known path accepts, or ``None`` when unknown."""
-    if path in ("/healthz", CATALOG_PATH):
-        return ALLOWED_METHODS
-    if path == SUBMISSIONS_PATH:
-        return ALLOWED_METHODS
-    if path == SYNC_PATH:
-        return ("POST",)
-    if path == PLAYGROUNDS_PATH:
-        return ("POST",)
-    if _match_playground(path) is not None:
-        return ("DELETE",)
-    if _match_playground_versions(path) is not None:
-        return ("POST",)
-    if _match_manifest(path) is not None:
-        return ALLOWED_METHODS
-    if _match_version_files(path) is not None:
-        return ALLOWED_METHODS
-    if _match_submission(path) is not None:
-        return ALLOWED_METHODS
-    return None
 
 
 def _decode_sync_request(payload):
@@ -389,21 +258,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             self._respond(200, "ok\n", head_only=head_only)
-        elif path == CATALOG_PATH:
+        elif path == routes.CATALOG_PATH:
             self._get_catalog(head_only=head_only)
-        elif _match_manifest(path) is not None:
-            self._get_manifest(*_match_manifest(path), head_only=head_only)
-        elif _match_version_files(path) is not None:
+        elif routes.match_manifest(path) is not None:
+            self._get_manifest(*routes.match_manifest(path), head_only=head_only)
+        elif routes.match_version_files(path) is not None:
             self._get_version_file(
-                *_match_version_files(path), head_only=head_only
+                *routes.match_version_files(path), head_only=head_only
             )
-        elif path == SUBMISSIONS_PATH:
+        elif path == routes.SUBMISSIONS_PATH:
             self._get_submissions(head_only=head_only)
-        elif _match_submission(path) is not None:
+        elif routes.match_submission(path) is not None:
             self._get_submission(
-                _match_submission(path), head_only=head_only
+                routes.match_submission(path), head_only=head_only
             )
-        elif _allowed_methods(path) is not None:
+        elif routes.allowed_methods(path) is not None:
             self._method_not_allowed(head_only=head_only)
         else:
             self._not_found(head_only=head_only)
@@ -411,13 +280,13 @@ class Handler(BaseHTTPRequestHandler):
     def _route_post(self):
         path = urlsplit(self.path).path
 
-        if path == PLAYGROUNDS_PATH:
+        if path == routes.PLAYGROUNDS_PATH:
             self._post_playground()
-        elif _match_playground_versions(path) is not None:
-            self._post_playground_versions(_match_playground_versions(path))
-        elif path == SYNC_PATH:
+        elif routes.match_playground_versions(path) is not None:
+            self._post_playground_versions(routes.match_playground_versions(path))
+        elif path == routes.SYNC_PATH:
             self._post_sync()
-        elif _allowed_methods(path) is not None:
+        elif routes.allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
@@ -460,11 +329,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_delete(self):
         path = urlsplit(self.path).path
-        playground_id = _match_playground(path)
+        playground_id = routes.match_playground(path)
 
         if playground_id is not None:
             self._delete_playground(playground_id)
-        elif _allowed_methods(path) is not None:
+        elif routes.allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
@@ -508,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
                             "WHERE scope = ? AND endpoint = ?",
                             (
                                 OPERATOR_SCOPE,
-                                _playground_versions_endpoint(playground_id),
+                                routes.playground_versions_endpoint(playground_id),
                             ),
                         )
                         record_archive_event(connection, playground_id)
@@ -734,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
                 status, body = execute_idempotent(
                     connection,
                     OPERATOR_SCOPE,
-                    _playground_versions_endpoint(playground_id),
+                    routes.playground_versions_endpoint(playground_id),
                     request_key,
                     _bundle_request(playground_id, bundle),
                     lambda connection: self._publish_bundle(
@@ -941,7 +810,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _method_not_allowed(self, head_only=False):
         path = urlsplit(self.path).path
-        methods = _allowed_methods(path)
+        methods = routes.allowed_methods(path)
         if methods is None:
             self._not_found(head_only=head_only)
             return

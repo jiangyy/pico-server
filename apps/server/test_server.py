@@ -16,7 +16,8 @@ from pathlib import Path
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from server import ALLOWED_METHODS, make_server  # noqa: E402
+import routes  # noqa: E402
+from server import make_server  # noqa: E402
 
 OPERATOR_TOKEN = "test-operator-token-value"
 
@@ -78,7 +79,7 @@ class ServerTest(unittest.TestCase):
             with self.subTest(method=method):
                 status, headers, _ = self.request(method, "/healthz")
                 self.assertEqual(status, 405)
-                self.assertEqual(headers["allow"], ", ".join(ALLOWED_METHODS))
+                self.assertEqual(headers["allow"], ", ".join(routes.ALLOWED_METHODS))
 
     def test_injected_repository_is_initialized_bare(self):
         self.assertEqual(self.server.repository_path, self.repository_path)

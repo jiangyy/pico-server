@@ -79,6 +79,15 @@ node scripts/retire.mjs <id>
 
 `deploy/picopg.service` 是 systemd 单元，工作目录 `~/picopg`，只允许写 `data/`。
 
+## 代码布局
+
+- `server.py` —— HTTP 层：路由分发、鉴权、请求解码、响应编码，以及 10 个 handler。
+- `routes.py` —— 所有 URL 形状与 method 表。纯函数，不碰数据库或仓库，
+  因此可以脱离服务器直接测（`test_routes.py`）。
+- 其余模块各管一个领域：`bundles`（ZIP 校验）、`repository`（Git）、
+  `manifests`（manifest 与单文件）、`events`（事件与日志）、`sync`（一轮同步）、
+  `playgrounds`（状态与发布/下线）、`submissions`（作业）。
+
 ## 测试
 
 ```bash
@@ -88,3 +97,6 @@ python3 -m unittest discover -s apps/server -p "test_*.py"
 PICOPG_CLIENT_DIR=../learn-python/apps/client \
     python3 -m unittest discover -s apps/server -p "test_*.py"
 ```
+
+在 `learn-python` 那一侧：`npm test` 跑全部（含 client），
+`npm run test:electron` 另外跑真 Electron 冒烟（需要先 `npm run build:client`）。
