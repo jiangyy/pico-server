@@ -37,6 +37,7 @@
 | POST | `/api/v1/playgrounds` | `{id}` 登记一门课（409 = 已存在） |
 | POST | `/api/v1/playgrounds/{id}/versions` | ZIP + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}` |
 | DELETE | `/api/v1/playgrounds/{id}` | 下线，返回 `{status}` |
+| POST | `/api/v1/playgrounds/{id}/restore` | 重新上线，返回 `{status}` |
 | GET | `/api/v1/submissions` | 分页列出交上来的作业 |
 | GET | `/api/v1/submissions/{id}` | 取回一份作业的文件 |
 
@@ -47,6 +48,12 @@
 覆盖先发的。首次发布（这门课还没有 Version）必须**不带**——带了就是 `conflict`。
 缺失是 `400`，不是 `conflict`：那是畸形请求，不是过期的 base。
 `ArchiveResult.status`：`accepted` / `no_op`。
+
+下线之后**不能**直接重新发布（`state != active` → `409 playground_stopped`，
+protocol.md §2），所以让课程回来是 `POST .../restore`：它把 `state` 改回 active，并为
+当前 Version 记一条 `publish_playground` 事件——客户端就是靠这条事件知道课程回来了，
+内容日志没有单独的"恢复"类型。`restore` 是 protocol.md 明确留的空档（它说 Publisher
+不该靠重试同一个 PublishRequest 解决，但没定义该怎么做），不是协议里已有的操作。
 
 ## 存储
 
