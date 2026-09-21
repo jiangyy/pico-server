@@ -95,15 +95,28 @@ def read_event(connection, event_id):
     return (row["kind"], row["status"], row["reason"], row["response_json"])
 
 
-def read_content_log(connection, after_seq):
-    """Every content log entry with ``seq > after_seq``, ordered by seq."""
+def read_content_log(connection, after_seq, limit=None):
+    """Content log entries with ``seq > after_seq``, oldest first.
+
+    ``limit`` bounds one response. The log grows for the life of the
+    deployment, so an unbounded read would eventually produce a body larger
+    than a client is willing to accept — and that client could never advance
+    its cursor again. A caller that bounds the read must report the seq it
+    actually delivered, never the log's global maximum.
+    """
     if type(after_seq) is not int or after_seq < 0:
         raise ValueError("after_seq must be a non-negative integer")
-    rows = connection.execute(
+    if limit is not None and (type(limit) is not int or limit <= 0):
+        raise ValueError("limit must be a positive integer or None")
+    query = (
         "SELECT seq, event_id, kind, payload FROM content_log "
-        "WHERE seq > ? ORDER BY seq",
-        (after_seq,),
-    ).fetchall()
+        "WHERE seq > ? ORDER BY seq"
+    )
+    parameters = [after_seq]
+    if limit is not None:
+        query += " LIMIT ?"
+        parameters.append(limit)
+    rows = connection.execute(query, parameters).fetchall()
     return tuple(
         ContentLogEntry(
             seq=row["seq"],

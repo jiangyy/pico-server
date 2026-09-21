@@ -31,8 +31,15 @@ from __future__ import annotations
 import sqlite3
 from typing import Callable
 
+import database
 import events
 import events_types
+
+
+#: How many content log entries one sync response carries. The client reads a
+#: response body under a 1 MiB cap, so an unbounded log read would eventually
+#: answer with a body the client refuses — leaving it unable to advance.
+MAX_ENTRIES_PER_SYNC = 500
 
 
 class EventRejected(Exception):
@@ -68,7 +75,10 @@ def process_sync(
 
     event_results = []
 
-    with connection:  # one transaction for the whole round
+    # One immediate transaction for the whole round, so the "has this
+    # event been seen?" read and the insert that follows it cannot be
+    # interleaved with another connection doing the same check.
+    with database.immediate_transaction(connection):
         for envelope in request.pending_events:
             stored = events.read_event(connection, envelope.event_id)
             if stored is not None:
@@ -127,8 +137,12 @@ def process_sync(
                 )
             )
 
-    entries = events.read_content_log(connection, request.after_seq)
-    upto_seq = events.current_upto_seq(connection)
+    entries = events.read_content_log(
+        connection, request.after_seq, MAX_ENTRIES_PER_SYNC
+    )
+    # The cursor is the last seq *delivered*, not the log's maximum: advancing
+    # past entries this response did not carry would lose them for good.
+    upto_seq = entries[-1].seq if entries else request.after_seq
 
     return events_types.SyncResponse(
         event_results=tuple(event_results),

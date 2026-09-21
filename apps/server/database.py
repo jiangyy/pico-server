@@ -2,12 +2,43 @@
 
 import re
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import permissions
 
 
 SCHEMA_VERSION = 2
+
+
+@contextmanager
+def immediate_transaction(connection):
+    """One transaction that takes SQLite's write lock up front.
+
+    ``with connection:`` gives a *deferred* transaction: SQLite only takes the
+    write lock at the first write, so two connections can each read the same
+    "this event does not exist yet" answer and then race to insert it. One of
+    them loses with a UNIQUE violation — a benign retry turned into a 500.
+
+    ``BEGIN IMMEDIATE`` takes the lock at the start, so the read and the write
+    that follows it are atomic with respect to every other writer. Connections
+    wait for each other (python's ``sqlite3`` default ``timeout`` is 5s)
+    instead of failing.
+
+    Safe to nest: an inner block joins the caller's already-open transaction
+    rather than starting a second one.
+    """
+    owns = not connection.in_transaction
+    if owns:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield connection
+    except BaseException:
+        if owns:
+            connection.rollback()
+        raise
+    if owns:
+        connection.commit()
 
 
 class SchemaValidationError(RuntimeError):

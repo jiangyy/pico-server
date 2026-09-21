@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import database
 import events
 import events_types
 import repository as _repository
@@ -83,7 +84,7 @@ def create_playground(connection, playground_id):
 
     playground_id = _require_opaque_id(playground_id)
 
-    with connection:
+    with database.immediate_transaction(connection):
         row = connection.execute(
             "SELECT 1 FROM playgrounds WHERE id = ?",
             (playground_id,),

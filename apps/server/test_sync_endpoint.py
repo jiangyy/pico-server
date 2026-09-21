@@ -231,5 +231,84 @@ class SyncEndpointTests(ServerTestCase):
         )
 
 
+class ContentLogBacklogTest(ServerTestCase):
+    """A log long enough that one response cannot carry it.
+
+    Its own class on purpose: it writes a backlog straight into the log, and
+    ``ServerTestCase`` shares one database across a class, so a sibling test
+    reading the same log would see the backlog.
+    """
+
+    def sync(self, pending_events, after_seq=0):
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/sync",
+            payload={"pending_events": pending_events, "after_seq": after_seq},
+        )
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_a_long_content_log_is_walked_in_bounded_rounds(self):
+        """The log grows for the life of the deployment, so one response must
+        not try to carry all of it: a body a client refuses would leave that
+        client unable to advance ever again."""
+        import json
+        import sqlite3
+
+        from sync import MAX_ENTRIES_PER_SYNC
+
+        playground_id, version_id = self.seed("pg-sync-backlog")
+        # A backlog a real deployment would take a long time to reach, so
+        # write it straight into the log rather than publishing thousands of
+        # real bundles.
+        extra = MAX_ENTRIES_PER_SYNC * 2 + 7
+        database_path = self.server.database_path
+        connection = sqlite3.connect(database_path)
+        with connection:
+            for index in range(extra):
+                event_id = f"backlog-{index}"
+                payload = json.dumps(
+                    {"playground_id": playground_id, "version_id": version_id},
+                    separators=(",", ":"),
+                )
+                connection.execute(
+                    "INSERT INTO events (event_id, kind, payload, status, reason,"
+                    " response_json, created_at)"
+                    " VALUES (?, 'publish_playground', ?, 'accepted', '', '{}', 'now')",
+                    (event_id, payload),
+                )
+                connection.execute(
+                    "INSERT INTO content_log (event_id, kind, payload) VALUES (?,"
+                    " 'publish_playground', ?)",
+                    (event_id, payload),
+                )
+        connection.close()
+
+        connection = sqlite3.connect(self.server.database_path)
+        total = connection.execute(
+            "SELECT MAX(seq) FROM content_log"
+        ).fetchone()[0]
+        connection.close()
+        cursor = 0
+        rounds = 0
+        seen = 0
+        while True:
+            body = self.sync([], after_seq=cursor)
+            self.assertLessEqual(len(body["entries"]), MAX_ENTRIES_PER_SYNC)
+            seen += len(body["entries"])
+            rounds += 1
+            if body["upto_seq"] == cursor:
+                break
+            # The cursor never runs ahead of what was actually delivered.
+            if body["entries"]:
+                self.assertEqual(body["upto_seq"], body["entries"][-1]["seq"])
+            cursor = body["upto_seq"]
+            self.assertLess(rounds, 100, "the walk did not converge")
+
+        self.assertEqual(seen, total)
+        self.assertEqual(cursor, total)
+
+
+
 if __name__ == "__main__":
     unittest.main()

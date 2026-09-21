@@ -30,7 +30,7 @@ from bundles import (
     decode_bundle_zip,
     validate_bundle,
 )
-from database import open_database
+from database import immediate_transaction, open_database
 from idempotency import (
     MAX_REQUEST_KEY_LENGTH,
     IdempotencyConflict,
@@ -467,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not already_stopped:
                     # One transaction: the archive event, its content log row
                     # and the state flip all land together, or none of them do.
-                    with connection:
+                    with immediate_transaction(connection):
                         # Drop the recorded publishes so an exact replay of an
                         # old idempotency key cannot report a 201 for a course
                         # nobody can read. The events table keeps the archive

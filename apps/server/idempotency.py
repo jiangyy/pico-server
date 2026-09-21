@@ -17,6 +17,8 @@ import hashlib
 import json
 import sqlite3
 
+import database
+
 
 MAX_REQUEST_KEY_LENGTH = 255
 MAX_ENDPOINT_LENGTH = 255
@@ -79,7 +81,7 @@ def execute(connection, scope, endpoint, request_key, request, callback):
     if existing is not None:
         return _existing_result(existing, digest)
 
-    with connection:
+    with database.immediate_transaction(connection):
         status, response = _validated_result(callback(connection))
         response_json = _serialize_response(response)
         try:

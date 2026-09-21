@@ -1,11 +1,16 @@
 """Tests for persistent transactional idempotency."""
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
+import idempotency
 from database import open_database
+from database import immediate_transaction  # noqa: E402
 from idempotency import (
     IdempotencyConflict,
     IdempotencyRequestError,
@@ -329,58 +334,94 @@ class IdempotencyTest(unittest.TestCase):
         self.assertNotIn("Lesson", stored)
         self.assertNotIn("authorization", stored)
 
-    def test_concurrent_attempt_resolves_through_unique_constraint(self):
+    def test_a_lost_race_falls_back_to_the_winners_result(self):
+        """The initial lookup is deliberately outside the transaction.
+
+        Two attempts can therefore both miss it, and the one that reaches the
+        insert second hits the primary key. That is a retry, not a fault: it
+        must roll back its own business writes and answer with the winner's
+        stored result.
+        """
         connection = self.open()
         other = self.open()
         self.create_playground(connection)
         connection.commit()
 
-        def winner(conn):
-            return 201, {"id": "winner"}
+        winner = execute(
+            other, "scope-1", "/playgrounds", "key-1",
+            {"name": "A"}, lambda inner: (201, {"id": "winner"}),
+        )
+        self.assertEqual(winner, (201, {"id": "winner"}))
 
         def loser(conn):
-            # Simulate a competing request committing after this attempt's
-            # initial lookup but before it records its own result.
-            execute(
-                other, "scope-1", "/playgrounds", "key-1",
-                {"name": "A"}, winner,
-            )
+            # Simulate the lookup having happened before the winner
+            # committed: the business write must be discarded and the
+            # winner's answer returned.
             self.create_playground(conn, "pg-business-1")
             return 500, {"id": "loser"}
 
-        result = execute(
-            connection, "scope-1", "/playgrounds", "key-1",
-            {"name": "A"}, loser,
-        )
+        with mock.patch.object(idempotency, "_lookup", side_effect=[None, idempotency._lookup(connection, "scope-1", "/playgrounds", "key-1")]):
+            result = execute(
+                connection, "scope-1", "/playgrounds", "key-1",
+                {"name": "A"}, loser,
+            )
 
         self.assertEqual(result, (201, {"id": "winner"}))
         self.assertEqual(self.count_business_playground(connection, "pg-business-1"), 0)
         self.assertEqual(self.count(connection, "idempotency_results"), 1)
-        stored = connection.execute(
-            "SELECT response_json FROM idempotency_results"
-        ).fetchone()["response_json"]
-        self.assertEqual(json.loads(stored), {"id": "winner"})
 
-    def test_concurrent_attempt_with_different_request_conflicts(self):
+    def test_a_lost_race_with_a_different_request_still_conflicts(self):
         connection = self.open()
         other = self.open()
         self.create_playground(connection)
         connection.commit()
 
-        def loser(conn):
-            execute(
-                other, "scope-1", "/playgrounds", "key-1",
-                {"name": "A"}, lambda inner: (201, {"id": "winner"}),
-            )
-            return 201, {"id": "loser"}
+        execute(
+            other, "scope-1", "/playgrounds", "key-1",
+            {"name": "A"}, lambda inner: (201, {"id": "winner"}),
+        )
+        stored = idempotency._lookup(connection, "scope-1", "/playgrounds", "key-1")
 
-        with self.assertRaises(IdempotencyConflict):
-            execute(
-                connection, "scope-1", "/playgrounds", "key-1",
-                {"name": "B"}, loser,
-            )
+        with mock.patch.object(idempotency, "_lookup", side_effect=[None, stored]):
+            with self.assertRaises(IdempotencyConflict):
+                execute(
+                    connection, "scope-1", "/playgrounds", "key-1",
+                    {"name": "B"}, lambda inner: (201, {"id": "loser"}),
+                )
 
         self.assertEqual(self.count(connection, "idempotency_results"), 1)
+
+    def test_an_immediate_transaction_holds_the_write_lock(self):
+        """The lock is what makes lookup-then-insert safe, so assert it is
+        actually taken: a second connection cannot write until the first
+        transaction ends."""
+        connection = self.open()
+        competing = self.open()
+        competing.execute("PRAGMA busy_timeout = 0")
+
+        with immediate_transaction(connection):
+            self.assertTrue(connection.in_transaction)
+            with self.assertRaises(sqlite3.OperationalError):
+                competing.execute(
+                    "INSERT INTO playgrounds (id, created_at) VALUES (?, ?)",
+                    ("pg-blocked", "2026-09-15T00:00:00Z"),
+                )
+
+        # Once the round is over the same write goes through.
+        with competing:
+            competing.execute(
+                "INSERT INTO playgrounds (id, created_at) VALUES (?, ?)",
+                ("pg-blocked", "2026-09-15T00:00:00Z"),
+            )
+        self.assertEqual(self.count_business_playground(connection, "pg-blocked"), 1)
+
+    def test_an_immediate_transaction_rolls_back_on_failure(self):
+        connection = self.open()
+        with self.assertRaises(RuntimeError):
+            with immediate_transaction(connection):
+                self.create_playground(connection, "pg-doomed")
+                raise RuntimeError("the rest of the round failed")
+        self.assertEqual(self.count_business_playground(connection, "pg-doomed"), 0)
 
 
 if __name__ == "__main__":
