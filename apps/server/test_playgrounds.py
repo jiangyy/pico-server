@@ -110,7 +110,8 @@ class PlaygroundTest(unittest.TestCase):
         self.assertEqual(len(first.commit_id), 40)
 
         again = playgrounds.publish_playground(
-            self.connection, "pg-one", self.repository, self.bundle(), self.metadata()
+            self.connection, "pg-one", self.repository, self.bundle(), self.metadata(),
+            base_version_id=first.commit_id,
         )
         self.assertTrue(again.no_op)
         self.assertEqual(again.commit_id, first.commit_id)
@@ -125,6 +126,7 @@ class PlaygroundTest(unittest.TestCase):
         second = playgrounds.publish_playground(
             self.connection, "pg-one", self.repository, self.bundle(b"print(2)"),
             self.metadata(),
+            base_version_id=first.commit_id,
         )
         self.assertNotEqual(first.commit_id, second.commit_id)
         self.assertTrue(

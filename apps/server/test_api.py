@@ -107,6 +107,17 @@ class ServerTestCase(unittest.TestCase):
 
     # ----- operator fixtures ---------------------------------------------
 
+    def variant_zip(self, body):
+        """The same bundle with one file's bytes changed, so its tree differs."""
+
+        return self.build_zip(
+            (
+                ("picopg.json", MANIFEST),
+                ("course/module/app.py", body),
+                ("starter/setup.py", b"setup"),
+            )
+        )
+
     def build_zip(self, entries=None):
         if entries is None:
             entries = (
@@ -128,14 +139,39 @@ class ServerTestCase(unittest.TestCase):
             token=OPERATOR_TOKEN,
         )
 
-    def publish(self, playground_id, archive=None, key="key-1"):
+    def current_version(self, playground_id):
+        """The Version a publish of this Playground would have to name as base."""
+
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        for entry in body["playgrounds"]:
+            if entry["playground_id"] == playground_id:
+                return entry["current_version_id"]
+        return None
+
+    def publish(self, playground_id, archive=None, key="key-1", base=None):
+        """Publish one bundle, naming the current Version as its base.
+
+        protocol.md §2: every publish of an existing Playground says which
+        Version it built on. `base=None` asks the server what that is, exactly
+        as `upload.mjs` does; `base=False` sends nothing, which is how the
+        refusal is tested.
+        """
+
+        headers = {"Idempotency-Key": key}
+        if base is None:
+            found = self.current_version(playground_id)
+            if found is not None:
+                headers["X-Base-Version-Id"] = found
+        elif base is not False:
+            headers["X-Base-Version-Id"] = base
         return self.request(
             "POST",
             f"/api/v1/playgrounds/{playground_id}/versions",
             raw_body=archive if archive is not None else self.build_zip(),
             token=OPERATOR_TOKEN,
             content_type="application/zip",
-            extra_headers={"Idempotency-Key": key},
+            extra_headers=headers,
         )
 
     def seed(self, playground_id=None):
@@ -267,6 +303,89 @@ class DistributionTest(ServerTestCase):
         self.assertEqual(status, 404)
 
 
+class PublishBaseTest(ServerTestCase):
+    """`base_version_id`: publishing against a Version that is still current.
+
+    Without it two publishes racing each other would both append a Version and
+    the later one would silently discard the earlier one's content. The base is
+    what turns that into a refusal the publisher can see and resolve.
+    """
+
+    def test_the_first_publish_of_a_playground_names_no_base(self):
+        playground_id = "pg-base-first"
+        self.create_playground(playground_id)
+        status, _, body = self.publish(playground_id, base=False)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["status"], "accepted")
+        self.assertEqual(len(body["version_id"]), 40)
+
+    def test_the_first_publish_must_not_name_a_base(self):
+        # Naming one claims a history the Playground does not have.
+        playground_id = "pg-base-first-with-base"
+        self.create_playground(playground_id)
+        status, _, body = self.publish(playground_id, base="0" * 40)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["status"], "conflict")
+
+    def test_a_later_publish_must_name_the_current_base(self):
+        playground_id, version_id = self.seed("pg-base-required")
+        # No base at all: a malformed PublishRequest, not a stale one.
+        status, _, body = self.publish(playground_id, key="no-base", base=False)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "invalid_request")
+
+        # The current Version is accepted, and is a no-op because the content is
+        # the same bundle.
+        status, _, body = self.publish(playground_id, key="with-base", base=version_id)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["status"], "no_op")
+        self.assertEqual(body["version_id"], version_id)
+
+    def test_a_stale_base_is_a_conflict_and_writes_nothing(self):
+        playground_id, first = self.seed("pg-base-stale")
+        # Someone else publishes first, so the base this caller holds is gone.
+        status, _, second = self.publish(playground_id, archive=self.variant_zip(b"second"), key="k2")
+        self.assertEqual(status, 201)
+        self.assertNotEqual(second["version_id"], first)
+
+        status, _, body = self.publish(
+            playground_id, archive=self.variant_zip(b"third"), key="k3", base=first
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["status"], "conflict")
+        # A conflict carries no version: the caller must read the current one.
+        self.assertNotIn("version_id", body)
+
+        # ...and the two accepted publishes are the only ones in the history.
+        status, _, manifest = self.request(
+            "GET", f"/api/v1/playgrounds/{playground_id}/versions/{second['version_id']}/manifest"
+        )
+        self.assertEqual(status, 200)
+
+    def test_a_malformed_base_is_a_bad_request(self):
+        playground_id, _ = self.seed("pg-base-malformed")
+        for base in ("HEAD", "not-a-version", "A" * 40, "0" * 39, "0" * 41):
+            with self.subTest(base=base):
+                status, _, body = self.publish(playground_id, key=f"k-{base}", base=base)
+                self.assertEqual(status, 400, base)
+                self.assertEqual(body["code"], "invalid_request")
+
+    def test_a_blank_base_is_treated_as_absent(self):
+        # A header sent with an empty value is not a claim about anything.
+        playground_id = "pg-base-blank"
+        self.create_playground(playground_id)
+        status, _, _ = self.publish(playground_id, base="")
+        self.assertEqual(status, 201)
+
+    def test_the_base_is_part_of_what_a_key_identifies(self):
+        # The same bundle offered against a different Version is a different
+        # request with a different answer, so it cannot replay the first result.
+        playground_id, version_id = self.seed("pg-base-identity")
+        self.assertEqual(self.publish(playground_id, key="same-key", base=False)[0], 400)
+        status, _, _ = self.publish(playground_id, key="same-key", base=version_id)
+        self.assertEqual(status, 201)
+
+
 class CatalogSourceTest(ServerTestCase):
     """The catalog reads the database, and start-up keeps it complete.
 
@@ -387,11 +506,15 @@ class PublishTest(ServerTestCase):
         self.assertEqual(body["status"], "no_op")
 
     def test_retrying_with_the_same_key_replays_the_result(self):
+        # A retry resends the *same* request, base included: the base is part of
+        # what the key identifies, so re-reading it would be a different request
+        # rather than a replay. A first publish names no base, and so does its
+        # retry.
         playground_id = f"pg-{uuid.uuid4().hex[:8]}"
         self.create_playground(playground_id)
 
-        first = self.publish(playground_id, key="retry-key")
-        second = self.publish(playground_id, key="retry-key")
+        first = self.publish(playground_id, key="retry-key", base=False)
+        second = self.publish(playground_id, key="retry-key", base=False)
         self.assertEqual(first[0], 201)
         self.assertEqual(second[0], 201)
         self.assertEqual(first[2], second[2])

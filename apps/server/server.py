@@ -25,7 +25,7 @@ import pagination
 import routes
 import sync
 import sync_handlers
-from api_handler import ApiHandler, MAX_JSON_BODY_BYTES
+from api_handler import ApiHandler, BASE_VERSION_HEADER, MAX_JSON_BODY_BYTES
 from bundles import (
     MAX_ARCHIVE_BYTES,
     BundleValidationError,
@@ -42,6 +42,7 @@ from playgrounds import (
     InvalidRequestError,
     MissingPlaygroundError,
     PlaygroundConflictError,
+    PlaygroundBaseChangedError,
     PlaygroundStoppedError,
     create_playground,
     get_playground,
@@ -121,16 +122,19 @@ def _decode_sync_request(payload):
     )
 
 
-def _bundle_request(playground_id, bundle):
+def _bundle_request(playground_id, bundle, base_version_id):
     """Return the canonical, content-addressed logical publish request.
 
     The identity is derived from the normalized validated bundle rather than
     the raw ZIP bytes, so repacking identical content with different
-    compression or member order is the same logical request.
+    compression or member order is the same logical request. The base is part
+    of the identity too: the same bundle offered against a different Version is
+    a different request, with a different answer.
     """
 
     return {
         "playgroundId": playground_id,
+        "baseVersionId": base_version_id,
         "files": [
             {
                 "path": path,
@@ -488,6 +492,11 @@ class Handler(ApiHandler):
         if request_key is None:
             return
 
+        # The base names the Version this bundle was built on; an empty header
+        # means "the first one", and `publish_playground` decides whether that
+        # is true. A header that is present but blank is the same as absent.
+        base_version_id = self.headers.get(BASE_VERSION_HEADER, "").strip() or None
+
         try:
             content_length = int(self.headers.get("Content-Length", ""))
         except ValueError:
@@ -519,9 +528,9 @@ class Handler(ApiHandler):
                     OPERATOR_SCOPE,
                     routes.playground_versions_endpoint(playground_id),
                     request_key,
-                    _bundle_request(playground_id, bundle),
+                    _bundle_request(playground_id, bundle, base_version_id),
                     lambda connection: self._publish_bundle(
-                        connection, playground_id, bundle
+                        connection, playground_id, bundle, base_version_id
                     ),
                 )
         except IdempotencyConflict:
@@ -541,8 +550,14 @@ class Handler(ApiHandler):
             # retrying the same request will not change that.
             self._respond_json(409, {"status": "playground_stopped"})
             return
+        except PlaygroundBaseChangedError:
+            # protocol.md's `conflict`: the base is stale. Nothing was written,
+            # and the publisher resolves it by reading the current Version.
+            self._respond_json(409, {"status": "conflict"})
+            return
         except PlaygroundHeadChangedError:
-            # The ref moved under us: the publisher's base is stale.
+            # The ref moved under us: a race with another publish, with the same
+            # answer and the same remedy.
             self._respond_json(409, {"status": "conflict"})
             return
         except RepositoryError:
@@ -551,7 +566,7 @@ class Handler(ApiHandler):
 
         self._respond_json(status, body)
 
-    def _publish_bundle(self, connection, playground_id, bundle):
+    def _publish_bundle(self, connection, playground_id, bundle, base_version_id):
         """Create a Version for one validated bundle.
 
         The result is protocol.md's ``PublishResult``: the protocol's own field
@@ -567,6 +582,7 @@ class Handler(ApiHandler):
             self.server.repository,
             bundle,
             _commit_metadata(),
+            base_version_id,
         )
         return 201, {
             "status": "no_op" if result.no_op else "accepted",

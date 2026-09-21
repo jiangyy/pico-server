@@ -71,7 +71,17 @@ class ManifestTestBase(unittest.TestCase):
             self.repository,
             self.make_bundle(self.default_entries(course_data)),
             self.metadata(f"publish {playground_id}"),
+            base_version_id=self.current_version(playground_id),
         )
+
+    def current_version(self, playground_id):
+        """The Version this Playground is on, or ``None`` when it has none."""
+
+        row = self.connection.execute(
+            "SELECT current_version_id FROM playgrounds WHERE id = ?",
+            (playground_id,),
+        ).fetchone()
+        return None if row is None or not row["current_version_id"] else row["current_version_id"]
 
     # ----- Git helpers ---------------------------------------------------
 
@@ -576,12 +586,18 @@ class CommitFileReadTest(ManifestTestBase):
         )
 
     def publish_entries(self, playground_id, entries):
+        row = self.connection.execute(
+            "SELECT current_version_id FROM playgrounds WHERE id = ?",
+            (playground_id,),
+        ).fetchone()
+        base = None if row is None or not row["current_version_id"] else row["current_version_id"]
         return playgrounds.publish_playground(
             self.connection,
             playground_id,
             self.repository,
             self.make_bundle(entries),
             self.metadata(),
+            base_version_id=base,
         )
 
     def test_normalize_content_path_uses_bundle_rules(self):

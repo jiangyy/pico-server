@@ -26,6 +26,12 @@ from idempotency import MAX_REQUEST_KEY_LENGTH
 #: larger in `server.py`); anything bigger is refused before it is read.
 MAX_JSON_BODY_BYTES = 16 * 1024
 
+# protocol.md's `PublishRequest` is `{playground_id, base_version_id?, bundle}`:
+# the id is in the URL and the bundle is the body, so the base travels here. It
+# is a header for the same reason the protocol version is — nothing else about
+# the request could carry it without inventing a second bundle format.
+BASE_VERSION_HEADER = "X-Base-Version-Id"
+
 # protocol.md §4: every request states which protocol the client speaks. It
 # cannot travel in a payload — a catalog request has no parameters and a file
 # read is a bare GET — so it is a header, checked once before routing.
