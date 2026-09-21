@@ -91,7 +91,10 @@ node scripts/retire.mjs <id>
 
 ## 代码布局
 
-- `server.py` —— HTTP 层：路由分发、鉴权、请求解码、响应编码，以及 10 个 handler。
+- `api_handler.py` —— HTTP 管道：有界读体、响应编码、错误词汇、协议版本闸门、
+  operator token、每请求一条数据库连接。不知道 Playground / bundle / Git / 作业的存在，
+  所以只能按形状理解，端点也无法借它绕到存储。
+- `server.py` —— 路由分发与 10 个 handler。
 - `routes.py` —— 所有 URL 形状与 method 表。纯函数，不碰数据库或仓库，
   因此可以脱离服务器直接测（`test_routes.py`）。
 - 其余模块各管一个领域：`bundles`（ZIP 校验）、`repository`（Git）、

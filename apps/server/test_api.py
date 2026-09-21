@@ -618,6 +618,85 @@ class ProtocolVersionTest(ServerTestCase):
         self.assertEqual(status, 200)
 
 
+class ConditionalReadTest(ServerTestCase):
+    """`If-None-Match` on the byte routes.
+
+    A version's files are immutable, so their ETag is their own sha256 and a
+    repeat request can be answered `304` with no body. This is the one part of
+    the response plumbing that had no test.
+    """
+
+    def test_a_file_carries_its_digest_as_an_etag(self):
+        playground_id, version_id = self.seed()
+        path = f"/api/v1/playgrounds/{playground_id}/versions/{version_id}/files/course/module/app.py"
+
+        status, headers, body = self.request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"print(1)")
+        self.assertEqual(headers["etag"], f'"{hashlib.sha256(body).hexdigest()}"')
+
+        # The same request with the validator is a 304 and no body.
+        again, headers, body = self.request(
+            "GET", path, extra_headers={"If-None-Match": headers["etag"]}
+        )
+        self.assertEqual(again, 304)
+        self.assertIsNone(body)
+        self.assertEqual(headers["cache-control"], "no-store")
+
+    def test_a_stale_validator_still_gets_the_bytes(self):
+        playground_id, version_id = self.seed()
+        path = f"/api/v1/playgrounds/{playground_id}/versions/{version_id}/files/course/module/app.py"
+
+        status, _, body = self.request(
+            "GET", path, extra_headers={"If-None-Match": '"' + "0" * 64 + '"'}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"print(1)")
+
+    def test_a_head_with_the_validator_has_no_body(self):
+        playground_id, version_id = self.seed()
+        path = f"/api/v1/playgrounds/{playground_id}/versions/{version_id}/files/course/module/app.py"
+        etag = self.request("GET", path)[1]["etag"]
+
+        status, _, body = self.request(
+            "HEAD", path, extra_headers={"If-None-Match": etag}
+        )
+        self.assertEqual(status, 304)
+        self.assertIsNone(body)
+
+
+class OperatorTokenShapeTest(ServerTestCase):
+    """How the `Authorization` header is read.
+
+    The operator token is the whole write authorization, so the parsing that
+    decides whether it was presented is worth pinning: a scheme that is merely
+    spelled differently must not become a way in or out.
+    """
+
+    def header(self, value):
+        return self.request(
+            "GET", "/api/v1/submissions", extra_headers={"Authorization": value}
+        )
+
+    def test_a_well_formed_header_is_accepted(self):
+        self.assertEqual(self.header(f"Bearer {OPERATOR_TOKEN}")[0], 200)
+        # The scheme is case-insensitive by RFC 7235.
+        self.assertEqual(self.header(f"bearer {OPERATOR_TOKEN}")[0], 200)
+        self.assertEqual(self.header(f"BEARER {OPERATOR_TOKEN}")[0], 200)
+
+    def test_a_malformed_header_is_not(self):
+        for value in (
+            "",
+            OPERATOR_TOKEN,                     # no scheme
+            f"Basic {OPERATOR_TOKEN}",          # wrong scheme
+            f"Bearer",                          # no token
+            f"Bearer  {OPERATOR_TOKEN}",        # two spaces: the token would be empty
+            f"Bearer {OPERATOR_TOKEN} extra",   # trailing material
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self.header(value)[0], 401, value)
+
+
 class RoutingTest(ServerTestCase):
     """What an unknown route, an unsupported verb, and a bad payload get."""
 
