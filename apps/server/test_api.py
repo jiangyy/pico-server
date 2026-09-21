@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import subprocess
 import threading
 import os
 import sys
@@ -26,6 +27,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from events_types import PROTOCOL_VERSION  # noqa: E402
+from unittest import mock  # noqa: E402
+
+import playgrounds  # noqa: E402
+import repository  # noqa: E402
+import server as server_module  # noqa: E402
 from server import make_server  # noqa: E402
 
 OPERATOR_TOKEN = "test-operator-token-value"
@@ -412,6 +418,100 @@ class PublishBaseTest(ServerTestCase):
         self.assertEqual(self.publish(playground_id, key="same-key", base=False)[0], 400)
         status, _, _ = self.publish(playground_id, key="same-key", base=version_id)
         self.assertEqual(status, 201)
+
+
+class PublishPhasesOverHttpTest(ServerTestCase):
+    """三阶段在 HTTP 层的顺序与失败语义。
+
+    这些断言针对的是**两个存储各自独立**这件事：Git 不在 SQLite 事务里，数据库
+    没答应之前 history ref 不动。两条都曾经不成立，而且都只在出错时才看得见。
+    """
+
+    def history_head(self, playground_id):
+        completed = subprocess.run(
+            ["git", "-C", str(self.server.repository_path), "rev-parse", "--verify", "--quiet",
+             f"refs/picopg/history/{playground_id}"],
+            capture_output=True, text=True,
+        )
+        return completed.stdout.strip() or None
+
+    def pending_refs(self):
+        completed = subprocess.run(
+            ["git", "-C", str(self.server.repository_path), "for-each-ref", "--format=%(refname)",
+             "refs/picopg/pending/"],
+            capture_output=True, text=True,
+        )
+        return [line for line in completed.stdout.split("\n") if line]
+
+    def test_a_database_failure_after_prepare_leaves_no_trace(self):
+        # Prepare 已经建了 commit 和 pending ref，然后数据库那一半失败：history ref
+        # 必须不动，pending ref 必须被清掉，那个 commit 之后由 GC 收走。
+        playground_id, version_id = self.seed("pg-db-fails")
+        before = self.history_head(playground_id)
+        self.assertEqual(before, version_id)
+
+        def explode(*_args, **_kwargs):
+            raise sqlite3.OperationalError("simulated database failure")
+
+        # 打 server 模块里的名字：它是 `from playgrounds import ...` 进来的，
+        # 打 playgrounds 上的属性对已经绑好的引用没有影响。
+        with mock.patch.object(server_module, "commit_prepared_version", side_effect=explode):
+            status, _, _ = self.publish(
+                playground_id, archive=self.variant_zip(b"new"), key="db-fails", base=version_id
+            )
+
+        self.assertEqual(status, 500, "数据库失败就是这个请求失败")
+        self.assertEqual(self.history_head(playground_id), before, "history ref 不能领先数据库")
+        self.assertEqual(self.pending_refs(), [], "失败路径必须清掉 pending ref")
+
+    def test_the_git_work_does_not_hold_the_database_write_lock(self):
+        # Git 子进程不在 BEGIN IMMEDIATE 里面：Prepare 期间另一个连接还能写。
+        playground_id, version_id = self.seed("pg-no-lock")
+        observed = {}
+        original = repository.publish_playground_prepare
+
+        def spy(*args, **kwargs):
+            other = sqlite3.connect(self.server.database_path, timeout=0.5)
+            try:
+                with other:
+                    other.execute(
+                        "INSERT INTO playgrounds (id, created_at, state, current_version_id)"
+                        " VALUES ('probe-lock', 'now', 'active', '')"
+                    )
+                observed["blocked"] = False
+            except sqlite3.OperationalError as error:
+                observed["blocked"] = str(error)
+            finally:
+                other.close()
+            return original(*args, **kwargs)
+
+        with mock.patch.object(server_module, "publish_playground_prepare", side_effect=spy):
+            status, _, _ = self.publish(
+                playground_id, archive=self.variant_zip(b"x"), key="no-lock", base=version_id
+            )
+        self.assertEqual(status, 201)
+        self.assertEqual(observed.get("blocked"), False, f"Prepare 期间数据库被锁住了：{observed}")
+
+    def test_recovery_runs_before_the_first_request(self):
+        # 启动顺序的一部分：make_server 返回时不该还有 pending ref。
+        playground_id, version_id = self.seed("pg-recovery-wired")
+        repository.create_pending_ref(
+            self.server.repository, "evt-leftover", version_id
+        )
+        self.assertIn("refs/picopg/pending/evt-leftover", self.pending_refs())
+
+        restarted = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=self.server.database_path,
+            repository_path=self.server.repository_path,
+            operator_token=OPERATOR_TOKEN,
+        )
+        self.addCleanup(restarted.server_close)
+        self.addCleanup(restarted.shutdown)
+        threading.Thread(target=restarted.serve_forever, daemon=True).start()
+
+        self.assertEqual(self.pending_refs(), [], "make_server 返回前必须已经恢复过")
 
 
 class RestoreTest(ServerTestCase):

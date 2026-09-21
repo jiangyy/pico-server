@@ -8,6 +8,7 @@ repository in a temporary directory.
 
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bundles  # noqa: E402
+import database  # noqa: E402
+import events  # noqa: E402
+import events_types  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
 import manifests  # noqa: E402
@@ -221,6 +225,199 @@ class BackfillCurrentVersionsTest(PlaygroundTest):
         self.assertEqual(playgrounds.backfill_current_versions(self.connection, resolve), 1)
         self.assertEqual(playgrounds.backfill_current_versions(self.connection, resolve), 0)
         self.assertEqual(self.stored("pg"), "a" * 40)
+
+
+
+class PublishPhasesTest(PlaygroundTest):
+    """三阶段 Publish：Prepare 产出 pending ref，数据库决定，Finalize 收敛。
+
+    每条用例测的是**某一步之后世界长什么样**，因为这三步之间正是崩溃能插进来的地方。
+    不在这里的 setUp 建行：父类的用例会数行数。
+    """
+
+    def pending(self):
+        return [event_id for event_id, _ in repository.list_pending_refs(self.repository)]
+
+    def history_head(self, playground_id="pg"):
+        ref = self.repository.history_ref(playground_id)
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository.path), "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True, text=True,
+        )
+        return completed.stdout.strip() or None
+
+    def test_prepare_creates_a_pending_ref_and_no_history_yet(self):
+        playgrounds.create_playground(self.connection, "pg")
+        prepared = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-1"
+        )
+        self.assertFalse(prepared.no_op)
+        self.assertEqual(prepared.event_id, "evt-1")
+        self.assertEqual(self.pending(), ["evt-1"], "prepared Version 靠它防 GC")
+        self.assertIsNone(self.history_head(), "还没被接受，history ref 不该动")
+
+    def test_a_no_op_prepares_nothing(self):
+        playgrounds.create_playground(self.connection, "pg")
+        first = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-1"
+        )
+        repository.converge_history_ref(self.repository, "pg", first.commit_id)
+        repository.delete_pending_ref(self.repository, "evt-1")
+
+        again = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-2"
+        )
+        self.assertTrue(again.no_op)
+        self.assertIsNone(again.event_id, "no_op 没有任何东西需要保护")
+        self.assertEqual(again.commit_id, first.commit_id)
+        self.assertEqual(self.pending(), [], "no_op 不产生 pending ref")
+
+    def test_committing_records_the_event_under_the_prepared_id(self):
+        playgrounds.create_playground(self.connection, "pg")
+        prepared = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-shared"
+        )
+        with database.immediate_transaction(self.connection):
+            result = playgrounds.commit_prepared_version(self.connection, "pg", prepared, None)
+        self.assertEqual(result.commit_id, prepared.commit_id)
+
+        # Event 与 pending ref 同名 —— recovery 就是靠这个把两者对上
+        payload = events.find_accepted_event(
+            self.connection, "evt-shared", events_types.EVENT_KIND_PUBLISH_PLAYGROUND
+        )
+        self.assertEqual(payload["version_id"], prepared.commit_id)
+        row = self.connection.execute(
+            "SELECT current_version_id FROM playgrounds WHERE id = 'pg'"
+        ).fetchone()
+        self.assertEqual(row["current_version_id"], prepared.commit_id)
+
+    def test_committing_refuses_a_base_that_moved(self):
+        playgrounds.create_playground(self.connection, "pg")
+        first = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(b"one"), self.metadata(), "evt-1"
+        )
+        with database.immediate_transaction(self.connection):
+            playgrounds.commit_prepared_version(self.connection, "pg", first, None)
+
+        second = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(b"two"), self.metadata(), "evt-2"
+        )
+        with self.assertRaises(playgrounds.PlaygroundBaseChangedError):
+            with database.immediate_transaction(self.connection):
+                playgrounds.commit_prepared_version(self.connection, "pg", second, "a" * 40)
+
+
+class PublishCrashRecoveryTest(PlaygroundTest):
+    """启动时的恢复：pending ref 是唯一会被中断留下的痕迹。"""
+
+    def pending(self):
+        return [event_id for event_id, _ in repository.list_pending_refs(self.repository)]
+
+    def history_head(self, playground_id="pg"):
+        ref = self.repository.history_ref(playground_id)
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository.path), "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True, text=True,
+        )
+        return completed.stdout.strip() or None
+
+    def test_prepare_then_crash_drops_the_ref_and_leaves_history_alone(self):
+        # Git Prepare 成功、数据库事务没有提交：这个 Version 从没被接受。
+        playgrounds.create_playground(self.connection, "pg")
+        prepared = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-crash"
+        )
+        self.assertEqual(self.pending(), ["evt-crash"])
+
+        dropped, converged = playgrounds.recover_pending_refs(self.connection, self.repository)
+
+        self.assertEqual((dropped, converged), (1, 0))
+        self.assertEqual(self.pending(), [], "未被接受的 pending ref 必须消失")
+        self.assertIsNone(self.history_head(), "没被接受过就不该出现在 history 里")
+        self.assertFalse(
+            repository.commit_in_playground_history(self.repository, "pg", prepared.commit_id),
+            "清理之后那个 commit 不再可见",
+        )
+
+    def test_commit_then_crash_converges_history_to_the_database(self):
+        # 数据库提交了、Finalize 之前崩溃：Version 已被接受，history ref 落后。
+        playgrounds.create_playground(self.connection, "pg")
+        prepared = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-crash"
+        )
+        with database.immediate_transaction(self.connection):
+            playgrounds.commit_prepared_version(self.connection, "pg", prepared, None)
+        self.assertIsNone(self.history_head(), "Finalize 没跑，ref 还落后")
+        self.assertEqual(self.pending(), ["evt-crash"])
+
+        dropped, converged = playgrounds.recover_pending_refs(self.connection, self.repository)
+
+        self.assertEqual((dropped, converged), (1, 1))
+        self.assertEqual(self.history_head(), prepared.commit_id, "收敛到数据库说的当前版本")
+        self.assertEqual(self.pending(), [])
+        self.assertTrue(
+            repository.commit_in_playground_history(self.repository, "pg", prepared.commit_id)
+        )
+
+    def test_recovery_is_idempotent(self):
+        playgrounds.create_playground(self.connection, "pg")
+        prepared = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(), self.metadata(), "evt-crash"
+        )
+        with database.immediate_transaction(self.connection):
+            playgrounds.commit_prepared_version(self.connection, "pg", prepared, None)
+
+        first = playgrounds.recover_pending_refs(self.connection, self.repository)
+        head_after_first = self.history_head()
+        second = playgrounds.recover_pending_refs(self.connection, self.repository)
+
+        self.assertEqual(first, (1, 1))
+        self.assertEqual(second, (0, 0), "第二次没有东西可做")
+        self.assertEqual(self.history_head(), head_after_first)
+
+    def test_recovery_ignores_a_pending_ref_that_names_another_event_kind(self):
+        # 只认 publish 事件。一个 submit_code 的 event_id 恰好被当成 pending ref
+        # 时，不能被拿去收敛 history。
+        playgrounds.create_playground(self.connection, "pg")
+        envelope = events_types.EventEnvelope(
+            event_id="evt-submit",
+            kind=events_types.EVENT_KIND_SUBMIT_CODE,
+            payload={"playground_id": "pg", "version_id": "v", "files": {}},
+        )
+        with self.connection:
+            events.accept_event(self.connection, envelope, "accepted", {})
+        commit_id = repository.publish_playground(
+            self.repository, "pg", self.bundle(), self.metadata()
+        ).commit_id
+        repository.create_pending_ref(self.repository, "evt-submit", commit_id)
+
+        dropped, converged = playgrounds.recover_pending_refs(self.connection, self.repository)
+
+        self.assertEqual((dropped, converged), (1, 0), "只丢 ref，不收敛")
+        self.assertEqual(self.pending(), [])
+
+    def test_recovery_converges_to_current_not_to_the_pending_commit(self):
+        # 关键：pending ref 指向那次尝试的 commit，但数据库可能已经被后续发布推得
+        # 更远。收敛的目标永远是数据库，不能把 ref 拉回去。
+        playgrounds.create_playground(self.connection, "pg")
+        first = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(b"one"), self.metadata(), "evt-1"
+        )
+        with database.immediate_transaction(self.connection):
+            playgrounds.commit_prepared_version(self.connection, "pg", first, None)
+
+        second = repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(b"two"), self.metadata(), "evt-2"
+        )
+        with database.immediate_transaction(self.connection):
+            playgrounds.commit_prepared_version(self.connection, "pg", second, first.commit_id)
+        repository.converge_history_ref(self.repository, "pg", second.commit_id)
+        repository.delete_pending_ref(self.repository, "evt-2")
+
+        playgrounds.recover_pending_refs(self.connection, self.repository)
+
+        self.assertEqual(self.history_head(), second.commit_id, "不能被旧的 pending ref 拉回去")
+        self.assertEqual(self.pending(), [])
 
 
 if __name__ == "__main__":

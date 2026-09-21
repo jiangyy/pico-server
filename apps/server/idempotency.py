@@ -65,6 +65,26 @@ def request_digest(request):
     return hashlib.sha256(canonicalize_request(request)).hexdigest()
 
 
+def lookup(connection, scope, endpoint, request_key, request):
+    """Return the stored ``(status, response)`` for this request, or ``None``.
+
+    A separate entry point from :func:`execute` because the caller may have work
+    to do *before* it can be run safely inside a transaction — a publish builds
+    its Git commit outside one — and a replay must skip that work entirely: the
+    stored answer is the answer, whatever the world looks like now.
+
+    Raises :class:`IdempotencyConflict` when the key was used for a different
+    request, which is the same thing :func:`execute` would have raised.
+    """
+
+    _validate_scope(scope, endpoint, request_key)
+    digest = request_digest(request)
+    existing = _lookup(connection, scope, endpoint, request_key)
+    if existing is None:
+        return None
+    return _existing_result(existing, digest)
+
+
 def execute(connection, scope, endpoint, request_key, request, callback):
     """Run ``callback`` once per scope and return its recorded result.
 

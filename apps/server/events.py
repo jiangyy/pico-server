@@ -95,6 +95,29 @@ def read_event(connection, event_id):
     return (row["kind"], row["status"], row["reason"], row["response_json"])
 
 
+def find_accepted_event(connection, event_id, kind):
+    """The payload of one accepted Event of ``kind``, or ``None``.
+
+    Crash recovery's only question about a pending ref is whether the database
+    ever heard of its Event: an Event that is absent, rejected, or of another
+    kind means the publish did not commit, and the prepared Version was never
+    accepted.
+    """
+
+    _require_event_id(event_id)
+    row = connection.execute(
+        "SELECT kind, status, payload FROM events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if row is None or row["kind"] != kind or row["status"] != "accepted":
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return payload if type(payload) is dict else None
+
+
 def read_content_log(connection, after_seq, limit=None):
     """Content log entries with ``seq > after_seq``, oldest first.
 

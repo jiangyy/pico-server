@@ -8,6 +8,7 @@ a Playground reference through the validated helper on :class:`Repository`.
 import os
 import re
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -291,15 +292,6 @@ class PublishResult:
     no_op: bool
 
 
-class PlaygroundHeadChangedError(RepositoryError):
-    """The Playground ref moved between reading HEAD and the CAS update."""
-
-    reason = "playground_head_changed"
-
-    def __init__(self, message="playground head changed"):
-        super().__init__(message)
-
-
 def _validate_commit_metadata(metadata):
     if type(metadata) is not CommitMetadata:
         raise RepositoryError("commit metadata must be CommitMetadata")
@@ -513,56 +505,51 @@ def _create_commit(
     return completed.stdout.strip().decode("ascii")
 
 
-def _is_zero_object_id(object_id):
-    return bool(object_id) and set(object_id) == {"0"}
+# `PlaygroundHeadChangedError` and the ref compare-and-swap (`_compare_and_swap`,
+# `_reference_matches`, `_is_zero_object_id`) used to live here. They reported
+# "the history ref moved between the read and the write". The database now
+# decides whether a Version is accepted, a publisher whose base is stale is told
+# `PlaygroundBaseChangedError`, and the history ref is *converged* onto the
+# database's answer rather than compared against it — a ref that is behind is a
+# ref to correct, not a race to report.
 
 
-def _reference_matches(repository, ref, object_id):
-    """Return whether ``ref`` still holds exactly ``object_id``.
+@dataclass(frozen=True)
+class PreparedVersion:
+    """A Version built from a bundle, not yet accepted by anything.
 
-    A zero object id means "the ref must not exist", so a missing ref is the
-    unchanged state.  Any other id must equal the resolved ref target.
+    ``event_id`` is ``None`` exactly when ``no_op`` is true: no commit was
+    created, so there is nothing to protect and nothing to record.
     """
 
-    current = _resolve_head(repository, ref)
-    if _is_zero_object_id(object_id):
-        return current is None
-    return current == object_id
+    playground_id: str
+    commit_id: str
+    event_id: str | None
+    no_op: bool
 
 
-def _compare_and_swap(
-    repository, ref, new_id, old_id, error=PlaygroundHeadChangedError
-):
-    # ``update-ref`` with a zero ``new_id`` deletes the ref instead of moving it,
-    # under the same "the old value must still be there" guard.
-    arguments = (
-        ("update-ref", "-d", ref, old_id)
-        if _is_zero_object_id(new_id)
-        else ("update-ref", ref, new_id, old_id)
-    )
-    completed = _run_git(arguments, cwd=repository.path)
-    if completed.returncode != 0:
-        # A failed update is only a lost race when the protected ref no longer
-        # holds the expected object.  An unchanged ref means disk, lock, or
-        # repository failure, which must not surface as concurrency.
-        if _reference_matches(repository, ref, old_id):
-            raise RepositoryError("could not update reference")
-        raise error()
+def publish_playground_prepare(repository, playground_id, bundle, metadata, event_id):
+    """Prepare a Version for ``playground_id`` and protect it from the GC.
 
+    Phase one of three (protocol.md §2). Nothing here reads the database and
+    nothing decides that the Version is accepted: it builds the commit, hangs a
+    ``refs/picopg/pending/<event_id>`` on it so the garbage collector cannot
+    take bytes the database has not ruled on yet, and returns.
 
-def publish_playground(repository, playground_id, bundle, metadata):
-    """Build a commit from a validated bundle and CAS the Playground ref.
+    The parent is the commit the current history ref points at — the last
+    Version that *was* accepted. A concurrent publish therefore forks, and the
+    database's compare-and-swap decides which side survives; the loser's commit
+    becomes unreachable once its pending ref is dropped.
 
-    ``bundle`` must be the exact immutable mapping returned by
-    :func:`bundles.validate_bundle`; no directory, archive, or arbitrary
-    mutable tree is accepted.  ``metadata`` is a trusted
-    :class:`CommitMetadata`.  The function never overwrites a moved ref: a
-    concurrent change surfaces as :class:`PlaygroundHeadChangedError`.
+    ``no_op`` means the tree is already the one at the history ref, so no commit
+    and no pending ref are created. ``event_id`` must be an id the caller also
+    gives to the Event it will record, because recovery matches the two up.
     """
 
     if not isinstance(repository, Repository):
         raise RepositoryError("repository handle required")
     _validate_commit_metadata(metadata)
+    _require_event_id(event_id)
 
     # Re-validates the identifier and returns only the namespaced Playground
     # ref; no caller-controlled ref string reaches Git.
@@ -577,15 +564,41 @@ def publish_playground(repository, playground_id, bundle, metadata):
     new_tree_id = _write_bundle_tree(repository, tree)
 
     if head is not None and new_tree_id == head_tree:
-        return PublishResult(
-            playground_id=playground_id, commit_id=head, no_op=True
+        return PreparedVersion(
+            playground_id=playground_id, commit_id=head, event_id=None, no_op=True
         )
 
     commit_id = _create_commit(repository, new_tree_id, head, metadata)
-    old_id = head if head is not None else _zero_object_id(repository)
-    _compare_and_swap(repository, ref, commit_id, old_id)
+    create_pending_ref(repository, event_id, commit_id)
+    return PreparedVersion(
+        playground_id=playground_id,
+        commit_id=commit_id,
+        event_id=event_id,
+        no_op=False,
+    )
+
+
+def publish_playground(repository, playground_id, bundle, metadata):
+    """Prepare a Version and converge the history ref onto it.
+
+    A convenience for callers that have already decided to accept the Version
+    (tests, and anything that has no database behind it). The service does
+    *not* use this: it prepares, lets the database decide, and converges
+    afterwards, because converging first is what makes the ref lead the
+    database instead of following it.
+    """
+
+    event_id = uuid.uuid4().hex
+    prepared = publish_playground_prepare(
+        repository, playground_id, bundle, metadata, event_id
+    )
+    if not prepared.no_op:
+        converge_history_ref(repository, playground_id, prepared.commit_id)
+        delete_pending_ref(repository, event_id)
     return PublishResult(
-        playground_id=playground_id, commit_id=commit_id, no_op=False
+        playground_id=prepared.playground_id,
+        commit_id=prepared.commit_id,
+        no_op=prepared.no_op,
     )
 
 

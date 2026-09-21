@@ -31,7 +31,12 @@
 | --- | --- | --- |
 | POST | `/api/v1/playgrounds` | `{id}` 登记一门课（409 = 已存在） |
 | POST | `/api/v1/playgrounds/{id}/versions` | ZIP + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}` |
+
+发布的 `status`：`accepted` / `no_op` / `conflict` / `playground_stopped`。`conflict` 表示
+`X-Base-Version-Id` 已经过时，这次什么都没有写；`playground_stopped` 表示这门课已下线，
+所以**不能靠重新发布让它回来**——用下面的 `restore`。
 | DELETE | `/api/v1/playgrounds/{id}` | 下线，返回 `{status}` |
+| POST | `/api/v1/playgrounds/{id}/restore` | 重新上线，返回 `{status}` |
 | GET | `/api/v1/submissions` | 分页列出交上来的作业 |
 | GET | `/api/v1/submissions/{id}` | 取回一份作业的文件 |
 
@@ -44,8 +49,19 @@
 - `content_log` —— 只收 `publish_playground` 与 `archive_playground`，`seq` 即客户端游标。
 - `submissions` —— 交上来的作业，只追加，文件正文在 `files_json`。
 
-`data/picopg.git` —— 一个 bare 仓库，每门课一条 ref（`refs/heads/playgrounds/<id>`）。
-一个 Version 就是一个 commit，内容不可变、天然去重。
+`data/picopg.git` —— 一个 bare 仓库，一个 Version 就是一个 commit，内容不可变、天然去重。
+两类 ref：
+
+- `refs/picopg/history/<playground_id>` —— 稳定的可达性根。它**从数据库的
+  `current_version_id` 收敛**，不领先数据库；Archive 不删它。
+- `refs/picopg/pending/<event_id>` —— 一次发布在"commit 已建、数据库还没表态"之间的
+  临时保护，防止那时被 Git GC 收走。发布结束就删；启动时扫描清理。
+
+Publish 因此是三阶段（protocol.md §2）：**Prepare**（建 commit + pending ref）→
+一个短事务（CAS `current_version_id` + Event + Content Log）→ **Finalize**（把 history
+ref 收敛到数据库说的当前版本、删 pending ref）。Git 不在数据库事务里；数据库没答应
+之前 history ref 不动。中途崩溃由启动扫描恢复：数据库没有接受过的 Version 丢掉，
+接受过的把 history ref 补上。
 
 `data/submissions/` —— 交上来的作业的人可读副本，一行记录对应一个目录：
 

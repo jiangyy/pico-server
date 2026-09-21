@@ -16,6 +16,10 @@ import events
 import events_types
 import repository as _repository
 
+#: The storage layer's publish result; re-exported shape, unchanged by the
+#: three-phase split.
+from repository import PublishResult
+
 
 class InvalidRequestError(ValueError):
     """A mutation carried a malformed identifier or body."""
@@ -117,27 +121,16 @@ def create_playground(connection, playground_id):
     return Playground(id=playground_id, created_at=created_at)
 
 
-def publish_playground(
-    connection, playground_id, repository, bundle, metadata, base_version_id=None
-):
-    """Publish a validated bundle as the Playground's next Version.
+def require_publishable(connection, playground_id, base_version_id):
+    """Check everything the database alone can refuse, and return the row.
 
-    protocol.md §2: the publisher says which Version it built on, and the
-    publish only lands if that is still the current one. Without it two
-    publishers racing would each append a Version and the later one would
-    silently discard the earlier one's content — with it, the loser is told
-    ``conflict`` and can look at what arrived before deciding again.
+    The first of the three publish phases that touches the database, and the
+    only one that runs before any Git work: an archived Playground, an unknown
+    one, or a stale base is refused without creating a commit. That is worth
+    doing up front — a refusal must not leave a prepared Version to clean up.
 
-    The metadata row is resolved before any Git subprocess is started, so an
-    unknown Playground never reaches the repository. On a fresh publish
-    (``no_op=False``) the new Version is recorded as a ``publish_playground``
-    event in the content log and ``current_version_id`` is updated; the event id
-    is generated here because an operator's request carries none.
-
-    Raises :class:`PlaygroundStoppedError` for an archived Playground,
-    :class:`PlaygroundBaseChangedError` for a stale base, and
-    :class:`InvalidRequestError` for a base that is missing when one is needed
-    or malformed. The caller owns the transaction; this never commits.
+    Returns the row so the caller can pass ``current_version_id`` on to the
+    compare-and-swap rather than reading it twice.
     """
 
     playground_id = _require_opaque_id(playground_id)
@@ -149,15 +142,120 @@ def publish_playground(
         raise PlaygroundStoppedError("playground is archived")
 
     _require_base(base_version_id, row["current_version_id"])
+    return row
 
-    result = _repository.publish_playground(
-        repository, playground_id, bundle, metadata
+
+def commit_prepared_version(
+    connection, playground_id, prepared, base_version_id
+):
+    """Accept a prepared Version, or refuse it because the base moved.
+
+    The second phase, and the only one that writes: the compare-and-swap on
+    ``current_version_id``, the Event and the Content Log entry all land in the
+    caller's transaction or none of them do. Until this commits, the Version is
+    only a pending ref and the database has never heard of it.
+
+    Refusing here is not an error the caller can retry into success: the
+    database says the base it was given is not current, and the publisher has to
+    look at what arrived and decide again.
+    """
+
+    row = _playground_row(connection, playground_id)
+    if row is None:
+        raise MissingPlaygroundError("playground does not exist")
+    if row["state"] == "stopped":
+        raise PlaygroundStoppedError("playground is archived")
+    if row["current_version_id"] != (base_version_id or ""):
+        raise PlaygroundBaseChangedError("base_version_id is not current")
+
+    if prepared.no_op:
+        return PublishResult(
+            playground_id=playground_id, commit_id=prepared.commit_id, no_op=True
+        )
+
+    record_publish_event(
+        connection,
+        playground_id,
+        prepared.commit_id,
+        event_id=prepared.event_id,
+    )
+    return PublishResult(
+        playground_id=playground_id, commit_id=prepared.commit_id, no_op=False
     )
 
-    if not result.no_op:
-        record_publish_event(connection, playground_id, result.commit_id)
 
+def publish_playground(
+    connection, playground_id, repository, bundle, metadata, base_version_id=None
+):
+    """The three phases in one call, for callers with no HTTP layer above them.
+
+    The service does *not* use this: it sequences the phases itself so the Git
+    work sits outside the database transaction (a Git subprocess inside
+    ``BEGIN IMMEDIATE`` holds the write lock for its whole duration). This
+    exists for tests and for anything that wants the whole operation, and it
+    keeps the phases in the order protocol.md §2 requires.
+    """
+
+    require_publishable(connection, playground_id, base_version_id)
+    event_id = uuid4().hex
+    prepared = _repository.publish_playground_prepare(
+        repository, playground_id, bundle, metadata, event_id
+    )
+
+    try:
+        with database.immediate_transaction(connection):
+            result = commit_prepared_version(
+                connection, playground_id, prepared, base_version_id
+            )
+    except BaseException:
+        if not prepared.no_op:
+            _repository.delete_pending_ref(repository, event_id)
+        raise
+
+    if not prepared.no_op:
+        _repository.converge_history_ref(repository, playground_id, result.commit_id)
+        _repository.delete_pending_ref(repository, event_id)
     return result
+
+
+def recover_pending_refs(connection, repository):
+    """Bring every pending ref to a settled state, at start-up.
+
+    protocol.md §2's crash recovery. A pending ref means a publish was
+    interrupted somewhere between "the commit exists" and "the database knows":
+    either the transaction never committed, in which case the Version was never
+    accepted and the ref is dropped, or it did commit, in which case the history
+    ref is made to point at what the database says is current and the pending ref
+    is dropped.
+
+    The database is the only thing consulted for what is accepted — this never
+    replays a publish. Idempotent by construction: it only ever removes refs and
+    converges one ref to a commit, all of which are no-ops the second time.
+
+    Returns ``(dropped, converged)``: how many pending refs were discarded and
+    how many were settled against an accepted Event.
+    """
+
+    dropped = 0
+    converged = 0
+    for event_id, _commit_id in _repository.list_pending_refs(repository):
+        payload = events.find_accepted_event(
+            connection, event_id, events_types.EVENT_KIND_PUBLISH_PLAYGROUND
+        )
+        playground_id = (payload or {}).get("playground_id")
+        if type(playground_id) is str and playground_id:
+            row = _playground_row(connection, playground_id)
+            # Converge to what the *database* says is current, never to the
+            # commit the pending ref points at: a later publish may already
+            # have moved on, and the ref must not be pulled backwards.
+            if row is not None and row["current_version_id"]:
+                _repository.converge_history_ref(
+                    repository, row["id"], row["current_version_id"]
+                )
+                converged += 1
+        _repository.delete_pending_ref(repository, event_id)
+        dropped += 1
+    return dropped, converged
 
 
 def _require_base(base_version_id, observed_version_id):
@@ -273,16 +371,21 @@ def backfill_current_versions(connection, resolve_version):
     return filled
 
 
-def record_publish_event(connection, playground_id, version_id):
+def record_publish_event(connection, playground_id, version_id, event_id=None):
     """Record a server-generated ``publish_playground`` event.
 
     Writes the event row, appends to the content log and updates the
     playground's ``current_version_id``. Runs in the caller's transaction
     and never commits, so the event lands only if the publish that produced
-    it does too. Returns the generated event id.
+    it does too.
+
+    ``event_id`` is supplied by a publish, because the pending ref that protects
+    the prepared Version is named after it and recovery is what matches the two
+    up. Without one a fresh id is generated (archive and restore have no pending
+    ref to name).
     """
     envelope = events_types.EventEnvelope(
-        event_id=uuid4().hex,
+        event_id=event_id or uuid4().hex,
         kind=events_types.EVENT_KIND_PUBLISH_PLAYGROUND,
         payload={"playground_id": playground_id, "version_id": version_id},
     )

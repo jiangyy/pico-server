@@ -17,7 +17,6 @@ import repository  # noqa: E402
 from repository import (  # noqa: E402
     DEFAULT_REPOSITORY_PATH,
     CommitMetadata,
-    PlaygroundHeadChangedError,
     PublishResult,
     Repository,
     RepositoryError,
@@ -346,47 +345,6 @@ class PlaygroundPublishingTest(unittest.TestCase):
             self.git("rev-list", "--count", ref).stdout.strip(), b"1"
         )
 
-    def test_concurrent_ref_change_raises_head_changed(self):
-        playground_id = "pg-race"
-        first = repository.publish_playground(
-            self.repository,
-            playground_id,
-            self.make_bundle(self.default_entries(b"print(1)")),
-            self.metadata(),
-        )
-        ref = self.repository.history_ref(playground_id)
-        head_tree = self.git(
-            "rev-parse", f"{first.commit_id}^{{tree}}"
-        ).stdout.strip().decode("ascii")
-        decoy = self.commit_tree(head_tree)
-
-        original = repository._run_git
-        moved = {"done": False}
-
-        def racing(arguments, cwd=None, stdin=None, environment=None):
-            completed = original(
-                arguments, cwd=cwd, stdin=stdin, environment=environment
-            )
-            if not moved["done"] and arguments and arguments[0] == "commit-tree":
-                moved["done"] = True
-                self.git("update-ref", ref, decoy)
-            return completed
-
-        with mock.patch.object(repository, "_run_git", side_effect=racing):
-            with self.assertRaises(PlaygroundHeadChangedError) as context:
-                repository.publish_playground(
-                    self.repository,
-                    playground_id,
-                    self.make_bundle(self.default_entries(b"print(2)")),
-                    self.metadata(),
-                )
-
-        self.assertEqual(context.exception.reason, "playground_head_changed")
-        # The concurrent ref target is preserved, never overwritten.
-        self.assertEqual(
-            self.git("rev-parse", ref).stdout.strip().decode("ascii"), decoy
-        )
-
     def test_tree_contains_only_the_allowlisted_paths(self):
         result = repository.publish_playground(
             self.repository,
@@ -618,14 +576,20 @@ class PlaygroundPublishingTest(unittest.TestCase):
                 self.metadata(),
             )
 
-        expected_ref = self.repository.history_ref("pg-argv")
+        # 出现的 ref 只能是我们自己的两个命名空间里的，而且是这次操作该用的那个：
+        # 调用方的字符串永远不直接成为 ref 名。
+        history = self.repository.history_ref("pg-argv")
+        pending = {
+            f"refs/picopg/pending/{event_id}" for event_id in seen_event_ids(seen)
+        }
+        allowed = {history, *pending}
         for arguments in seen:
             for argument in arguments:
                 self.assertNotIn(str(self.path), argument)
                 self.assertNotIn("course/", argument)
                 self.assertNotIn("starter/", argument)
                 if "refs/" in argument:
-                    self.assertEqual(argument, expected_ref)
+                    self.assertIn(argument, allowed, f"出现了不在命名空间里的 ref: {argument}")
 
     def test_invalid_playground_ids_never_start_git(self):
         seen = []
@@ -784,7 +748,9 @@ class PlaygroundPublishingTest(unittest.TestCase):
 
         self.assertFalse(marker.exists())
 
-    def test_update_ref_failure_without_move_is_plain_repository_error(self):
+    def test_a_failing_ref_update_is_a_repository_error(self):
+        # 一个写 ref 失败的 Git 调用不能被当成"有人抢先改了"：它是磁盘/锁/仓库
+        # 故障，必须原样冒出来，而不是伪装成并发。
         playground_id = "pg-lock-failure"
         first = repository.publish_playground(
             self.repository,
@@ -795,81 +761,35 @@ class PlaygroundPublishingTest(unittest.TestCase):
         ref = self.repository.history_ref(playground_id)
         original = repository._run_git
 
-        def failing_update_ref(
-            arguments, cwd=None, stdin=None, environment=None
-        ):
+        def failing_update_ref(arguments, cwd=None, stdin=None, environment=None):
             if arguments and arguments[0] == "update-ref":
                 return subprocess.CompletedProcess(
                     ["git", *arguments], 1, b"", b"fatal: cannot lock ref"
                 )
-            return original(
-                arguments, cwd=cwd, stdin=stdin, environment=environment
-            )
+            return original(arguments, cwd=cwd, stdin=stdin, environment=environment)
 
-        with mock.patch.object(
-            repository, "_run_git", side_effect=failing_update_ref
-        ):
-            with self.assertRaises(RepositoryError) as context:
-                repository.publish_playground(
-                    self.repository,
-                    playground_id,
-                    self.make_bundle(self.default_entries(b"print(2)")),
-                    self.metadata(),
+        with mock.patch.object(repository, "_run_git", side_effect=failing_update_ref):
+            with self.assertRaises(RepositoryError):
+                repository.converge_history_ref(
+                    self.repository, playground_id, first.commit_id
                 )
 
-        # An unchanged ref means disk/lock failure, not a lost race.
-        self.assertNotIsInstance(
-            context.exception, PlaygroundHeadChangedError
-        )
+        # 失败没有动过 ref
         self.assertEqual(
             self.git("rev-parse", ref).stdout.strip().decode("ascii"),
             first.commit_id,
         )
 
-    def test_update_ref_failure_after_move_is_head_changed(self):
-        playground_id = "pg-move-failure"
-        first = repository.publish_playground(
-            self.repository,
-            playground_id,
-            self.make_bundle(self.default_entries(b"print(1)")),
-            self.metadata(),
-        )
-        ref = self.repository.history_ref(playground_id)
-        tree_id = (
-            self.git("rev-parse", f"{first.commit_id}^{{tree}}")
-            .stdout.strip()
-            .decode("ascii")
-        )
-        decoy = self.commit_tree(tree_id)
-        original = repository._run_git
 
-        def moving_update_ref(
-            arguments, cwd=None, stdin=None, environment=None
-        ):
-            if arguments and arguments[0] == "update-ref":
-                original(("update-ref", ref, decoy), cwd=self.path)
-                return subprocess.CompletedProcess(
-                    ["git", *arguments], 1, b"", b"fatal: cannot lock ref"
-                )
-            return original(
-                arguments, cwd=cwd, stdin=stdin, environment=environment
-            )
+def seen_event_ids(seen):
+    """从 git argv 里取出所有 pending ref 用的 event id。"""
 
-        with mock.patch.object(
-            repository, "_run_git", side_effect=moving_update_ref
-        ):
-            with self.assertRaises(PlaygroundHeadChangedError) as context:
-                repository.publish_playground(
-                    self.repository,
-                    playground_id,
-                    self.make_bundle(self.default_entries(b"print(2)")),
-                    self.metadata(),
-                )
-
-        self.assertEqual(context.exception.reason, "playground_head_changed")
-        self.assertEqual(
-            self.git("rev-parse", ref).stdout.strip().decode("ascii"), decoy
-        )
+    ids = set()
+    for arguments in seen:
+        for argument in arguments:
+            if argument.startswith("refs/picopg/pending/"):
+                ids.add(argument[len("refs/picopg/pending/"):])
+    return ids
 
 
 class CommitTreeReadTest(unittest.TestCase):

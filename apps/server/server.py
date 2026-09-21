@@ -25,6 +25,7 @@ import pagination
 import routes
 import sync
 import sync_handlers
+import uuid
 from api_handler import ApiHandler, BASE_VERSION_HEADER, MAX_JSON_BODY_BYTES
 from bundles import (
     MAX_ARCHIVE_BYTES,
@@ -37,25 +38,30 @@ from idempotency import (
     IdempotencyConflict,
     IdempotencyRequestError,
     execute as execute_idempotent,
+    lookup as idempotency_lookup,
 )
 from playgrounds import (
     InvalidRequestError,
     MissingPlaygroundError,
-    PlaygroundConflictError,
     PlaygroundBaseChangedError,
+    PlaygroundConflictError,
     PlaygroundStoppedError,
+    commit_prepared_version,
     create_playground,
     get_playground,
-    publish_playground,
     record_archive_event,
+    recover_pending_refs,
+    require_publishable,
     restore_playground,
 )
 from repository import (
     DEFAULT_REPOSITORY_PATH,
     CommitMetadata,
-    PlaygroundHeadChangedError,
     RepositoryError,
+    converge_history_ref,
+    delete_pending_ref,
     open_repository,
+    publish_playground_prepare,
     valid_playground_id,
 )
 from submissions import (
@@ -581,9 +587,12 @@ class Handler(ApiHandler):
             return
 
         # The base names the Version this bundle was built on; an empty header
-        # means "the first one", and `publish_playground` decides whether that
-        # is true. A header that is present but blank is the same as absent.
+        # means "the first one", and the database decides whether that is true.
+        # A header that is present but blank is the same as absent.
         base_version_id = self.headers.get(BASE_VERSION_HEADER, "").strip() or None
+        # The event id names the pending ref that protects the prepared Version,
+        # so it has to exist before the Git work does. Recovery matches the two.
+        event_id = uuid.uuid4().hex
 
         try:
             content_length = int(self.headers.get("Content-Length", ""))
@@ -609,17 +618,19 @@ class Handler(ApiHandler):
             )
             return
 
+        # A replay answers from storage before anything else happens. It has to
+        # come first: the stored request may no longer be valid against the
+        # world as it is now — a retry of a first publish carries no base, and
+        # the Playground has one by then — and re-judging it would refuse a
+        # request the server already accepted.
         try:
             with self._database() as connection:
-                status, body = execute_idempotent(
+                stored = idempotency_lookup(
                     connection,
                     OPERATOR_SCOPE,
                     routes.playground_versions_endpoint(playground_id),
                     request_key,
                     _bundle_request(playground_id, bundle, base_version_id),
-                    lambda connection: self._publish_bundle(
-                        connection, playground_id, bundle, base_version_id
-                    ),
                 )
         except IdempotencyConflict:
             self._api_error(409, "idempotency_conflict")
@@ -627,6 +638,27 @@ class Handler(ApiHandler):
         except IdempotencyRequestError:
             self._api_error(400, "invalid_request")
             return
+        if stored is not None:
+            self._respond_json(*stored)
+            return
+
+        # Three phases (protocol.md §2), and the order is the point: the Git
+        # work must not sit inside the database transaction, and the database
+        # must decide before the history ref moves.
+        #
+        #   1. refuse anything the database alone can refuse, without building
+        #      a commit at all
+        #   2. prepare the Version in Git, protected by a pending ref
+        #   3. one short transaction: compare-and-swap, Event, Content Log
+        #   4. converge the history ref onto what the database now says
+        handle = self.server.repository
+        prepared = None
+        try:
+            with self._database() as connection:
+                require_publishable(connection, playground_id, base_version_id)
+            prepared = publish_playground_prepare(
+                handle, playground_id, bundle, _commit_metadata(), event_id
+            )
         except MissingPlaygroundError:
             self._api_error(404, "not_found")
             return
@@ -634,43 +666,110 @@ class Handler(ApiHandler):
             self._api_error(400, "invalid_request")
             return
         except PlaygroundStoppedError:
-            # protocol.md's PublishResult: the Playground is not writable, and
-            # retrying the same request will not change that.
             self._respond_json(409, {"status": "playground_stopped"})
             return
         except PlaygroundBaseChangedError:
-            # protocol.md's `conflict`: the base is stale. Nothing was written,
-            # and the publisher resolves it by reading the current Version.
-            self._respond_json(409, {"status": "conflict"})
-            return
-        except PlaygroundHeadChangedError:
-            # The ref moved under us: a race with another publish, with the same
-            # answer and the same remedy.
             self._respond_json(409, {"status": "conflict"})
             return
         except RepositoryError:
             self._api_error(500, "internal_error")
             return
 
-        self._respond_json(status, body)
+        # The database half. Everything that can fail between Prepare and
+        # Finalize is channelled through one `finally`: a Version the database
+        # did not accept must leave no trace, whatever stopped it — a mapped
+        # refusal, a lost base, or a database error nobody anticipated.
+        settled = False
+        try:
+            try:
+                with self._database() as connection:
+                    status, body = execute_idempotent(
+                        connection,
+                        OPERATOR_SCOPE,
+                        routes.playground_versions_endpoint(playground_id),
+                        request_key,
+                        _bundle_request(playground_id, bundle, base_version_id),
+                        lambda connection: self._accept_prepared(
+                            connection, playground_id, prepared, base_version_id
+                        ),
+                    )
+            except IdempotencyConflict:
+                self._api_error(409, "idempotency_conflict")
+                return
+            except IdempotencyRequestError:
+                self._api_error(400, "invalid_request")
+                return
+            except MissingPlaygroundError:
+                self._api_error(404, "not_found")
+                return
+            except InvalidRequestError:
+                self._api_error(400, "invalid_request")
+                return
+            except PlaygroundStoppedError:
+                # protocol.md's PublishResult: the Playground is not writable,
+                # and retrying the same request will not change that.
+                self._respond_json(409, {"status": "playground_stopped"})
+                return
+            except PlaygroundBaseChangedError:
+                # protocol.md's `conflict`: the base is stale. Nothing was
+                # written, and the publisher resolves it by reading the current
+                # Version.
+                self._respond_json(409, {"status": "conflict"})
+                return
+            except RepositoryError:
+                self._api_error(500, "internal_error")
+                return
 
-    def _publish_bundle(self, connection, playground_id, bundle, base_version_id):
-        """Create a Version for one validated bundle.
+            # Finalize. The database has committed, so the Version is accepted;
+            # the history ref and the pending ref now follow it. A failure here
+            # does not fail the request — the accept has happened and the next
+            # start-up recovery converges the ref — but it is logged.
+            if prepared is not None and not prepared.no_op:
+                self._finish_publish(playground_id, prepared.event_id)
+            settled = True
+            self._respond_json(status, body)
+        finally:
+            if not settled and prepared is not None and not prepared.no_op:
+                self._abandon_prepared(prepared.event_id)
+
+    def _abandon_prepared(self, event_id):
+        """Drop the pending ref of a Version the database did not accept.
+
+        The commit itself is left to the Git GC: nothing references it once this
+        returns, which is exactly the point of the pending ref existing.
+        """
+        try:
+            delete_pending_ref(self.server.repository, event_id)
+        except RepositoryError as error:
+            # Start-up recovery sweeps anything left behind, so this is loud but
+            # not fatal.
+            print(f"[picopg] pending ref not removed: {error}", flush=True)
+
+    def _finish_publish(self, playground_id, event_id):
+        """Converge the history ref and drop the pending ref, best effort."""
+
+        handle = self.server.repository
+        try:
+            with self._database() as connection:
+                row = get_playground(connection, playground_id)
+            if row is not None and row.current_version_id:
+                converge_history_ref(handle, playground_id, row.current_version_id)
+        except (RepositoryError, InvalidRequestError) as error:
+            print(f"[picopg] history ref not converged: {error}", flush=True)
+        try:
+            delete_pending_ref(handle, event_id)
+        except RepositoryError as error:
+            print(f"[picopg] pending ref not removed: {error}", flush=True)
+
+    def _accept_prepared(self, connection, playground_id, prepared, base_version_id):
+        """The database half of a publish, inside the idempotency transaction.
 
         The result is protocol.md's ``PublishResult``: the protocol's own field
         names carry the outcome, so the publisher never has to read an HTTP
         status to know what happened.
         """
-        existing = get_playground(connection, playground_id)
-        if existing is None:
-            raise MissingPlaygroundError("playground does not exist")
-        result = publish_playground(
-            connection,
-            playground_id,
-            self.server.repository,
-            bundle,
-            _commit_metadata(),
-            base_version_id,
+        result = commit_prepared_version(
+            connection, playground_id, prepared, base_version_id
         )
         return 201, {
             "status": "no_op" if result.no_op else "accepted",
@@ -842,6 +941,11 @@ def make_server(
         # Same idea for the readable copy of handed-in work: the row is the
         # record, so a missing folder is written rather than reported.
         submissions_backfill(connection, submissions_path)
+        # A publish that was interrupted leaves a pending ref behind. Settle
+        # every one of them before the first request: a pending ref that turned
+        # out to be unaccepted must not stay reachable, and one that turned out
+        # to be accepted must leave the history ref converged.
+        recover_pending_refs(connection, repository)
 
     server = SlimHTTPServer((host, port), Handler)
     server.database_path = database_path
