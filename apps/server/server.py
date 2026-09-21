@@ -48,6 +48,7 @@ from playgrounds import (
     get_playground,
     publish_playground,
     record_archive_event,
+    restore_playground,
 )
 from repository import (
     DEFAULT_REPOSITORY_PATH,
@@ -233,6 +234,8 @@ class Handler(ApiHandler):
             self._post_playground()
         elif routes.match_playground_versions(path) is not None:
             self._post_playground_versions(routes.match_playground_versions(path))
+        elif routes.match_playground_restore(path) is not None:
+            self._post_restore(routes.match_playground_restore(path))
         elif path == routes.SYNC_PATH:
             self._post_sync()
         elif routes.allowed_methods(path) is not None:
@@ -286,6 +289,30 @@ class Handler(ApiHandler):
             self._method_not_allowed()
         else:
             self._not_found()
+
+    def _post_restore(self, playground_id):
+        """Put an archived Playground back into the catalog.
+
+        The counterpart of the `DELETE` on the same path. Clients learn about it
+        the same way they learn about anything: the next sync carries a
+        `publish_playground` entry for the Version it returns to.
+        """
+        if not self._require_operator():
+            return
+
+        try:
+            with self._database() as connection:
+                restored = restore_playground(connection, playground_id)
+        except InvalidRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        except MissingPlaygroundError:
+            self._not_found()
+            return
+
+        self._respond_json(
+            200, {"status": "accepted" if restored else "no_op"}
+        )
 
     def _delete_playground(self, playground_id):
         """Take a Playground out of the catalog.

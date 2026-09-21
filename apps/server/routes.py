@@ -15,6 +15,7 @@ request body.
 
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_VERSIONS_SUFFIX = "/versions"
+PLAYGROUND_RESTORE_SUFFIX = "/restore"
 CATALOG_PATH = "/api/v1/catalog"
 SUBMISSIONS_PATH = "/api/v1/submissions"
 SYNC_PATH = "/api/v1/sync"
@@ -41,6 +42,25 @@ def _match_playground_versions(path):
         return None
 
     playground_id = path[len(prefix): -len(PLAYGROUND_VERSIONS_SUFFIX)]
+    if not playground_id or "/" in playground_id:
+        return None
+    return playground_id
+
+
+def match_playground_restore(path):
+    """Return the playground id in a restore path, else ``None``.
+
+    ``POST /api/v1/playgrounds/<id>/restore`` — the counterpart of the
+    ``DELETE`` on the same path.
+    """
+
+    prefix = PLAYGROUNDS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(
+        PLAYGROUND_RESTORE_SUFFIX
+    ):
+        return None
+
+    playground_id = path[len(prefix): -len(PLAYGROUND_RESTORE_SUFFIX)]
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
@@ -159,6 +179,8 @@ def allowed_methods(path):
     if match_playground(path) is not None:
         return ("DELETE",)
     if _match_playground_versions(path) is not None:
+        return ("POST",)
+    if match_playground_restore(path) is not None:
         return ("POST",)
     if match_manifest(path) is not None:
         return ALLOWED_METHODS

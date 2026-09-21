@@ -149,6 +149,34 @@ class ServerTestCase(unittest.TestCase):
                 return entry["current_version_id"]
         return None
 
+    def catalog_entries(self):
+        """The catalog's Playground list, as a client sees it."""
+
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        return body["playgrounds"]
+
+    def catalog_ids(self):
+        return [entry["playground_id"] for entry in self.catalog_entries()]
+
+    def sync(self, pending_events, after_seq=0):
+        """One sync round; the status is asserted here so callers read bodies."""
+
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/sync",
+            payload={"pending_events": pending_events, "after_seq": after_seq},
+        )
+        self.assertEqual(status, 200, body)
+        return body
+
+    def retire(self, playground_id, token=OPERATOR_TOKEN):
+        """Take a Playground out of the catalog."""
+
+        return self.request(
+            "DELETE", f"/api/v1/playgrounds/{playground_id}", token=token
+        )
+
     def publish(self, playground_id, archive=None, key="key-1", base=None):
         """Publish one bundle, naming the current Version as its base.
 
@@ -386,6 +414,86 @@ class PublishBaseTest(ServerTestCase):
         self.assertEqual(status, 201)
 
 
+class RestoreTest(ServerTestCase):
+    """Bringing an archived Playground back.
+
+    Without this the `state` flag only moves one way: publishing is refused
+    while a Playground is stopped, so a retired course could never return — and
+    `retire.mjs` documented exactly that impossible recovery.
+    """
+
+    def restore(self, playground_id, token=OPERATOR_TOKEN):
+        return self.request(
+            "POST", f"/api/v1/playgrounds/{playground_id}/restore", token=token
+        )
+
+    def test_a_restored_course_is_in_the_catalog_and_publishable_again(self):
+        playground_id, version_id = self.seed("pg-restore")
+        self.assertEqual(self.retire(playground_id)[2]["status"], "accepted")
+        self.assertNotIn(
+            playground_id, [p["playground_id"] for p in self.catalog_entries()]
+        )
+
+        status, _, body = self.restore(playground_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"status": "accepted"})
+
+        entry = next(
+            item for item in self.catalog_entries() if item["playground_id"] == playground_id
+        )
+        self.assertEqual(entry["current_version_id"], version_id)
+
+        # And the refusal that made restore necessary is gone.
+        status, _, _ = self.publish(playground_id, base=version_id)
+        self.assertEqual(status, 201)
+
+    def test_restoring_an_active_playground_is_a_no_op(self):
+        playground_id, _ = self.seed("pg-restore-noop")
+        status, _, body = self.restore(playground_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"status": "no_op"})
+
+    def test_restoring_an_unknown_playground_is_not_found(self):
+        self.assertEqual(self.restore("pg-never-existed")[0], 404)
+
+    def test_restoring_needs_the_operator_token(self):
+        playground_id, _ = self.seed("pg-restore-auth")
+        self.retire(playground_id)
+        self.assertEqual(self.restore(playground_id, token=None)[0], 401)
+        self.assertEqual(self.restore(playground_id, token="wrong-token-000000")[0], 401)
+
+    def test_a_restore_reaches_clients_as_a_publish(self):
+        # The content log has no "restored" kind, so the client learns about it
+        # the same way it learns about anything else: a publish it can install.
+        playground_id, version_id = self.seed("pg-restore-event")
+        before = self.sync([], after_seq=0)["upto_seq"]
+        self.retire(playground_id)
+        self.restore(playground_id)
+
+        body = self.sync([], after_seq=before)
+        kinds = [(entry["event"]["kind"], entry["event"]["payload"]) for entry in body["entries"]]
+        self.assertEqual(
+            kinds,
+            [
+                ("archive_playground", {"playground_id": playground_id}),
+                (
+                    "publish_playground",
+                    {"playground_id": playground_id, "version_id": version_id},
+                ),
+            ],
+        )
+
+    def test_a_playground_that_was_never_published_can_be_restored(self):
+        playground_id = "pg-restore-empty"
+        self.create_playground(playground_id)
+        self.retire(playground_id)
+        status, _, body = self.restore(playground_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "accepted")
+        # It has no Version, so it is active but still not in the catalog.
+        self.assertNotIn(playground_id, [p["playground_id"] for p in self.catalog_entries()])
+
+
 class CatalogSourceTest(ServerTestCase):
     """The catalog reads the database, and start-up keeps it complete.
 
@@ -394,11 +502,6 @@ class CatalogSourceTest(ServerTestCase):
     ``current_version_id`` is now the catalog's source. That makes it an
     invariant every writer must keep — these pin the two ways it could break.
     """
-
-    def catalog_ids(self):
-        status, _, body = self.request("GET", "/api/v1/catalog")
-        self.assertEqual(status, 200)
-        return [entry["playground_id"] for entry in body["playgrounds"]]
 
     def test_a_registered_but_unpublished_course_is_not_in_the_catalog(self):
         # POST /playgrounds creates the row; the version comes from the publish.
@@ -565,16 +668,6 @@ class RetiringTest(ServerTestCase):
     by ``state = stopped``. Re-archiving is a no-op; republishing an
     archived course is rejected.
     """
-
-    def catalog_ids(self):
-        status, _, body = self.request("GET", "/api/v1/catalog")
-        self.assertEqual(status, 200)
-        return [entry["playground_id"] for entry in body["playgrounds"]]
-
-    def retire(self, playground_id, token=OPERATOR_TOKEN):
-        return self.request(
-            "DELETE", f"/api/v1/playgrounds/{playground_id}", token=token
-        )
 
     def test_retiring_a_playground_takes_it_out_of_the_catalog(self):
         playground_id, commit_id = self.seed("pg-archive-catalog")

@@ -186,6 +186,44 @@ def _require_base(base_version_id, observed_version_id):
         raise PlaygroundBaseChangedError("base_version_id is not current")
 
 
+def restore_playground(connection, playground_id):
+    """Bring an archived Playground back into the catalog.
+
+    The counterpart to Archive. ``state`` is a distribution flag, and something
+    has to be able to clear it: publishing is refused while a Playground is
+    stopped (protocol.md §2), so without this the flag only moves one way and a
+    retired course can never come back — which is what `retire.mjs` used to
+    promise and could not deliver.
+
+    Returns whether it changed anything: ``False`` for a Playground that is
+    already active or was cancelled by a concurrent archive.
+
+    Emits a ``publish_playground`` event for the Version it returns to. That is
+    what tells a client the course is available again — the content log has no
+    separate "restored" kind, and a client already knows what to do with a
+    publish: install that Version and put it back in the active set.
+    """
+
+    playground_id = _require_opaque_id(playground_id)
+
+    with database.immediate_transaction(connection):
+        row = _playground_row(connection, playground_id)
+        if row is None:
+            raise MissingPlaygroundError("playground does not exist")
+        if row["state"] == "active":
+            return False
+
+        connection.execute(
+            "UPDATE playgrounds SET state = 'active' WHERE id = ?",
+            (playground_id,),
+        )
+        # A Playground that was never published has no Version to announce; it
+        # becomes active and stays out of the catalog until something is.
+        if row["current_version_id"]:
+            record_publish_event(connection, playground_id, row["current_version_id"])
+        return True
+
+
 def backfill_current_versions(connection, resolve_version):
     """Remember the current version of every row that never stored one.
 

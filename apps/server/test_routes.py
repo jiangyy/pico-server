@@ -38,6 +38,20 @@ class PlaygroundMatchersTest(unittest.TestCase):
         ):
             self.assertIsNone(routes.match_playground(path), path)
 
+    def test_the_restore_path_is_the_delete_path_with_a_suffix(self):
+        self.assertEqual(routes.match_playground_restore("/api/v1/playgrounds/pg/restore"), "pg")
+        for path in (
+            "/api/v1/playgrounds/pg",
+            "/api/v1/playgrounds/pg/restore/extra",
+            "/api/v1/playgrounds/pg/restores",
+            "/api/v1/playgrounds//restore",
+            "/api/v1/playgrounds/a/b/restore",
+        ):
+            self.assertIsNone(routes.match_playground_restore(path), path)
+        # It is a POST, and the bare path stays a DELETE.
+        self.assertEqual(routes.allowed_methods("/api/v1/playgrounds/pg/restore"), ("POST",))
+        self.assertEqual(routes.allowed_methods("/api/v1/playgrounds/pg"), ("DELETE",))
+
     def test_the_idempotency_endpoint_has_one_spelling(self):
         self.assertEqual(
             routes.playground_versions_endpoint("pg"),

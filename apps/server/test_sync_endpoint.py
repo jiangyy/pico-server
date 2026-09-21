@@ -15,15 +15,6 @@ from test_api import OPERATOR_TOKEN, ServerTestCase
 class SyncEndpointTests(ServerTestCase):
     """The wire shape of ``POST /api/v1/sync`` and its per-kind behaviour."""
 
-    def sync(self, pending_events, after_seq=0):
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/sync",
-            payload={"pending_events": pending_events, "after_seq": after_seq},
-        )
-        self.assertEqual(status, 200, body)
-        return body
-
     def submit_event(self, event_id, playground_id, version_id, text):
         return {
             "event_id": event_id,
@@ -252,15 +243,6 @@ class ContentLogBacklogTest(ServerTestCase):
     ``ServerTestCase`` shares one database across a class, so a sibling test
     reading the same log would see the backlog.
     """
-
-    def sync(self, pending_events, after_seq=0):
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/sync",
-            payload={"pending_events": pending_events, "after_seq": after_seq},
-        )
-        self.assertEqual(status, 200, body)
-        return body
 
     def test_a_long_content_log_is_walked_in_bounded_rounds(self):
         """The log grows for the life of the deployment, so one response must
