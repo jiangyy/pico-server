@@ -252,7 +252,7 @@ def current_playground_commit(repository, playground_id):
     """
 
     try:
-        ref = repository.playground_ref(playground_id)
+        ref = repository.history_ref(playground_id)
     except repository_module.RepositoryError:
         return None
     try:

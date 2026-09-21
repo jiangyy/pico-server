@@ -106,9 +106,22 @@ class RefNamespaceTest(unittest.TestCase):
     def setUp(self):
         self.repository = Repository(Path("/nonexistent/picopg.git"))
 
-    def test_playground_ref(self):
+    def test_the_three_ref_shapes(self):
+        """两个命名空间加一个只读的旧命名空间，各自负责一件事。"""
+
+        # history：稳定的可达性根
         self.assertEqual(
-            self.repository.playground_ref("pg-abc123"),
+            self.repository.history_ref("pg-abc123"),
+            "refs/picopg/history/pg-abc123",
+        )
+        # pending：一次 Publish 的临时根
+        self.assertEqual(
+            self.repository.pending_ref("deadbeef"),
+            "refs/picopg/pending/deadbeef",
+        )
+        # legacy：迁移时才读，新代码不写
+        self.assertEqual(
+            self.repository.legacy_ref("pg-abc123"),
             "refs/heads/playgrounds/pg-abc123",
         )
 
@@ -116,7 +129,13 @@ class RefNamespaceTest(unittest.TestCase):
         public = {
             name for name in dir(self.repository) if not name.startswith("_")
         }
-        self.assertEqual(public, {"path", "playground_ref"})
+        self.assertEqual(public, {"path", "history_ref", "pending_ref", "legacy_ref"})
+
+    def test_a_pending_ref_rejects_an_id_that_is_not_one_segment(self):
+        for hostile in ("", "a/b", "a\\b", ".hidden", None, 7):
+            with self.subTest(hostile=hostile):
+                with self.assertRaises(repository.RepositoryError):
+                    self.repository.pending_ref(hostile)
 
     def test_unsafe_identifiers_are_rejected(self):
         unsafe = [
@@ -143,13 +162,13 @@ class RefNamespaceTest(unittest.TestCase):
         for identifier in unsafe:
             with self.subTest(identifier=identifier):
                 with self.assertRaises(RepositoryError):
-                    self.repository.playground_ref(identifier)
+                    self.repository.history_ref(identifier)
 
     def test_non_string_identifiers_are_rejected(self):
         for identifier in (None, 1, b"bytes", ["list"]):
             with self.subTest(identifier=identifier):
                 with self.assertRaises(RepositoryError):
-                    self.repository.playground_ref(identifier)
+                    self.repository.history_ref(identifier)
 
     def test_git_ref_validation_guard(self):
         _check_ref_format("refs/heads/playgrounds/valid-id")
@@ -242,7 +261,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         self.assertEqual(result.playground_id, playground_id)
         self.assertFalse(result.no_op)
 
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         self.assertEqual(result.commit_id, self.git(
             "rev-parse", ref
         ).stdout.strip().decode("ascii"))
@@ -278,7 +297,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         self.assertEqual(len(lineage), 2)
         self.assertEqual(lineage[1].decode("ascii"), first.commit_id)
 
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         self.assertEqual(
             self.git("rev-parse", ref).stdout.strip().decode("ascii"),
             second.commit_id,
@@ -318,7 +337,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         self.assertNotIn("commit-tree", observed)
         self.assertNotIn("update-ref", observed)
 
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         self.assertEqual(
             self.git("rev-parse", ref).stdout.strip().decode("ascii"),
             first.commit_id,
@@ -335,7 +354,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
             self.make_bundle(self.default_entries(b"print(1)")),
             self.metadata(),
         )
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         head_tree = self.git(
             "rev-parse", f"{first.commit_id}^{{tree}}"
         ).stdout.strip().decode("ascii")
@@ -453,7 +472,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
                         )
             spy.assert_not_called()
 
-        ref = self.repository.playground_ref("pg-meta")
+        ref = self.repository.history_ref("pg-meta")
         self.assertFalse(self.ref_exists(ref))
 
     def test_bundle_must_be_the_normalized_read_only_mapping(self):
@@ -494,7 +513,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
             repository.publish_playground(
                 self.repository, "pg-bundle", conflicting, metadata
             )
-        self.assertFalse(self.ref_exists(self.repository.playground_ref("pg-bundle")))
+        self.assertFalse(self.ref_exists(self.repository.history_ref("pg-bundle")))
 
     def test_forged_mapping_proxy_is_revalidated_before_any_write(self):
         metadata = self.metadata()
@@ -551,7 +570,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
                 self.assertIsNone(ctx.exception.__context__)
                 self.assertNotIn("course/", str(ctx.exception))
         self.assertFalse(
-            self.ref_exists(self.repository.playground_ref("pg-forged"))
+            self.ref_exists(self.repository.history_ref("pg-forged"))
         )
 
     def test_nested_and_unusual_legal_filenames(self):
@@ -599,7 +618,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
                 self.metadata(),
             )
 
-        expected_ref = self.repository.playground_ref("pg-argv")
+        expected_ref = self.repository.history_ref("pg-argv")
         for arguments in seen:
             for argument in arguments:
                 self.assertNotIn(str(self.path), argument)
@@ -640,7 +659,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
             for playground_id in invalid:
                 with self.subTest(playground_id=playground_id):
                     with self.assertRaises(RepositoryError):
-                        self.repository.playground_ref(playground_id)
+                        self.repository.history_ref(playground_id)
         self.assertEqual(seen, [])
 
         self.assertFalse(repository.valid_playground_id("a" * 129))
@@ -654,7 +673,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         decoy_path = Path(self.temporary_directory.name) / "decoy.git"
         open_repository(decoy_path)
         playground_id = "pg-env"
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
 
         redirected = {
             "GIT_DIR": str(decoy_path),
@@ -690,7 +709,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         decoy_path = Path(self.temporary_directory.name) / "decoy.git"
         open_repository(decoy_path)
         playground_id = "pg-control"
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         trace_file = Path(self.temporary_directory.name) / "git-trace.log"
 
         redirected = {
@@ -773,7 +792,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
             self.make_bundle(self.default_entries(b"print(1)")),
             self.metadata(),
         )
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         original = repository._run_git
 
         def failing_update_ref(
@@ -815,7 +834,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
             self.make_bundle(self.default_entries(b"print(1)")),
             self.metadata(),
         )
-        ref = self.repository.playground_ref(playground_id)
+        ref = self.repository.history_ref(playground_id)
         tree_id = (
             self.git("rev-parse", f"{first.commit_id}^{{tree}}")
             .stdout.strip()
@@ -1118,6 +1137,185 @@ class GitSubprocessIsolationTest(unittest.TestCase):
         # accepted all six identity fields instead of rejecting them.
         self.assertIsInstance(completed, subprocess.CompletedProcess)
         self.assertNotEqual(completed.returncode, 0)
+
+
+class PendingRefTest(unittest.TestCase):
+    """pending ref 只为一件事存在：让还没被数据库接受的 commit 不被 GC 收走。"""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "picopg.git"
+        self.repository = repository.open_repository(self.path)
+        self.metadata = repository.CommitMetadata(
+            "o", "o@x", "2026-01-01T00:00:00Z", "m"
+        )
+
+    def bundle(self, body):
+        return bundles.validate_bundle(
+            [
+                bundles.BundleEntry("picopg.json", b'{"schemaVersion":1,"runtime":"python"}'),
+                bundles.BundleEntry("course/index.html", body),
+            ]
+        )
+
+    def publish(self, playground_id="pg", body=b"one"):
+        return repository.publish_playground(
+            self.repository, playground_id, self.bundle(body), self.metadata
+        )
+
+    def refs(self, prefix="refs/picopg/"):
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), "for-each-ref", "--format=%(refname)", prefix],
+            capture_output=True, text=True, check=True,
+        )
+        return [line for line in completed.stdout.split("\n") if line]
+
+    def test_publishing_creates_a_history_ref_and_leaves_nothing_pending(self):
+        result = self.publish()
+        self.assertEqual(self.refs(), ["refs/picopg/history/pg"])
+        self.assertEqual(self.refs("refs/picopg/pending/"), [])
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.path), "rev-parse", "refs/picopg/history/pg"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip(),
+            result.commit_id,
+        )
+
+    def test_a_pending_ref_keeps_an_unaccepted_commit_alive_and_can_go(self):
+        result = self.publish()
+        repository.create_pending_ref(self.repository, "evt1", result.commit_id)
+        self.assertEqual(repository.list_pending_refs(self.repository), [("evt1", result.commit_id)])
+
+        repository.delete_pending_ref(self.repository, "evt1")
+        self.assertEqual(repository.list_pending_refs(self.repository), [])
+
+    def test_deleting_a_missing_pending_ref_is_not_an_error(self):
+        # 失败路径会删它，而那条路径可能已经被别的清理删过了
+        repository.delete_pending_ref(self.repository, "never-existed")
+
+    def test_converging_moves_the_history_ref(self):
+        first = self.publish()
+        second = self.publish(body=b"two")
+        self.assertNotEqual(first.commit_id, second.commit_id)
+
+        repository.converge_history_ref(self.repository, "pg", first.commit_id)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.path), "rev-parse", "refs/picopg/history/pg"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip(),
+            first.commit_id,
+        )
+
+    def test_converging_rejects_something_that_is_not_a_commit(self):
+        self.publish()
+        for hostile in ("HEAD", "main", "", "0" * 39):
+            with self.subTest(hostile=hostile):
+                with self.assertRaises(repository.RepositoryError):
+                    repository.converge_history_ref(self.repository, "pg", hostile)
+
+
+class LegacyRefMigrationTest(unittest.TestCase):
+    """旧的 `refs/heads/playgrounds/*` 要搬进新命名空间，且不能弄丢字节。"""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "picopg.git"
+        self.repository = repository.open_repository(self.path)
+        self.metadata = repository.CommitMetadata("o", "o@x", "2026-01-01T00:00:00Z", "m")
+        self.bundle = bundles.validate_bundle(
+            [
+                bundles.BundleEntry("picopg.json", b'{"schemaVersion":1,"runtime":"python"}'),
+                bundles.BundleEntry("course/index.html", b"one"),
+            ]
+        )
+
+    def publish_with_legacy_ref(self, playground_id="pg", body=None):
+        """造一个"旧代码发布过"的状态：commit + refs/heads 上的 ref。"""
+
+        bundle = self.bundle if body is None else bundles.validate_bundle(
+            [
+                bundles.BundleEntry("picopg.json", b'{"schemaVersion":1,"runtime":"python"}'),
+                bundles.BundleEntry("course/index.html", body),
+            ]
+        )
+        result = repository.publish_playground(
+            self.repository, playground_id, bundle, self.metadata
+        )
+        subprocess.run(
+            ["git", "-C", str(self.path), "update-ref", "-d",
+             f"refs/picopg/history/{playground_id}"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.path), "update-ref",
+             f"refs/heads/playgrounds/{playground_id}", result.commit_id], check=True,
+        )
+        return result.commit_id
+
+    def refs(self, prefix):
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), "for-each-ref", "--format=%(refname)", prefix],
+            capture_output=True, text=True, check=True,
+        )
+        return [line for line in completed.stdout.split("\n") if line]
+
+    def test_a_legacy_ref_moves_and_the_commit_stays_readable(self):
+        commit_id = self.publish_with_legacy_ref()
+        self.assertEqual(repository.migrate_legacy_refs(self.repository, ["pg"]), 1)
+
+        self.assertEqual(self.refs("refs/heads/"), [], "旧 ref 不该留下")
+        self.assertEqual(self.refs("refs/picopg/history/"), ["refs/picopg/history/pg"])
+        self.assertTrue(
+            repository.commit_in_playground_history(self.repository, "pg", commit_id),
+            "迁移后这个 Version 仍然可见",
+        )
+
+    def test_it_is_idempotent(self):
+        self.publish_with_legacy_ref()
+        self.assertEqual(repository.migrate_legacy_refs(self.repository, ["pg"]), 1)
+        self.assertEqual(repository.migrate_legacy_refs(self.repository, ["pg"]), 0)
+
+    def test_a_playground_with_no_legacy_ref_is_untouched(self):
+        result = repository.publish_playground(
+            self.repository, "pg", self.bundle, self.metadata
+        )
+        self.assertEqual(repository.migrate_legacy_refs(self.repository, ["pg"]), 0)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.path), "rev-parse", "refs/picopg/history/pg"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip(),
+            result.commit_id,
+            "已有的 history ref 是权威的，迁移不能覆盖它",
+        )
+
+    def test_the_history_ref_wins_when_the_legacy_one_is_stale(self):
+        # 真实场景：旧命名空间的 ref 停在更早的 commit（迁移中断过、或那段历史
+        # 后来又被发布过）。history ref 是当前被接受的版本，迁移不能把它拉回去。
+        newer = self.publish_with_legacy_ref(body=b"two")
+        older = self.publish_with_legacy_ref(body=b"one")
+        subprocess.run(
+            ["git", "-C", str(self.path), "update-ref",
+             "refs/heads/playgrounds/pg", older], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.path), "update-ref",
+             "refs/picopg/history/pg", newer], check=True,
+        )
+
+        repository.migrate_legacy_refs(self.repository, ["pg"])
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.path), "rev-parse", "refs/picopg/history/pg"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip(),
+            newer,
+            "history ref 是权威的，不能被旧的拉回去",
+        )
+        self.assertEqual(self.refs("refs/heads/"), [])
 
 
 if __name__ == "__main__":

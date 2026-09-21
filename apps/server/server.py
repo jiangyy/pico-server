@@ -829,6 +829,10 @@ def make_server(
     # catalog no longer resolves one on demand. Fill them in once, here, so a
     # request never pays a Git subprocess per row.
     with closing(open_database(database_path)) as connection:
+        # The repository's refs are brought into agreement with the database
+        # before the first request: the history refs move into their namespace,
+        # then rows that never stored a version get one.
+        playgrounds_module.migrate_legacy_refs(connection, repository)
         playgrounds_module.backfill_current_versions(
             connection,
             lambda playground_id: manifests.current_playground_commit(

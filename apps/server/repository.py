@@ -30,6 +30,23 @@ _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 # prefix, or an option from being resolved as if it were an object id.
 _OBJECT_ID_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
 
+#: protocol.md §2: the stable, per-Playground reachability root. It converges to
+#: the database's `current_version_id`; it never leads it.
+HISTORY_REF_PREFIX = "refs/picopg/history/"
+#: protocol.md §2: the temporary root for a Version that is prepared but not yet
+#: accepted. One per publish attempt, removed once the attempt is settled.
+PENDING_REF_PREFIX = "refs/picopg/pending/"
+
+
+def _require_event_id(event_id):
+    """An event id names a pending ref, so it must be a safe single segment."""
+
+    if type(event_id) is not str or not event_id:
+        raise RepositoryError("event id must be a non-empty string")
+    if "/" in event_id or "\\" in event_id or event_id.startswith("."):
+        raise RepositoryError("event id must be a single path-safe segment")
+    return event_id
+
 
 class RepositoryError(Exception):
     """Raised when the private repository cannot be opened or validated."""
@@ -41,8 +58,36 @@ class Repository:
     def __init__(self, path):
         self.path = Path(path)
 
-    def playground_ref(self, opaque_id):
-        """Return the Playground ref for ``opaque_id``."""
+    def history_ref(self, opaque_id):
+        """Return the stable history ref for a Playground.
+
+        Everything a Playground has accepted stays reachable from here. It is
+        *not* the addressing scheme for a Version — a Version is read by its own
+        id (protocol.md §3) — it is the reachability root that keeps the Git GC
+        away and the thing `commit_in_playground_history` consults.
+        """
+        validate_playground_id(opaque_id)
+        ref = f"{HISTORY_REF_PREFIX}{opaque_id}"
+        _check_ref_format(ref)
+        return ref
+
+    def pending_ref(self, event_id):
+        """Return the temporary ref that protects one prepared Version.
+
+        A publish creates its commit before the database decides to accept it,
+        and in that window nothing else references the commit. This ref is what
+        keeps it alive; recovery removes it, so it is never a second history.
+        """
+        _require_event_id(event_id)
+        ref = f"{PENDING_REF_PREFIX}{event_id}"
+        _check_ref_format(ref)
+        return ref
+
+    def legacy_ref(self, opaque_id):
+        """The ref this project wrote before it had a namespaced layout.
+
+        Read once during migration. Nothing writes it any more.
+        """
         validate_playground_id(opaque_id)
         ref = f"refs/heads/playgrounds/{opaque_id}"
         _check_ref_format(ref)
@@ -521,7 +566,7 @@ def publish_playground(repository, playground_id, bundle, metadata):
 
     # Re-validates the identifier and returns only the namespaced Playground
     # ref; no caller-controlled ref string reaches Git.
-    ref = repository.playground_ref(playground_id)
+    ref = repository.history_ref(playground_id)
 
     files = _snapshot_bundle(bundle)
     tree = _bundle_tree(files)
@@ -542,6 +587,125 @@ def publish_playground(repository, playground_id, bundle, metadata):
     return PublishResult(
         playground_id=playground_id, commit_id=commit_id, no_op=False
     )
+
+
+# --- The two ref namespaces ------------------------------------------------
+#
+# Publish is three phases (protocol.md §2): Git prepares a Version, the database
+# decides whether to accept it, Git finalises. The two ref namespaces are what
+# makes that safe:
+#
+#   refs/picopg/pending/<event_id>   protects a prepared Version until the
+#                                    database has answered, then goes away
+#   refs/picopg/history/<playground> the stable root, converged *from* the
+#                                    database's current_version_id afterwards
+#
+# Nothing here reads the database, and nothing here decides what is accepted:
+# these are reachability operations.
+
+
+def create_pending_ref(repository, event_id, commit_id):
+    """Point a pending ref at a prepared Version, so the GC cannot take it."""
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    _require_object_id(commit_id)
+    ref = repository.pending_ref(event_id)
+    completed = _run_git(
+        ("update-ref", ref, commit_id, _zero_object_id(repository)),
+        cwd=repository.path,
+    )
+    if completed.returncode != 0:
+        # A pending ref is created once, by the attempt that owns this event id,
+        # so a failure here is a repository problem, not a lost race.
+        raise RepositoryError("could not create pending reference")
+
+
+def delete_pending_ref(repository, event_id):
+    """Remove a pending ref, if it is still there."""
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    ref = repository.pending_ref(event_id)
+    completed = _run_git(("update-ref", "-d", ref), cwd=repository.path)
+    if completed.returncode != 0:
+        raise RepositoryError("could not delete pending reference")
+
+
+def converge_history_ref(repository, playground_id, version_id):
+    """Move the history ref to the Version the database says is current.
+
+    Unconditional on purpose: the database is the authority, so the ref follows
+    it. There is nothing to compare-and-swap against, because a ref that
+    disagrees is a ref that is behind, not a race.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    _require_object_id(version_id)
+    ref = repository.history_ref(playground_id)
+    completed = _run_git(
+        ("update-ref", ref, version_id), cwd=repository.path
+    )
+    if completed.returncode != 0:
+        raise RepositoryError("could not converge history reference")
+
+
+def list_pending_refs(repository):
+    """Return ``[(event_id, commit_id), ...]`` for every pending ref."""
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    completed = _run_git(
+        ("for-each-ref", "--format=%(refname) %(objectname)", PENDING_REF_PREFIX),
+        cwd=repository.path,
+    )
+    if completed.returncode != 0:
+        raise RepositoryError("could not list pending references")
+
+    pending = []
+    for line in completed.stdout.decode("ascii", "replace").splitlines():
+        name, _, object_id = line.partition(" ")
+        event_id = name[len(PENDING_REF_PREFIX):]
+        if not event_id or not object_id:
+            continue
+        pending.append((event_id, object_id.strip()))
+    return pending
+
+
+def migrate_legacy_refs(repository, playground_ids):
+    """Copy the pre-namespace refs into ``refs/picopg/history/`` and drop them.
+
+    Before this layout a Playground's history lived at
+    ``refs/heads/playgrounds/<id>``. The history ref is created first and the
+    legacy one deleted second, so an interrupted migration leaves the bytes
+    reachable either way and running it again finishes the job.
+
+    Returns how many Playgrounds were migrated.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+
+    migrated = 0
+    for playground_id in playground_ids:
+        try:
+            legacy = repository.legacy_ref(playground_id)
+            history = repository.history_ref(playground_id)
+        except RepositoryError:
+            continue
+        version_id = _resolve_head(repository, legacy)
+        if version_id is None:
+            continue
+        # Only when the history ref is missing: a Playground whose history ref
+        # already exists is authoritative, and the legacy ref is stale.
+        if _resolve_head(repository, history) is None:
+            converge_history_ref(repository, playground_id, version_id)
+        completed = _run_git(("update-ref", "-d", legacy), cwd=repository.path)
+        if completed.returncode != 0:
+            raise RepositoryError("could not delete legacy reference")
+        migrated += 1
+    return migrated
 
 
 # --- Read-only access to published commits ---------------------------------
@@ -575,7 +739,7 @@ def commit_in_playground_history(repository, playground_id, commit_id):
     """
 
     try:
-        ref = repository.playground_ref(playground_id)
+        ref = repository.history_ref(playground_id)
     except RepositoryError:
         return False
     if _resolve_head(repository, ref) is None:

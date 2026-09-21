@@ -163,7 +163,7 @@ class ManifestTestBase(unittest.TestCase):
     def set_ref(self, playground_id, commit_id):
         self.git(
             "update-ref",
-            self.repository.playground_ref(playground_id),
+            self.repository.history_ref(playground_id),
             commit_id,
         )
 

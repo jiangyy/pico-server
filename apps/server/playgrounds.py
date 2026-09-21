@@ -224,6 +224,21 @@ def restore_playground(connection, playground_id):
         return True
 
 
+def migrate_legacy_refs(connection, repository):
+    """Move every Playground's history into the namespaced ref layout.
+
+    Reads the rows rather than the refs: a Playground with no row is not part of
+    the catalog, and its ref (if any) is not this service's to move.
+
+    Returns how many were migrated.
+    """
+
+    rows = connection.execute("SELECT id FROM playgrounds ORDER BY id").fetchall()
+    return _repository.migrate_legacy_refs(
+        repository, [row["id"] for row in rows]
+    )
+
+
 def backfill_current_versions(connection, resolve_version):
     """Remember the current version of every row that never stored one.
 
