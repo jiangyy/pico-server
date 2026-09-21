@@ -125,7 +125,7 @@ class ServerTestCase(unittest.TestCase):
     def publish(self, playground_id, archive=None, key="key-1"):
         return self.request(
             "POST",
-            f"/api/v1/playgrounds/{playground_id}/commits",
+            f"/api/v1/playgrounds/{playground_id}/versions",
             raw_body=archive if archive is not None else self.build_zip(),
             token=OPERATOR_TOKEN,
             content_type="application/zip",
@@ -139,7 +139,7 @@ class ServerTestCase(unittest.TestCase):
         self.create_playground(playground_id)
         status, _, body = self.publish(playground_id)
         assert status == 201, (status, body)
-        return playground_id, body["commitId"]
+        return playground_id, body["version_id"]
 
     def submit(self, playground_id, commit_id, **overrides):
         """Hand one piece of work in; overrides replace any request field."""
@@ -295,8 +295,8 @@ class PublishTest(ServerTestCase):
 
         status, _, body = self.publish(playground_id, key="key-2")
         self.assertEqual(status, 201)
-        self.assertEqual(body["commitId"], commit_id)
-        self.assertTrue(body["noOp"])
+        self.assertEqual(body["version_id"], commit_id)
+        self.assertEqual(body["status"], "no_op")
 
     def test_retrying_with_the_same_key_replays_the_result(self):
         playground_id = f"pg-{uuid.uuid4().hex[:8]}"
@@ -332,7 +332,7 @@ class PublishTest(ServerTestCase):
 
         status, _, body = self.request(
             "POST",
-            f"/api/v1/playgrounds/{playground_id}/commits",
+            f"/api/v1/playgrounds/{playground_id}/versions",
             raw_body=self.build_zip(),
             token=OPERATOR_TOKEN,
             content_type="application/zip",
@@ -371,7 +371,7 @@ class RetiringTest(ServerTestCase):
 
         status, _, body = self.retire("pg-archive-catalog")
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"playgroundId": "pg-archive-catalog", "status": "accepted"})
+        self.assertEqual(body, {"status": "accepted"})
 
         self.assertNotIn("pg-archive-catalog", self.catalog_ids())
         # The Git ref is left intact: a pinned client can still read the
@@ -382,10 +382,10 @@ class RetiringTest(ServerTestCase):
         )
         self.assertEqual(status, 200)
 
-        # Publishing an archived course is rejected.
+        # Publishing an archived course is refused.
         status, _, body = self.publish("pg-archive-catalog")
         self.assertEqual(status, 409)
-        self.assertEqual(body.get("code"), "playground_head_changed")
+        self.assertEqual(body.get("status"), "playground_stopped")
 
     def test_retiring_needs_the_operator_token(self):
         self.seed("pg-archive-token")

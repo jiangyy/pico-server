@@ -43,6 +43,7 @@ from playgrounds import (
     InvalidRequestError,
     MissingPlaygroundError,
     PlaygroundConflictError,
+    PlaygroundStoppedError,
     create_playground,
     get_playground,
     publish_playground,
@@ -82,8 +83,7 @@ COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 ALLOWED_METHODS = ("GET", "HEAD")
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
-PLAYGROUND_COMMITS_SUFFIX = "/commits"
-COMMITS_SEGMENT = "commits"
+PLAYGROUND_VERSIONS_SUFFIX = "/versions"
 VERSIONS_SEGMENT = "versions"
 FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
@@ -115,15 +115,15 @@ OPERATOR_ENVIRONMENT_VARIABLE = "PICOPG_OPERATOR_TOKEN"
 MIN_OPERATOR_TOKEN_BYTES = 16
 
 
-def _match_playground_commit(path):
+def _match_playground_versions(path):
     """Return the playground ID in a commit upload path, else None."""
     prefix = PLAYGROUNDS_PATH + "/"
     if not path.startswith(prefix) or not path.endswith(
-        PLAYGROUND_COMMITS_SUFFIX
+        PLAYGROUND_VERSIONS_SUFFIX
     ):
         return None
 
-    playground_id = path[len(prefix): -len(PLAYGROUND_COMMITS_SUFFIX)]
+    playground_id = path[len(prefix): -len(PLAYGROUND_VERSIONS_SUFFIX)]
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
@@ -142,14 +142,14 @@ def _match_playground(path):
     return playground_id
 
 
-def _playground_commits_endpoint(playground_id):
+def _playground_versions_endpoint(playground_id):
     """The idempotency endpoint of a Playground's bundle publish.
 
     One spelling, used by both the publish that records a result and the retire
     that has to forget it, so the two can never drift apart.
     """
 
-    return f"POST {PLAYGROUNDS_PATH}/{playground_id}{PLAYGROUND_COMMITS_SUFFIX}"
+    return f"POST {PLAYGROUNDS_PATH}/{playground_id}{PLAYGROUND_VERSIONS_SUFFIX}"
 
 
 def _version_route_parts(path):
@@ -227,7 +227,7 @@ def _allowed_methods(path):
         return ("POST",)
     if _match_playground(path) is not None:
         return ("DELETE",)
-    if _match_playground_commit(path) is not None:
+    if _match_playground_versions(path) is not None:
         return ("POST",)
     if _match_manifest(path) is not None:
         return ALLOWED_METHODS
@@ -396,8 +396,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == PLAYGROUNDS_PATH:
             self._post_playground()
-        elif _match_playground_commit(path) is not None:
-            self._post_playground_commit(_match_playground_commit(path))
+        elif _match_playground_versions(path) is not None:
+            self._post_playground_versions(_match_playground_versions(path))
         elif path == SUBMISSIONS_PATH:
             self._post_submission()
         elif path == SYNC_PATH:
@@ -493,7 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                             "WHERE scope = ? AND endpoint = ?",
                             (
                                 OPERATOR_SCOPE,
-                                _playground_commits_endpoint(playground_id),
+                                _playground_versions_endpoint(playground_id),
                             ),
                         )
                         record_archive_event(connection, playground_id)
@@ -501,12 +501,10 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(400, "invalid_request")
             return
 
+        # protocol.md's ArchiveResult: the status alone says whether this call
+        # changed anything.
         self._respond_json(
-            200,
-            {
-                "playgroundId": playground_id,
-                "status": "no_op" if already_stopped else "accepted",
-            },
+            200, {"status": "no_op" if already_stopped else "accepted"}
         )
 
     def _respond_bytes(
@@ -680,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             {"playground": self._playground_payload(playground)},
         )
 
-    def _post_playground_commit(self, playground_id):
+    def _post_playground_versions(self, playground_id):
         if not self._require_operator():
             return
 
@@ -721,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
                 status, body = execute_idempotent(
                     connection,
                     OPERATOR_SCOPE,
-                    _playground_commits_endpoint(playground_id),
+                    _playground_versions_endpoint(playground_id),
                     request_key,
                     _bundle_request(playground_id, bundle),
                     lambda connection: self._publish_bundle(
@@ -740,8 +738,14 @@ class Handler(BaseHTTPRequestHandler):
         except InvalidRequestError:
             self._api_error(400, "invalid_request")
             return
+        except PlaygroundStoppedError:
+            # protocol.md's PublishResult: the Playground is not writable, and
+            # retrying the same request will not change that.
+            self._respond_json(409, {"status": "playground_stopped"})
+            return
         except PlaygroundHeadChangedError:
-            self._api_error(409, "playground_head_changed")
+            # The ref moved under us: the publisher's base is stale.
+            self._respond_json(409, {"status": "conflict"})
             return
         except RepositoryError:
             self._api_error(500, "internal_error")
@@ -750,13 +754,15 @@ class Handler(BaseHTTPRequestHandler):
         self._respond_json(status, body)
 
     def _publish_bundle(self, connection, playground_id, bundle):
+        """Create a Version for one validated bundle.
+
+        The result is protocol.md's ``PublishResult``: the protocol's own field
+        names carry the outcome, so the publisher never has to read an HTTP
+        status to know what happened.
+        """
         existing = get_playground(connection, playground_id)
         if existing is None:
             raise MissingPlaygroundError("playground does not exist")
-        if existing.state == "stopped":
-            # An archived playground is read-only; the operator must publish
-            # under a fresh id (or restore the row by hand) to publish again.
-            raise PlaygroundHeadChangedError("playground is archived")
         result = publish_playground(
             connection,
             playground_id,
@@ -765,9 +771,8 @@ class Handler(BaseHTTPRequestHandler):
             _commit_metadata(),
         )
         return 201, {
-            "playgroundId": result.playground_id,
-            "commitId": result.commit_id,
-            "noOp": result.no_op,
+            "status": "no_op" if result.no_op else "accepted",
+            "version_id": result.commit_id,
         }
 
     def _post_submission(self):
