@@ -18,11 +18,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bundles  # noqa: E402
-import idempotency  # noqa: E402
+from unittest import mock  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
 import submissions  # noqa: E402
-from unittest import mock  # noqa: E402
+import sync  # noqa: E402
+import sync_handlers  # noqa: E402
 from database import open_database  # noqa: E402
 
 MANIFEST_BYTES = b'{"schemaVersion":1,"runtime":"python"}'
@@ -67,11 +68,26 @@ class SubmissionTestBase(unittest.TestCase):
         payload.update(overrides)
         return payload
 
-    def create(self, payload=None, key="key-1"):
-        request = submissions.decode_submission_request(payload or self.payload())
-        return submissions.create_submission(
-            self.connection, self.repository, request, key
+    def store(self, student="2026-001", files=None, event_id=None):
+        """Record one hand-in through the sync handler, as the server does."""
+        import events_types
+        import uuid
+
+        files = files if files is not None else {"work/main.py": f"# 姓名：{student}\nprint(1)\n"}
+        envelope = events_types.EventEnvelope(
+            event_id=event_id or uuid.uuid4().hex,
+            kind=events_types.EVENT_KIND_SUBMIT_CODE,
+            payload={
+                "playground_id": self.playground_id,
+                "version_id": self.commit_id,
+                "files": files,
+            },
         )
+        with self.connection:
+            body = sync_handlers.submit_handler(
+                self.connection, envelope, repository=self.repository
+            )
+        return body["submission"]
 
 
 class StudentFromFilesTest(unittest.TestCase):
@@ -290,84 +306,6 @@ class FileSetValidationTest(unittest.TestCase):
         self.assertEqual(list(request.files.items()), [("work/a.py", "1"), ("work/b.py", "2")])
 
 
-class CreateSubmissionTest(SubmissionTestBase):
-    """What actually gets recorded."""
-
-    def test_a_submission_records_the_exact_commit_and_files(self):
-        status, body = self.create()
-
-        self.assertEqual(status, 201)
-        mapping = body["submission"]
-        self.assertEqual(mapping["playgroundId"], self.playground_id)
-        self.assertEqual(mapping["commitId"], self.commit_id)
-        self.assertEqual(mapping["student"], "2026-001")
-
-        stored = submissions.get_submission(self.connection, mapping["id"])
-        self.assertEqual(stored.files, (("work/main.py", "print(1)\n"),))
-
-    def test_an_unpublished_commit_is_refused(self):
-        request = submissions.decode_submission_request(
-            self.payload(commitId="0" * 40)
-        )
-
-        with self.assertRaises(submissions.UnknownPlaygroundError):
-            submissions.create_submission(
-                self.connection, self.repository, request, "key-1"
-            )
-
-    def test_an_unknown_playground_is_refused(self):
-        request = submissions.decode_submission_request(
-            self.payload(playgroundId="pg-none")
-        )
-
-        with self.assertRaises(submissions.UnknownPlaygroundError):
-            submissions.create_submission(
-                self.connection, self.repository, request, "key-1"
-            )
-
-    def test_an_exact_retry_replays_the_stored_result(self):
-        first = self.create()
-        second = self.create()
-
-        self.assertEqual(first, second)
-        self.assertEqual(self.count_rows(), 1)
-
-    def test_the_same_key_with_another_body_conflicts(self):
-        self.create()
-
-        with self.assertRaises(idempotency.IdempotencyConflict):
-            self.create(self.payload(files={"work/main.py": "print(2)\n"}))
-
-    def test_two_students_may_reuse_one_key(self):
-        self.create(key="shared")
-        self.create(self.payload(student="2026-002"), key="shared")
-
-        self.assertEqual(self.count_rows(), 2)
-
-    def test_a_submission_is_append_only(self):
-        first = self.create()
-        second = self.create(self.payload(files={"work/main.py": "print(2)\n"}), key="key-2")
-
-        self.assertNotEqual(
-            first[1]["submission"]["id"], second[1]["submission"]["id"]
-        )
-        stored = submissions.get_submission(
-            self.connection, first[1]["submission"]["id"]
-        )
-        self.assertEqual(stored.files, (("work/main.py", "print(1)\n"),))
-
-    def test_a_caller_must_supply_a_decoded_request(self):
-        with self.assertRaises(submissions.InvalidSubmissionRequestError):
-            submissions.create_submission(
-                self.connection, self.repository, self.payload(), "key-1"
-            )
-
-    def count_rows(self):
-        return self.connection.execute(
-            "SELECT COUNT(*) AS n FROM submissions"
-        ).fetchone()["n"]
-
-
 class ReadSubmissionTest(SubmissionTestBase):
     """Reading back what was handed in."""
 
@@ -404,9 +342,7 @@ class ReadSubmissionTest(SubmissionTestBase):
 
     def test_listing_is_newest_first_and_paged(self):
         for index in range(3):
-            self.create(
-                self.payload(student=f"2026-00{index}"), key=f"key-{index}"
-            )
+            self.store(student=f"2026-00{index}")
 
         page = submissions.list_submissions(self.connection, limit=2)
         self.assertEqual(len(page), 2)
@@ -430,7 +366,8 @@ class ReadSubmissionTest(SubmissionTestBase):
 
     def test_the_mapping_carries_files_only_when_asked(self):
         stored = submissions.get_submission(
-            self.connection, self.create()[1]["submission"]["id"]
+            self.connection,
+            self.store(files={"work/main.py": "# 姓名：2026-001\nprint(1)\n"})["id"],
         )
 
         self.assertNotIn(
@@ -440,120 +377,8 @@ class ReadSubmissionTest(SubmissionTestBase):
             submissions.submission_to_mapping(stored.submission, files=stored.files)[
                 "files"
             ],
-            [{"path": "work/main.py", "text": "print(1)\n"}],
+            [{"path": "work/main.py", "text": "# 姓名：2026-001\nprint(1)\n"}],
         )
-
-
-class SubmissionFileLayoutTest(unittest.TestCase):
-    """Where a handed-in file set lands on disk.
-
-    The student string is the only caller-controlled part of that path, so
-    these tests are as much about what a hostile name cannot do as about the
-    layout a teacher will read.
-    """
-
-    def setUp(self):
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary_directory.cleanup)
-        self.root = Path(self.temporary_directory.name) / "submissions"
-
-    def write(self, student, files=None, ordinal=1):
-        return submissions.write_submission_files(
-            root=self.root,
-            submission_id="abcdef1234567890",
-            student=student,
-            playground_id="pg-one",
-            playground_commit_id="c1" + "0" * 38,
-            created_at="2026-09-18T10:11:12Z",
-            files=files if files is not None else {"work/main.py": "print(1)\n"},
-            ordinal=ordinal,
-        )
-
-    def test_class_and_name_become_one_directory_each(self):
-        directory = self.write("张三（1 班）")
-
-        self.assertEqual(
-            directory.relative_to(self.root),
-            Path("1 班") / "张三" / "pg-one",
-        )
-        self.assertEqual(
-            (directory / "work/main.py").read_text(encoding="utf-8"), "print(1)\n"
-        )
-
-    def test_a_name_without_a_class_is_filed_directly_under_it(self):
-        directory = self.write("张三")
-        self.assertEqual(directory.relative_to(self.root), Path("张三") / "pg-one")
-
-    def test_handing_the_same_course_in_again_is_numbered(self):
-        first = self.write("张三（1 班）", ordinal=1)
-        second = self.write("张三（1 班）", ordinal=2)
-        third = self.write("张三（1 班）", ordinal=3)
-
-        self.assertEqual(
-            [d.name for d in (first, second, third)], ["pg-one", "pg-one-2", "pg-one-3"]
-        )
-        # Same course, same student, and each hand-in keeps its own copy of the work.
-        self.assertEqual(first.parent, second.parent)
-        self.assertEqual((second / "work/main.py").read_text(encoding="utf-8"), "print(1)\n")
-
-    def test_the_folder_says_whose_work_it_is(self):
-        directory = self.write("张三（1 班）")
-        manifest = json.loads(
-            (directory / submissions.MANIFEST_NAME).read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            manifest,
-            {
-                "commitId": "c1" + "0" * 38,
-                "createdAt": "2026-09-18T10:11:12Z",
-                "files": ["work/main.py"],
-                "id": "abcdef1234567890",
-                "ordinal": 1,
-                "playgroundId": "pg-one",
-                "student": "张三（1 班）",
-            },
-        )
-
-    def test_a_name_cannot_reach_outside_the_root(self):
-        for hostile in (
-            "../../etc/passwd",
-            "..",
-            "/etc/passwd",
-            "a/b",
-            "a\\b",
-            "..（..）",
-        ):
-            with self.subTest(hostile=hostile):
-                directory = self.write(hostile)
-                self.assertIn(self.root, directory.parents)
-                # Every segment is one name: no separators survive.
-                for part in directory.relative_to(self.root).parts:
-                    self.assertNotIn("/", part)
-                    self.assertNotIn("\\", part)
-                    self.assertNotIn(part, ("", ".", ".."))
-
-    def test_a_nameless_student_still_gets_a_directory(self):
-        # A `student` that sanitizes away (`.` and `/` only) must not produce an
-        # unnamed folder: the directory name is the only handle a teacher has.
-        directory = self.write("...")
-        self.assertIn("student", directory.relative_to(self.root).parts)
-
-    def test_a_long_name_is_truncated_per_segment(self):
-        directory = self.write(f"{'名' * 200}（{'班' * 200}）")
-        class_room, name, _stamp = directory.relative_to(self.root).parts
-        self.assertEqual(len(name), submissions.MAX_SEGMENT_LENGTH)
-        self.assertEqual(len(class_room), submissions.MAX_SEGMENT_LENGTH)
-
-    def test_files_are_private_and_rewriting_the_same_work_is_harmless(self):
-        first = self.write("张三（1 班）")
-        second = self.write("张三（1 班）")
-
-        self.assertEqual(first, second)
-        if os.name == "posix":
-            self.assertEqual(os.stat(second).st_mode & 0o777, 0o700)
-            self.assertEqual(
-                os.stat(second / "work/main.py").st_mode & 0o777, 0o600
-            )
 
 
 if __name__ == "__main__":

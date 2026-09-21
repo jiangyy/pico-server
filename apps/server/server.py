@@ -22,12 +22,10 @@ import events
 import events_types
 import manifests
 import pagination
-import permissions
 import sync
 import sync_handlers
 from bundles import (
     MAX_ARCHIVE_BYTES,
-    MAX_TOTAL_BYTES,
     BundleValidationError,
     decode_bundle_zip,
     validate_bundle,
@@ -61,21 +59,15 @@ from submissions import (
     InvalidSubmissionRequestError,
     MissingSubmissionError,
     StoredSubmissionError,
-    UnknownPlaygroundError,
-    create_submission,
-    decode_submission_request,
     get_submission,
     list_submissions,
-    submission_ordinal,
     submission_to_mapping,
-    write_submission_files,
 )
 
 
 HOST = "127.0.0.1"
 PORT = 8001
 DATABASE_PATH = Path("data/app.db")
-SUBMISSIONS_DIRECTORY_NAME = "submissions"
 
 MAX_JSON_BODY_BYTES = 16 * 1024
 
@@ -97,15 +89,9 @@ SYNC_PATH = "/api/v1/sync"
 # offline.
 MAX_PENDING_EVENTS = 100
 
-# The idempotency scope of the single operator that publishes bundles.  A
-# submission uses the self-reported student name instead, so two students can
-# use the same key without colliding.
+# The idempotency scope of the single operator that publishes bundles, so the
+# recorded result of a publish can never collide with anything else.
 OPERATOR_SCOPE = "operator"
-
-# A submission body is bounded JSON: the request fields plus text files, and it
-# must stay inside the file-set limits the submission module enforces.  Twice
-# the decoded total leaves room for JSON escaping.
-MAX_SUBMISSION_JSON_BODY_BYTES = 2 * MAX_TOTAL_BYTES
 
 # The operator token is the whole write authorization: publishing a bundle and
 # reading what was handed in.  It is supplied at start-up, compared in constant
@@ -398,8 +384,6 @@ class Handler(BaseHTTPRequestHandler):
             self._post_playground()
         elif _match_playground_versions(path) is not None:
             self._post_playground_versions(_match_playground_versions(path))
-        elif path == SUBMISSIONS_PATH:
-            self._post_submission()
         elif path == SYNC_PATH:
             self._post_sync()
         elif _allowed_methods(path) is not None:
@@ -775,85 +759,6 @@ class Handler(BaseHTTPRequestHandler):
             "version_id": result.commit_id,
         }
 
-    def _post_submission(self):
-        """Accept one bounded submission from a client.
-
-        This is the only anonymous write.  The body is validated field by field
-        before any database or Git access, and the named Playground commit must
-        be published, so a submission can never reference content this server
-        does not serve.
-        """
-
-        request_key = self._idempotency_key()
-        if request_key is None:
-            return
-
-        payload = self._read_json(max_bytes=MAX_SUBMISSION_JSON_BODY_BYTES)
-        if payload is None:
-            return
-
-        try:
-            request = decode_submission_request(payload)
-        except InvalidSubmissionRequestError as error:
-            self._api_error(
-                400,
-                "invalid_request",
-                details={"reason": str(error)},
-            )
-            return
-
-        ordinal = 1
-        try:
-            with self._database() as connection:
-                status, body = create_submission(
-                    connection,
-                    self.server.repository,
-                    request,
-                    request_key,
-                )
-                # The folder number is the submission's position in the record, so
-                # a replayed create names the same folder as the first attempt.
-                submission = body.get("submission") if isinstance(body, dict) else None
-                if status == 201 and submission is not None:
-                    ordinal = submission_ordinal(
-                        connection, request.student, submission["id"], submission["createdAt"]
-                    )
-        except IdempotencyConflict:
-            self._api_error(409, "idempotency_conflict")
-            return
-        except IdempotencyRequestError:
-            self._api_error(400, "invalid_request")
-            return
-        except UnknownPlaygroundError:
-            self._api_error(404, "not_found")
-            return
-        except InvalidSubmissionRequestError:
-            self._api_error(400, "invalid_request")
-            return
-
-        # The row is the record; the files are the copy a human opens. Writing
-        # after the row exists means a storage failure is a failed request the
-        # client can retry, and a replay writes the same bytes to the same
-        # path, so the retry is harmless.
-        if status == 201:
-            submission = body.get("submission") if isinstance(body, dict) else None
-            try:
-                write_submission_files(
-                    self.server.submissions_path,
-                    submission["id"],
-                    request.student,
-                    request.playground_id,
-                    request.playground_commit_id,
-                    submission["createdAt"],
-                    dict(request.files),
-                    ordinal=ordinal,
-                )
-            except (KeyError, TypeError, OSError, permissions.PermissionPolicyError):
-                self._api_error(500, "submission_storage_failed")
-                return
-
-        self._respond_json(status, body)
-
     def _get_submissions(self, head_only=False):
         if not self._require_operator(head_only=head_only):
             return
@@ -1119,29 +1024,14 @@ def make_server(
     port=PORT,
     database_path=DATABASE_PATH,
     repository_path=DEFAULT_REPOSITORY_PATH,
-    submissions_path=None,
     operator_token=None,
 ):
-    """Return an initialized HTTP server bound to ``host:port``.
-
-    ``submissions_path`` is the injected directory holding one directory per
-    handed-in piece of work.  When omitted it
-    defaults to a sibling directory of the database, which keeps every
-    deployment path under one data directory.  The directory is created
-    lazily by the submission writer
-    instead of at startup, so a read-only or unused directory never becomes a
-    start-up failure.
-    """
+    """Return an initialized HTTP server bound to ``host:port``."""
     operator_token = _validate_operator_token(operator_token)
 
     database_path = Path(database_path)
     database = open_database(database_path)
     database.close()
-
-    if submissions_path is None:
-        submissions_path = database_path.parent / SUBMISSIONS_DIRECTORY_NAME
-    else:
-        submissions_path = Path(submissions_path)
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
@@ -1150,7 +1040,6 @@ def make_server(
     server.database_path = database_path
     server.repository_path = repository_path
     server.repository = repository
-    server.submissions_path = submissions_path
     server.operator_token = operator_token
     return server
 

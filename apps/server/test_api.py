@@ -23,10 +23,7 @@ from pathlib import Path
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from server import (  # noqa: E402
-    MAX_SUBMISSION_JSON_BODY_BYTES,
-    make_server,
-)
+from server import make_server  # noqa: E402
 
 OPERATOR_TOKEN = "test-operator-token-value"
 MANIFEST = b'{"schemaVersion":1,"runtime":"python"}'
@@ -141,22 +138,38 @@ class ServerTestCase(unittest.TestCase):
         assert status == 201, (status, body)
         return playground_id, body["version_id"]
 
-    def submit(self, playground_id, commit_id, **overrides):
-        """Hand one piece of work in; overrides replace any request field."""
+    def hand_in(self, playground_id, commit_id, header="# 姓名：2026-001", files=None):
+        """Hand one piece of work in through the client's one write path.
 
-        payload = {
-            "playgroundId": playground_id,
-            "commitId": commit_id,
-            "student": "2026-001",
-            "files": {"work/main.py": "print(1)\n"},
+        Returns the single ``EventResult`` the server answered with, so a
+        caller can assert on ``status``/``reason`` the same way the client
+        does.
+        """
+        event = {
+            "event_id": uuid.uuid4().hex,
+            "kind": "submit_code",
+            "payload": {
+                "playground_id": playground_id,
+                "version_id": commit_id,
+                "files": files if files is not None else {"work/main.py": f"{header}\nprint(1)\n"},
+            },
         }
-        payload.update(overrides)
-        return self.request(
-            "POST",
-            "/api/v1/submissions",
-            payload,
-            extra_headers={"Idempotency-Key": str(uuid.uuid4())},
+        status, _, body = self.request(
+            "POST", "/api/v1/sync", payload={"pending_events": [event], "after_seq": 0}
         )
+        self.assertEqual(status, 200, body)
+        return body["event_results"][0]
+
+    def stored_submissions(self, playground_id):
+        status, _, body = self.request(
+            "GET", "/api/v1/submissions", token=OPERATOR_TOKEN
+        )
+        self.assertEqual(status, 200)
+        return [
+            entry
+            for entry in body["submissions"]
+            if entry["playgroundId"] == playground_id
+        ]
 
 
 class DistributionTest(ServerTestCase):
@@ -412,7 +425,9 @@ class RetiringTest(ServerTestCase):
 
     def test_a_retired_course_keeps_the_work_already_handed_in(self):
         playground_id, commit_id = self.seed("pg-archive-keeps")
-        submission_id = self.submit(playground_id, commit_id)[2]["submission"]["id"]
+        self.assertEqual(self.hand_in(playground_id, commit_id)["status"], "accepted")
+        (stored,) = self.stored_submissions(playground_id)
+        submission_id = stored["id"]
 
         self.assertEqual(self.retire(playground_id)[0], 200)
 
@@ -424,242 +439,59 @@ class RetiringTest(ServerTestCase):
         self.assertEqual(body["submission"]["playgroundId"], playground_id)
 
         # A new submission against a retired course is refused.
-        self.assertEqual(self.submit(playground_id, commit_id)[0], 404)
+        result = self.hand_in(playground_id, commit_id)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "playground_stopped")
 
 
 class SubmissionTest(ServerTestCase):
-    """The one anonymous write: a bounded file set from a client."""
-
-    def test_a_client_can_submit_without_an_account(self):
-        playground_id, commit_id = self.seed()
-
-        status, _, body = self.submit(playground_id, commit_id)
-        self.assertEqual(status, 201)
-        submission = body["submission"]
-        self.assertEqual(submission["playgroundId"], playground_id)
-        self.assertEqual(submission["commitId"], commit_id)
-        self.assertEqual(submission["student"], "2026-001")
-
-    def test_a_submission_is_filed_under_its_class_and_name(self):
-        playground_id, commit_id = self.seed()
-
-        status, _, body = self.submit(playground_id, commit_id, student="张三（1 班）")
-        self.assertEqual(status, 201)
-        submission_id = body["submission"]["id"]
-
-        # One directory per piece of work: <班级>/<姓名>/<playgroundId>/work/main.py
-        class_directory = Path(self.server.submissions_path) / "1 班" / "张三"
-        self.assertTrue(class_directory.is_dir())
-        (folder,) = list(class_directory.iterdir())
-        self.assertEqual(folder.name, playground_id)
-        self.assertEqual(
-            (folder / "work/main.py").read_text(encoding="utf-8"), "print(1)\n"
-        )
-
-        # The folder says whose work it is without anyone having to ask the API.
-        manifest = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["id"], submission_id)
-        self.assertEqual(manifest["student"], "张三（1 班）")
-        self.assertEqual(manifest["playgroundId"], playground_id)
-        self.assertEqual(manifest["commitId"], commit_id)
-        self.assertEqual(manifest["files"], ["work/main.py"])
-        self.assertEqual(manifest["ordinal"], 1)
-
-    def test_a_hostile_student_name_stays_inside_the_submissions_root(self):
-        playground_id, commit_id = self.seed()
-        root = Path(self.server.submissions_path)
-
-        status, _, _ = self.submit(
-            playground_id, commit_id, student="../../etc/passwd（../../..）"
-        )
-        self.assertEqual(status, 201)
-
-        # Every directory the request created is under the injected root, and
-        # every segment is a single name: no separators, no `..`.
-        created = list(root.rglob("*"))
-        self.assertTrue(created)
-        for path in created:
-            self.assertIn(root, path.parents)
-            self.assertNotIn("..", path.relative_to(root).parts)
-        self.assertFalse((root.parent.parent / "etc").exists())
-
-    def test_handing_the_same_course_in_twice_numbers_the_folder(self):
-        playground_id, commit_id = self.seed()
-
-        # A student of their own: the class shares one database, so a name another
-        # test already used would start this one at a later ordinal.
-        first = self.submit(playground_id, commit_id, student="王五（7 班）")
-        second = self.submit(
-            playground_id,
-            commit_id,
-            student="王五（7 班）",
-            files={"work/main.py": "print(2)\n"},
-        )
-        self.assertEqual((first[0], second[0]), (201, 201))
-
-        student_directory = Path(self.server.submissions_path) / "7 班" / "王五"
-        self.assertEqual(
-            sorted(entry.name for entry in student_directory.iterdir()),
-            [playground_id, f"{playground_id}-2"],
-        )
-        # Each hand-in keeps its own work; the first one is not overwritten.
-        self.assertEqual(
-            (student_directory / playground_id / "work/main.py").read_text(encoding="utf-8"),
-            "print(1)\n",
-        )
-        self.assertEqual(
-            (student_directory / f"{playground_id}-2" / "work/main.py").read_text(encoding="utf-8"),
-            "print(2)\n",
-        )
-
-    def test_an_exact_retry_rewrites_the_same_folder(self):
-        playground_id, commit_id = self.seed()
-        key = str(uuid.uuid4())
-        payload = {
-            "playgroundId": playground_id,
-            "commitId": commit_id,
-            "student": "李四（2 班）",
-            "files": {"work/main.py": "print(2)\n"},
-        }
-
-        first = self.request("POST", "/api/v1/submissions", payload, extra_headers={"Idempotency-Key": key})
-        second = self.request("POST", "/api/v1/submissions", payload, extra_headers={"Idempotency-Key": key})
-        self.assertEqual((first[0], second[0]), (201, 201))
-        self.assertEqual(first[2], second[2])
-
-        # The replay wrote the same bytes to the same place, so there is still
-        # exactly one folder for that piece of work.
-        (folder,) = list((Path(self.server.submissions_path) / "2 班" / "李四").iterdir())
-        self.assertEqual((folder / "work/main.py").read_text(encoding="utf-8"), "print(2)\n")
+    """Submissions arrive through sync; the operator only reads them back."""
 
     def test_the_operator_reads_the_submitted_files_back(self):
         playground_id, commit_id = self.seed()
-        submission_id = self.submit(playground_id, commit_id)[2]["submission"]["id"]
+        self.assertEqual(self.hand_in(playground_id, commit_id)["status"], "accepted")
 
+        (stored,) = self.stored_submissions(playground_id)
         status, _, body = self.request(
             "GET",
-            f"/api/v1/submissions/{submission_id}",
+            f"/api/v1/submissions/{stored['id']}",
             token=OPERATOR_TOKEN,
         )
         self.assertEqual(status, 200)
         self.assertEqual(
             body["submission"]["files"],
-            [{"path": "work/main.py", "text": "print(1)\n"}],
+            [{"path": "work/main.py", "text": "# 姓名：2026-001\nprint(1)\n"}],
         )
 
     def test_listing_submissions_requires_the_operator_token(self):
         playground_id, commit_id = self.seed()
-        self.submit(playground_id, commit_id)
+        self.hand_in(playground_id, commit_id)
 
         anonymous = self.request("GET", "/api/v1/submissions")
         self.assertEqual(anonymous[0], 401)
 
-        listed = self.request(
-            "GET", "/api/v1/submissions", token=OPERATOR_TOKEN
-        )
+        listed = self.request("GET", "/api/v1/submissions", token=OPERATOR_TOKEN)
         self.assertEqual(listed[0], 200)
         self.assertGreaterEqual(len(listed[2]["submissions"]), 1)
         for entry in listed[2]["submissions"]:
             self.assertNotIn("files", entry)
 
-    def test_a_submission_to_an_unpublished_commit_is_not_found(self):
-        playground_id, _ = self.seed()
-
-        status, _, body = self.submit(playground_id, "0" * 40)
-        self.assertEqual(status, 404)
-        self.assertEqual(body["code"], "not_found")
-
-    def test_a_submission_outside_work_is_rejected(self):
+    def test_a_hand_in_records_the_exact_version_and_files(self):
         playground_id, commit_id = self.seed()
+        self.hand_in(playground_id, commit_id)
 
-        status, _, body = self.submit(
-            playground_id, commit_id, files={"course/index.html": "<p>"}
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(body["code"], "invalid_request")
+        (stored,) = self.stored_submissions(playground_id)
+        self.assertEqual(stored["commitId"], commit_id)
+        self.assertEqual(stored["student"], "2026-001")
 
-    def test_a_submission_with_a_malformed_student_is_rejected(self):
+    def test_a_hand_in_without_an_attribution_is_refused(self):
+        # The name lives in the hand-in's own header, so an empty file set
+        # carries none and cannot be filed under anyone.
         playground_id, commit_id = self.seed()
-
-        blank = self.submit(playground_id, commit_id, student="   ")
-        self.assertEqual(blank[0], 400)
-
-        long_name = self.submit(playground_id, commit_id, student="a" * 129)
-        self.assertEqual(long_name[0], 400)
-
-    def test_a_submission_may_hand_in_nothing(self):
-        playground_id, commit_id = self.seed()
-
-        status, _, body = self.submit(playground_id, commit_id, files={})
-        self.assertEqual(status, 201)
-        self.assertEqual(body["submission"]["student"], "2026-001")
-
-    def test_retrying_a_submission_returns_the_same_record(self):
-        playground_id, commit_id = self.seed()
-        payload = {
-            "playgroundId": playground_id,
-            "commitId": commit_id,
-            "student": "2026-002",
-            "files": {"work/main.py": "print(2)\n"},
-        }
-
-        first = self.request(
-            "POST",
-            "/api/v1/submissions",
-            payload,
-            extra_headers={"Idempotency-Key": "same-key"},
-        )
-        second = self.request(
-            "POST",
-            "/api/v1/submissions",
-            payload,
-            extra_headers={"Idempotency-Key": "same-key"},
-        )
-        self.assertEqual(first[0], 201)
-        self.assertEqual(first[2], second[2])
-
-    def test_two_students_may_use_the_same_idempotency_key(self):
-        playground_id, commit_id = self.seed()
-
-        first = self.submit(
-            playground_id, commit_id, student="2026-003", files={"work/a.py": "1"}
-        )
-        second = self.submit(
-            playground_id, commit_id, student="2026-004", files={"work/a.py": "1"}
-        )
-        self.assertEqual(first[0], 201)
-        self.assertEqual(second[0], 201)
-        self.assertNotEqual(
-            first[2]["submission"]["id"], second[2]["submission"]["id"]
-        )
-
-    def test_a_non_json_body_is_rejected(self):
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/submissions",
-            raw_body=b"{}",
-            content_type="text/plain",
-            extra_headers={"Idempotency-Key": "k"},
-        )
-        self.assertEqual(status, 415)
-        self.assertEqual(body["code"], "unsupported_media_type")
-
-    def test_an_oversized_body_is_refused_before_it_is_parsed(self):
-        try:
-            status, _, body = self.request(
-                "POST",
-                "/api/v1/submissions",
-                raw_body=b"x" * (MAX_SUBMISSION_JSON_BODY_BYTES + 1),
-                content_type="application/json",
-                extra_headers={"Idempotency-Key": "k"},
-            )
-        except OSError:
-            # The Content-Length bound is checked before the body is read, so
-            # a client still writing may see the closed connection (a broken
-            # pipe or a reset) instead of the 413.  Both are the same refusal.
-            return
-        self.assertEqual(status, 413)
-        self.assertEqual(body["code"], "request_too_large")
+        result = self.hand_in(playground_id, commit_id, files={})
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "invalid_submission")
+        self.assertEqual(self.stored_submissions(playground_id), [])
 
 
 class RoutingTest(ServerTestCase):

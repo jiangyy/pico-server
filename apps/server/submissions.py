@@ -22,24 +22,14 @@ retry returns the original ``201`` body and a changed body conflicts.
 import json
 import re
 import unicodedata
-import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 import bundles
-import idempotency
-import permissions
-import playgrounds
 import repository as repository_module
 from pagination import Page
 
-
-# One logical create scope: the request names the Playground, the exact commit,
-# the student, and the files, so reusing a key for a different body conflicts.
-SUBMISSION_CREATE_ENDPOINT = "/api/v1/submissions"
 
 # A self-reported student name is a display string, not an identity: it is
 # bounded, trimmed, and never used for authorization.
@@ -103,10 +93,6 @@ class StoredSubmission:
 
     submission: Submission
     files: tuple
-
-
-def _now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _require_playground_id(value):
@@ -278,234 +264,6 @@ def _header_fields(line):
                 end = other_position
         fields[label] = rest[:end].strip()
     return fields
-
-
-def _require_published_commit(connection, repository, request):
-    """Fail unless the named commit is in that Playground's own history."""
-
-    row = playgrounds.get_playground(connection, request.playground_id)
-    if row is None:
-        raise UnknownPlaygroundError("playground does not exist")
-    if row.state == "stopped":
-        # An archived playground is read-only. The client may still pin
-        # to a previously installed version, but no new hand-in is
-        # accepted against it.
-        raise UnknownPlaygroundError("playground is archived")
-    if not repository_module.commit_in_playground_history(
-        repository, request.playground_id, request.playground_commit_id
-    ):
-        raise UnknownPlaygroundError("commit is not published")
-
-
-def create_submission(connection, repository, request, request_key):
-    """Create one immutable Submission, idempotently, in one transaction.
-
-    The Playground row and the published-commit check run inside the same
-    transaction as the row insert, so a submission can only ever reference
-    content this server actually publishes.  The row and the idempotency result
-    commit or roll back together, so an exact retry returns the stored ``201``
-    body and a changed body raises
-    :class:`idempotency.IdempotencyConflict`.
-    """
-
-    if type(request) is not SubmissionRequest:
-        raise InvalidSubmissionRequestError("a decoded request is required")
-
-    logical_request = {
-        "playgroundId": request.playground_id,
-        "commitId": request.playground_commit_id,
-        "student": request.student,
-        "files": dict(request.files),
-    }
-
-    def callback(business_connection):
-        _require_published_commit(business_connection, repository, request)
-
-        submission_id = uuid.uuid4().hex
-        created_at = _now()
-        business_connection.execute(
-            """
-            INSERT INTO submissions (
-                id, playground_id, playground_commit_id, student,
-                files_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                submission_id,
-                request.playground_id,
-                request.playground_commit_id,
-                request.student,
-                json.dumps(dict(request.files), ensure_ascii=False, sort_keys=True),
-                created_at,
-            ),
-        )
-        stored = Submission(
-            id=submission_id,
-            playground_id=request.playground_id,
-            playground_commit_id=request.playground_commit_id,
-            student=request.student,
-            created_at=created_at,
-        )
-        return 201, {"submission": submission_to_mapping(stored)}
-
-    status, response = idempotency.execute(
-        connection,
-        request.student,
-        SUBMISSION_CREATE_ENDPOINT,
-        request_key,
-        logical_request,
-        callback,
-    )
-    return status, response
-
-
-# --- the copy a human opens ------------------------------------------------
-#
-# The database row is the record; these files are for whoever marks the work.
-# One submission lands at::
-#
-#     <root>/<班级>/<姓名>/<playgroundId>/work/main.py
-#     <root>/<班级>/<姓名>/<playgroundId>/submission.json
-#
-# A second piece of work for the same course becomes ``<playgroundId>-2``, then
-# ``-3``.  The number is the submission's position in the record (see
-# :func:`submission_ordinal`), not a count of folders, so a replayed create lands
-# where it did the first time.
-#
-# A name with no 班级 is filed directly under ``<root>/<姓名>/``.
-#
-# The student string is the only caller-controlled part of that path, so it is
-# sanitized into safe single segments; the file paths below it are already
-# portable ``work/**`` (:func:`_normalized_work_path`), so joining them cannot
-# escape the submission directory.  Writing the same submission twice writes
-# the same bytes to the same path, which is what makes a replayed idempotent
-# retry harmless.
-
-# A name is a label, not a payload: 64 characters is more than any real one and
-# keeps the whole path inside the usual filesystem limits.
-MAX_SEGMENT_LENGTH = 64
-
-# The client files work under one display name, ``姓名（班级）``.  Splitting it
-# is presentation, not identity: a name that does not match is used as-is.
-_STUDENT_PATTERN = re.compile(r"\A(.+?)（(.+?)）\Z")
-
-MANIFEST_NAME = "submission.json"
-
-
-def _safe_segment(value):
-    """Return ``value`` as one filesystem-safe path segment (possibly empty)."""
-
-    normalized = unicodedata.normalize("NFC", value)
-    printable = "".join(
-        " " if character in "/\\\u0000" else character
-        for character in normalized
-        if character.isprintable() or character == "\u0000"
-    )
-    return " ".join(printable.split()).strip(". ")[:MAX_SEGMENT_LENGTH]
-
-
-def student_segments(student):
-    """Return ``(class_room, name)`` for a self-reported name.
-
-    ``张三（1 班）`` becomes ``("1 班", "张三")``; anything else is a bare name
-    with no class.  Both parts are sanitized, and an empty result falls back to
-    the whole string so a submission never lands in an unnamed directory.
-    """
-
-    match = _STUDENT_PATTERN.match(student)
-    if match is not None:
-        name = _safe_segment(match.group(1))
-        class_room = _safe_segment(match.group(2))
-        if name and class_room:
-            return class_room, name
-    return "", _safe_segment(student) or "student"
-
-
-def submission_ordinal(connection, student, submission_id, created_at):
-    """Return this submission's 1-based position among that student's work.
-
-    The number comes from the record, never from the filesystem: an idempotent
-    replay must land in the same folder, and counting existing directories would
-    hand it the next number instead. ``id`` breaks ties when two submissions
-    share a timestamp.
-    """
-
-    row = connection.execute(
-        """
-        SELECT COUNT(*) FROM submissions
-        WHERE student = ?
-          AND (created_at < ? OR (created_at = ? AND id <= ?))
-        """,
-        (student, created_at, created_at, submission_id),
-    ).fetchone()
-    return int(row[0]) if row is not None else 1
-
-
-def submission_directory(root, student, playground_id, ordinal):
-    """Return the directory one submission's files belong in, as a path.
-
-    One folder per handed-in course: ``<班级>/<姓名>/<playgroundId>``, and
-    ``<playgroundId>-2``, ``-3`` … for the same course handed in again.
-    """
-
-    folder = playground_id if ordinal <= 1 else f"{playground_id}-{ordinal}"
-    class_room, name = student_segments(student)
-    parts = [
-        part
-        for part in (class_room, name, _safe_segment(folder) or folder)
-        if part
-    ]
-
-    directory = Path(root)
-    for part in parts:
-        directory = directory / part
-    return directory
-
-
-def write_submission_files(
-    root,
-    submission_id,
-    student,
-    playground_id,
-    playground_commit_id,
-    created_at,
-    files,
-    ordinal=1,
-):
-    """Write one submission's files under ``root`` and return the directory.
-
-    Nothing here decides whether a submission is valid: the caller has already
-    stored the row, so these bytes are a copy of an accepted submission.  A
-    failure raises, because a record without its files is exactly the state
-    this function exists to prevent.
-    """
-
-    directory = permissions.ensure_private_directory(
-        submission_directory(root, student, playground_id, ordinal)
-    )
-
-    for path, text in files.items():
-        target = directory.joinpath(*path.split("/"))
-        permissions.ensure_private_directory(target.parent)
-        target.write_text(text, encoding="utf-8")
-        permissions.ensure_private_file(target)
-
-    manifest = {
-        "id": submission_id,
-        "playgroundId": playground_id,
-        "commitId": playground_commit_id,
-        "student": student,
-        "createdAt": created_at,
-        "ordinal": ordinal,
-        "files": sorted(files),
-    }
-    manifest_path = directory / MANIFEST_NAME
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    permissions.ensure_private_file(manifest_path)
-    return directory
 
 
 def _submission_from_row(row):
