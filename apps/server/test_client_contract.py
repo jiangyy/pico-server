@@ -33,6 +33,7 @@ from pathlib import Path
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import server as server_module  # noqa: E402
 from server import make_server  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -146,9 +147,11 @@ class ClientContractTest(unittest.TestCase):
 
     # --- the client's side ---------------------------------------------------
 
-    def client(self, step, *args):
+    def client(self, step, *args, data=None):
+        """One driver step. `data` picks which machine's local store it runs on."""
+
         result = subprocess.run(
-            [NODE, str(DRIVER), str(self.port), str(CLIENT_DIR), str(self.client_data), step, *args],
+            [NODE, str(DRIVER), str(self.port), str(CLIENT_DIR), str(data or self.client_data), step, *args],
             capture_output=True,
             text=True,
             timeout=120,
@@ -308,6 +311,105 @@ class ClientContractTest(unittest.TestCase):
         manifest = self.read_local_manifest("pg-offline", second)
         self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>second</html>")
 
+    def test_the_client_sends_no_more_events_than_the_server_accepts(self):
+        """两侧的批次上限必须一致。
+
+        The client sends a prefix of its pending queue; the server refuses a
+        *whole round* that is longer than its own cap. If the server's cap were
+        lower, every round would be a 400 — including retries of the same
+        events — and the queue could never drain: there is no per-event answer
+        to learn from, so recovering would mean surgery on `pending.json`.
+        """
+        result = subprocess.run(
+            [
+                NODE,
+                "--input-type=module",
+                "-e",
+                f'const m = await import("{CLIENT_DIR}/sync.ts");'
+                " console.log(m.MAX_EVENTS_PER_SYNC);",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        client_cap = int(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            client_cap,
+            server_module.MAX_PENDING_EVENTS,
+            "客户端一轮送多少条，必须等于服务端一轮最多收多少条",
+        )
+
+    def test_two_machines_that_wrote_offline_do_not_fork(self):
+        """两台电脑各自脱网写作业，各自联网 —— 两份都在，谁也没有分叉。
+
+        The timeline is the server's, and that is what makes this work:
+
+          * A hand-in is a *fact*, not a slot to claim. Each machine invents its
+            own `event_id` before it ever has a network, so two machines writing
+            at the same time produce two submissions, both accepted. There is no
+            "last write wins" and nothing is overwritten.
+          * Content cannot fork at all: only the operator publishes, and a
+            publish is a compare-and-swap on `base_version_id`.
+          * Neither machine's *view* diverges either. Both were pinned to the
+            same Version and both follow the same log, so they converge on the
+            same cursor and the same current Version without any reconciliation.
+
+        A hand-in written offline is accepted even though the course moved on in
+        the meantime: protocol.md §2 only asks that the Version belong to that
+        Playground's published history.
+        """
+        first = self.publish("pg-two")
+        mine = self.client_data
+        theirs = self.client_data.parent / "client-b"
+        self.client("bootstrap", data=mine)
+        self.client("bootstrap", data=theirs)
+
+        # 两台都断网，各写一份不同的（同一门课、同一版本）
+        self.write_hand_in("# 姓名：甲\nprint(1)\n", data=mine)
+        self.write_hand_in("# 姓名：乙\nprint(2)\n", data=theirs)
+        for machine, who in ((mine, "甲"), (theirs, "乙")):
+            offline = self.client_on(self.dead_port(), "submit", "pg-two", first, who, data=machine)
+            self.assertEqual(offline["pending"], 1, f"{who} 的作业必须留在自己队列里")
+
+        # 网络不在的这段时间，课程往前走了一版
+        second = self.publish(
+            "pg-two",
+            files={
+                "picopg.json": json.dumps({"schemaVersion": 1, "runtime": "python"}),
+                "course/index.html": "<html>second</html>",
+            },
+            base=first,
+        )
+        self.assertNotEqual(second, first)
+
+        # 各自联网：各送各的作业，各拉同一版
+        for machine, who in ((mine, "甲"), (theirs, "乙")):
+            after = self.client("sync", data=machine)
+            self.assertEqual(len(after["accepted"]), 1, f"{who}: {after}")
+            self.assertEqual(after["rejected"], [], who)
+            self.assertEqual(after["pending"], 0, who)
+            self.assertEqual(after["installed"], ["pg-two"], f"{who} 要把新版拉下来")
+
+        # 服务端：两份都在，各自记在自己依据的那个版本上
+        stored = self.stored_submissions("pg-two")
+        self.assertEqual(sorted(entry["student"] for entry in stored), ["乙", "甲"])
+        self.assertEqual(
+            {entry["commitId"] for entry in stored},
+            {first},
+            "两份都是按断网时那一版写的，不是当前版本",
+        )
+
+        # 两台最后站在同一个位置上（同一游标、同一当前版本）
+        positions = [self.client("sync", data=machine) for machine in (mine, theirs)]
+        self.assertEqual({position["cursor"] for position in positions}, {positions[0]["cursor"]})
+        self.assertEqual(
+            {tuple(sorted(position["active"])) for position in positions},
+            {tuple(sorted(positions[0]["active"]))},
+        )
+        self.assertEqual(self.pending_count(data=mine), 0)
+        self.assertEqual(self.pending_count(data=theirs), 0)
+
     def test_a_second_launch_only_pulls_what_it_missed(self):
         self.publish("pg-e2e")
         first = self.client("bootstrap")
@@ -357,15 +459,15 @@ class ClientContractTest(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             return probe.getsockname()[1]
 
-    def client_on(self, port, step, *args):
+    def client_on(self, port, step, *args, data=None):
         """Run one driver step against another port, expecting it to fail."""
         subprocess.run(
-            [NODE, str(DRIVER), str(port), str(CLIENT_DIR), str(self.client_data), step, *args],
+            [NODE, str(DRIVER), str(port), str(CLIENT_DIR), str(data or self.client_data), step, *args],
             capture_output=True,
             text=True,
             timeout=120,
         )
-        return {"pending": self.pending_count()}
+        return {"pending": self.pending_count(data=data)}
 
     def run_driver_expecting_failure(self, step, *args):
         subprocess.run(
@@ -377,12 +479,13 @@ class ClientContractTest(unittest.TestCase):
         # The round failed, so read the queue straight from the client's store.
         return {"pending": self.pending_count()}
 
-    def write_hand_in(self, text):
-        self.client_data.mkdir(parents=True, exist_ok=True)
-        (self.client_data / "hand-in.py").write_text(text, encoding="utf-8")
+    def write_hand_in(self, text, data=None):
+        machine = data or self.client_data
+        machine.mkdir(parents=True, exist_ok=True)
+        (machine / "hand-in.py").write_text(text, encoding="utf-8")
 
-    def pending_count(self):
-        raw = json.loads((self.client_data / "pending.json").read_text(encoding="utf-8"))
+    def pending_count(self, data=None):
+        raw = json.loads(((data or self.client_data) / "pending.json").read_text(encoding="utf-8"))
         return len(raw["events"])
 
     def restart_server(self):
