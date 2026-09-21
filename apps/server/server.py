@@ -83,6 +83,11 @@ CATALOG_PATH = "/api/v1/catalog"
 SUBMISSIONS_PATH = "/api/v1/submissions"
 SYNC_PATH = "/api/v1/sync"
 
+# protocol.md §4: every request states which protocol the client speaks. It
+# cannot travel in a payload — a catalog request has no parameters and a file
+# read is a bare GET — so it is a header, checked once before routing.
+PROTOCOL_VERSION_HEADER = "X-Protocol-Version"
+
 # One sync round may carry at most this many pending events. The body is
 # already bounded, so this only keeps a single request's per-event work (and
 # its response) proportional to what a client can legitimately have queued
@@ -333,10 +338,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, route, **kwargs):
         self._headers_sent = False
+        if not self._accepts_client_protocol(**kwargs):
+            return
         try:
             route(**kwargs)
         except Exception:
             self._handle_unexpected_failure()
+
+    def _accepts_client_protocol(self, head_only=False):
+        """Refuse a request whose protocol version this server cannot serve.
+
+        A request that does not say which protocol it speaks cannot be served
+        safely — the answer would be interpreted under an unknown contract —
+        so it is a malformed request. A version below the oldest this server
+        still speaks gets ``426``, which is a refusal the client can turn into
+        "upgrade me" instead of a silently wrong result.
+
+        ``/healthz`` is exempt: a probe is not a client and has no protocol.
+        """
+        if not urlsplit(self.path).path.startswith("/api/v1/"):
+            return True
+
+        raw = self.headers.get(PROTOCOL_VERSION_HEADER)
+        version = raw.strip() if raw is not None else ""
+        if not version.isascii() or not version.isdigit():
+            self._api_error(400, "invalid_request", head_only=head_only)
+            return False
+        if int(version) < events_types.MINIMUM_CLIENT_PROTOCOL_VERSION:
+            self._api_error(426, "client_too_old", head_only=head_only)
+            return False
+        return True
 
     def _handle_unexpected_failure(self):
         """Turn an unexpected route exception into one bounded response.

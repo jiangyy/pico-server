@@ -6,6 +6,10 @@
 
 ## 对外接口
 
+`/api/v1/` 下的每个请求都必须带 `X-Protocol-Version` 头（protocol.md §4）：
+没有则 `400`，低于 Server 能服务的最低版本则 `426 client_too_old`。
+`/healthz` 不需要。头里放不下 payload——目录请求没有参数，读一个文件只是 `GET`。
+
 只读，匿名：
 
 | 方法 | 路径 | 返回 |

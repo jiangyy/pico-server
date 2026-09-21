@@ -87,7 +87,11 @@ class ClientContractTest(unittest.TestCase):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             data=body,
-            headers={"Authorization": f"Bearer {OPERATOR_TOKEN}", **(headers or {})},
+            headers={
+                "Authorization": f"Bearer {OPERATOR_TOKEN}",
+                "X-Protocol-Version": "1",
+                **(headers or {}),
+            },
             method=method,
         )
         try:

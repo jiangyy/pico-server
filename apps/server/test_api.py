@@ -23,6 +23,7 @@ from pathlib import Path
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from events_types import PROTOCOL_VERSION  # noqa: E402
 from server import make_server  # noqa: E402
 
 OPERATOR_TOKEN = "test-operator-token-value"
@@ -67,7 +68,9 @@ class ServerTestCase(unittest.TestCase):
         content_type="application/json",
         extra_headers=None,
     ):
-        headers = {}
+        # protocol.md §4: every API request states its protocol version, so
+        # the shared helper sends it unless a test deliberately omits it.
+        headers = {"X-Protocol-Version": str(PROTOCOL_VERSION)}
         body = raw_body
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
@@ -76,7 +79,11 @@ class ServerTestCase(unittest.TestCase):
             headers["Content-Type"] = content_type
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
-        headers.update(extra_headers or {})
+        for name, value in (extra_headers or {}).items():
+            if value is None:
+                headers.pop(name, None)
+            else:
+                headers[name] = value
 
         connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request(method, path, body=body, headers=headers)
@@ -492,6 +499,55 @@ class SubmissionTest(ServerTestCase):
         self.assertEqual(result["status"], "rejected")
         self.assertEqual(result["reason"], "invalid_submission")
         self.assertEqual(self.stored_submissions(playground_id), [])
+
+
+class ProtocolVersionTest(ServerTestCase):
+    """Requests must say which protocol they speak (protocol.md §4)."""
+
+    def test_a_request_without_the_header_is_refused(self):
+        for path in ("/api/v1/catalog", "/api/v1/sync", "/api/v1/submissions"):
+            with self.subTest(path=path):
+                status, _, body = self.request(
+                    "GET", path, extra_headers={"X-Protocol-Version": ""}
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["code"], "invalid_request")
+
+    def test_a_non_numeric_protocol_version_is_refused(self):
+        # "²" is the one that matters: it is a Latin-1 digit that `int()`
+        # rejects, so a plain `isdigit()` check would raise instead of refuse.
+        # (Non-Latin-1 digits cannot even be sent as an HTTP header.)
+        for raw in ("one", "1.0", "+1", "²", "1 2"):
+            with self.subTest(raw=raw):
+                status, _, body = self.request(
+                    "GET", "/api/v1/catalog",
+                    extra_headers={"X-Protocol-Version": raw},
+                )
+                self.assertEqual(status, 400, raw)
+                self.assertEqual(body["code"], "invalid_request")
+
+    def test_a_version_below_the_server_minimum_is_refused_with_426(self):
+        # The client can turn this into "upgrade me" instead of mis-reading a
+        # response it cannot understand.
+        self.seed()
+        status, _, body = self.request(
+            "GET", "/api/v1/catalog", extra_headers={"X-Protocol-Version": "0"}
+        )
+        self.assertEqual(status, 426)
+        self.assertEqual(body["code"], "client_too_old")
+
+    def test_a_newer_client_is_served(self):
+        # protocol evolution tolerates a server that is behind the client.
+        self.seed()
+        status, _, _ = self.request(
+            "GET", "/api/v1/catalog", extra_headers={"X-Protocol-Version": "99"}
+        )
+        self.assertEqual(status, 200)
+
+    def test_health_is_exempt(self):
+        # A probe is not a client and has no protocol.
+        status, _, body = self.request("GET", "/healthz", extra_headers={"X-Protocol-Version": None})
+        self.assertEqual(status, 200)
 
 
 class RoutingTest(ServerTestCase):
