@@ -528,7 +528,9 @@ class PreparedVersion:
     no_op: bool
 
 
-def publish_playground_prepare(repository, playground_id, bundle, metadata, event_id):
+def publish_playground_prepare(
+    repository, playground_id, bundle, metadata, event_id, observed_version_id=None
+):
     """Prepare a Version for ``playground_id`` and protect it from the GC.
 
     Phase one of three (protocol.md §2). Nothing here reads the database and
@@ -536,14 +538,22 @@ def publish_playground_prepare(repository, playground_id, bundle, metadata, even
     ``refs/picopg/pending/<event_id>`` on it so the garbage collector cannot
     take bytes the database has not ruled on yet, and returns.
 
-    The parent is the commit the current history ref points at — the last
-    Version that *was* accepted. A concurrent publish therefore forks, and the
-    database's compare-and-swap decides which side survives; the loser's commit
-    becomes unreachable once its pending ref is dropped.
+    The parent is the Version the *application* says is current —
+    protocol.md §2's ``observed_version_id`` — and only falls back to the history
+    ref for a Playground that has no Version yet. The ref is a reachability root,
+    not an addressing mechanism (protocol.md §3), and it lags the database
+    between the database's commit and Finalize: a publish that chained onto a
+    lagging ref would leave the Version the database had just accepted out of the
+    history, unreachable and no longer readable by the clients pinned to it. It
+    also makes ``no_op`` answer about the right Version.
 
-    ``no_op`` means the tree is already the one at the history ref, so no commit
-    and no pending ref are created. ``event_id`` must be an id the caller also
-    gives to the Event it will record, because recovery matches the two up.
+    A concurrent publish therefore forks, and the database's compare-and-swap
+    decides which side survives; the loser's commit becomes unreachable once its
+    pending ref is dropped.
+
+    ``no_op`` means the tree is already the one at the observed Version, so no
+    commit and no pending ref are created. ``event_id`` must be an id the caller
+    also gives to the Event it will record, because recovery matches the two up.
     """
 
     if not isinstance(repository, Repository):
@@ -558,7 +568,12 @@ def publish_playground_prepare(repository, playground_id, bundle, metadata, even
     files = _snapshot_bundle(bundle)
     tree = _bundle_tree(files)
 
-    head = _resolve_head(repository, ref)
+    if observed_version_id is not None:
+        head = resolve_commit(repository, observed_version_id)
+        if head is None:
+            raise RepositoryError("observed version is not a commit")
+    else:
+        head = _resolve_head(repository, ref)
     head_tree = _commit_tree_id(repository, head) if head is not None else None
 
     new_tree_id = _write_bundle_tree(repository, tree)

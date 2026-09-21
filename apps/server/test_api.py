@@ -31,6 +31,7 @@ from unittest import mock  # noqa: E402
 
 import bundles  # noqa: E402
 import playgrounds  # noqa: E402
+from repository import RepositoryError  # noqa: E402
 import repository  # noqa: E402
 import server as server_module  # noqa: E402
 from server import make_server  # noqa: E402
@@ -419,6 +420,97 @@ class PublishBaseTest(ServerTestCase):
         self.assertEqual(self.publish(playground_id, key="same-key", base=False)[0], 400)
         status, _, _ = self.publish(playground_id, key="same-key", base=version_id)
         self.assertEqual(status, 201)
+
+
+class PublishAfterLostFinalizeTest(ServerTestCase):
+    """Finalize 失败之后还能继续发布，且历史不断链。
+
+    Finalize 是"尽力而为"的：数据库提交后它失败不会让请求失败（接受已经发生）。
+    于是下一轮的发布是在"ref 落后数据库"的状态下开始的 —— 此时父提交必须取数据库
+    说的当前版本，不能取 ref。取了 ref 就会让数据库刚刚接受的那个 Version 掉出
+    历史：钉在它上面的客户端会 404，它的字节也可以被 GC 收走。
+    """
+
+    def publish_after_lost_finalize(self, name):
+        """Two publishes where the second one's Finalize fails.
+
+        The class shares one server, so each test names its own Playground (and
+        its own idempotency keys): reusing a key with a different bundle is a
+        `409 idempotency_conflict` by design.
+        """
+        self.create_playground(name)
+        _, _, first = self.publish(name, archive=self.build_zip(), key=f"{name}-1")
+
+        with mock.patch.object(
+            server_module, "converge_history_ref", side_effect=RepositoryError("simulated")
+        ):
+            _, _, second = self.publish(
+                name,
+                archive=self.variant_zip(b"two"),
+                key=f"{name}-2",
+                base=first["version_id"],
+            )
+        self.assertEqual(second["status"], "accepted")
+
+        # 数据库认了第二个，ref 还停在第一个
+        self.assertEqual(self.current_version(name), second["version_id"])
+        self.assertNotEqual(
+            self.head(name), second["version_id"], "这次 Finalize 就是要失败"
+        )
+        return first["version_id"], second["version_id"]
+
+    def head(self, playground_id):
+        completed = subprocess.run(
+            ["git", "-C", str(self.server.repository_path), "rev-parse", "--verify", "--quiet",
+             f"refs/picopg/history/{playground_id}"],
+            capture_output=True, text=True,
+        )
+        return completed.stdout.strip() or None
+
+    def test_the_next_publish_chains_onto_the_version_the_database_accepted(self):
+        name = "chain-chains"
+        first, second = self.publish_after_lost_finalize(name)
+
+        # 第三次发布基于数据库说的当前版本
+        _, _, third = self.publish(
+            name,
+            archive=self.variant_zip(b"three"),
+            key=f"{name}-3",
+            base=second,
+        )
+        self.assertEqual(third["status"], "accepted")
+        self.assertEqual(self.head(name), third["version_id"])
+
+        # 中间那个版本仍在历史里：钉在它上面的客户端还能读到它的文件
+        for version_id in (first, second, third["version_id"]):
+            with self.subTest(version=version_id[:8]):
+                self.assertEqual(
+                    self.request(
+                        "GET",
+                        f"/api/v1/playgrounds/{name}/versions/{version_id}/manifest",
+                    )[0],
+                    200,
+                )
+
+    def test_no_op_answers_about_the_current_version(self):
+        # 同一个坑的另一面：no_op 返回的 version_id 必须是**当前**那个 Version
+        # （protocol.md §3），不能是 ref 上落后的那个。
+        name = "chain-noop"
+        _, second = self.publish_after_lost_finalize(name)
+
+        _, _, third = self.publish(
+            name,
+            archive=self.variant_zip(b"three"),
+            key=f"{name}-3",
+            base=second,
+        )
+        _, _, again = self.publish(
+            name,
+            archive=self.variant_zip(b"three"),
+            key=f"{name}-4",
+            base=third["version_id"],
+        )
+        self.assertEqual(again, {"status": "no_op", "version_id": third["version_id"]})
 
 
 class VersionReadPathTest(ServerTestCase):

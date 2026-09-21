@@ -192,6 +192,19 @@ def commit_prepared_version(
     )
 
 
+def observed_version(row):
+    """The Version the database says is current for this Playground, if any.
+
+    What protocol.md §2 calls ``observed_version_id``: the Version a publish has
+    to be built on, as opposed to whatever the history ref happens to point at.
+    ``None`` means there is nothing to build on — the first publish of an id.
+    """
+
+    if row is None:
+        return None
+    return row["current_version_id"] or None
+
+
 def _create_from_prepared(connection, playground_id, prepared, base_version_id):
     """Create the Playground row for the first Version ever published to it.
 
@@ -241,10 +254,15 @@ def publish_playground(
     keeps the phases in the order protocol.md §2 requires.
     """
 
-    require_publishable(connection, playground_id, base_version_id)
+    row = require_publishable(connection, playground_id, base_version_id)
     event_id = uuid4().hex
     prepared = _repository.publish_playground_prepare(
-        repository, playground_id, bundle, metadata, event_id
+        repository,
+        playground_id,
+        bundle,
+        metadata,
+        event_id,
+        observed_version_id=observed_version(row),
     )
 
     try:

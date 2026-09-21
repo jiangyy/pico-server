@@ -49,6 +49,7 @@ from playgrounds import (
     commit_prepared_version,
     create_playground,
     get_playground,
+    observed_version,
     record_archive_event,
     recover_pending_refs,
     require_publishable,
@@ -656,9 +657,15 @@ class Handler(ApiHandler):
         prepared = None
         try:
             with self._database() as connection:
-                require_publishable(connection, playground_id, base_version_id)
+                row = require_publishable(connection, playground_id, base_version_id)
+                observed_version_id = observed_version(row)
             prepared = publish_playground_prepare(
-                handle, playground_id, bundle, _commit_metadata(), event_id
+                handle,
+                playground_id,
+                bundle,
+                _commit_metadata(),
+                event_id,
+                observed_version_id,
             )
         except InvalidRequestError:
             self._api_error(400, "invalid_request")
