@@ -25,11 +25,18 @@ class EventEnvelopeTests(unittest.TestCase):
         back = EventEnvelope.from_json(text)
         self.assertEqual(back, envelope)
 
-    def test_from_json_rejects_unknown_kind(self):
+    def test_from_json_keeps_an_unknown_kind_structurally_valid(self):
+        # protocol.md makes a kind an open string: an unknown one is a
+        # well-formed event the sync engine rejects per event, not a
+        # malformed request.
+        envelope = EventEnvelope.from_json(
+            json.dumps({"event_id": "e", "kind": "made_up", "payload": {}})
+        )
+        self.assertEqual(envelope.kind, "made_up")
+
+    def test_from_json_rejects_a_missing_kind(self):
         with self.assertRaises(ValueError):
-            EventEnvelope.from_json(
-                json.dumps({"event_id": "e", "kind": "made_up", "payload": {}})
-            )
+            EventEnvelope.from_json(json.dumps({"event_id": "e", "payload": {}}))
 
     def test_from_json_rejects_missing_payload(self):
         with self.assertRaises(ValueError):

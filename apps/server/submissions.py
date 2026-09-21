@@ -213,6 +213,73 @@ def decode_submission_request(payload):
     )
 
 
+# The one file a hand-in is required to carry its attribution in. The client
+# writes the student's own header line there, so the handed-in bytes are the
+# only copy of the name — there is no second one in the request.
+ATTRIBUTION_PATH = "work/main.py"
+
+#: The label pairs the header line knows, in the order they are documented.
+_HEADER_LABELS = ("姓名", "班级")
+
+
+def student_from_files(files):
+    """Read the student name out of a hand-in's own header line.
+
+    A submitted file set carries its attribution in ``work/main.py``: the
+    first non-blank line is ``# 姓名：<name> 班级：<class>`` (the class part is
+    optional). The returned value is the display name the record is filed
+    under — ``<name>（<class>）`` when a class is present, ``<name>`` alone
+    otherwise.
+
+    Returns ``None`` when there is no usable header, so the caller can refuse
+    the hand-in. Raises :class:`InvalidSubmissionRequestError` when a header
+    is present but the name it produces is not a valid student string.
+    """
+
+    if type(files) is not dict:
+        return None
+    text = files.get(ATTRIBUTION_PATH)
+    if type(text) is not str:
+        return None
+
+    line = next((line for line in text.split("\n") if line.strip()), "")
+    fields = _header_fields(line)
+    name = fields.get("姓名", "")
+    if not name:
+        return None
+
+    class_room = fields.get("班级", "")
+    candidate = name if not class_room else f"{name}（{class_room}）"
+    try:
+        return _require_student(candidate)
+    except InvalidSubmissionRequestError:
+        return None
+
+
+def _header_fields(line):
+    """Every ``标签：值`` pair on a header line.
+
+    A value ends at the next label marker of any kind, so ``班级`` before
+    ``姓名`` reads the same as the documented order.
+    """
+
+    markers = tuple(f"{label}：" for label in _HEADER_LABELS)
+    fields = {}
+    for label in _HEADER_LABELS:
+        marker = f"{label}："
+        position = line.find(marker)
+        if position < 0:
+            continue
+        rest = line[position + len(marker):]
+        end = len(rest)
+        for other in markers:
+            other_position = rest.find(other)
+            if 0 <= other_position < end:
+                end = other_position
+        fields[label] = rest[:end].strip()
+    return fields
+
+
 def _require_published_commit(connection, repository, request):
     """Fail unless the named commit is in that Playground's own history."""
 

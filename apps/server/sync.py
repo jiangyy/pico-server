@@ -8,32 +8,36 @@ A request carries:
 
 The engine processes pending events in the order they were submitted.
 Each one is either replayed (the ``event_id`` already exists in the
-events table, so the stored result is returned unchanged) or accepted
-through a per-kind handler. The handler decides whether to write a
-content log entry, update playground state, or both. After all pending
-events are settled, the engine reads every content log entry whose seq
-is greater than ``after_seq`` and bundles them with the matched
-results and the new ``upto_seq``.
+events table, so the stored result is returned unchanged) or handled by
+the per-kind handler bound to that kind. After all pending events are
+settled, the engine reads every content log entry whose seq is greater
+than ``after_seq`` and bundles them with the matched results and the new
+``upto_seq``.
 
-The engine never writes on its own: the per-kind handlers are the only
-callers of ``events.accept_event`` and ``events.append_content_log``,
-and they run inside the same transaction the engine opens. A handler
-that raises aborts the whole round — no event is half-accepted.
+The engine owns the round's transaction and delegates every write to the
+handlers, which run inside it. A handler that raises :class:`EventRejected`
+records a rejection and moves on; any other exception aborts the whole
+round, so no event is half-applied.
+
+An unknown ``kind`` is not an error. protocol.md makes a kind an open
+string, so an event this server does not understand is rejected per event
+(``unknown_kind``) and the rest of the round still runs. The rejection is
+not persisted: it is a deterministic answer to a request this server will
+never interpret, so a retry recomputes it from the same bytes.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from typing import Callable, Mapping
+from typing import Callable
 
 import events
 import events_types
 
 
-# A handler returns the JSON body to store as the event's response.
-# Raising rejects the event: the engine records the rejection with the
-# raised value's ``reason`` attribute.
 class EventRejected(Exception):
+    """A handler's refusal of one event, carrying a stable reason code."""
+
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
@@ -52,12 +56,9 @@ def process_sync(
 ):
     """Process one sync round and return a :class:`SyncResponse`.
 
-    ``submit_handler``, ``publish_handler`` and ``archive_handler`` are
-    the per-kind handlers. Each is called with ``(connection,
-    envelope)`` and returns the JSON body that should be replayed on a
-    retry. A handler that raises :class:`EventRejected` produces a
-    rejected ``EventResult`` for that event without affecting the rest
-    of the round.
+    Each handler is called with ``(connection, envelope)`` and returns the
+    JSON body to replay on a retry. Raising :class:`EventRejected` rejects
+    that one event with the raised reason.
     """
     handlers = {
         events_types.EVENT_KIND_SUBMIT_CODE: submit_handler,
@@ -66,13 +67,12 @@ def process_sync(
     }
 
     event_results = []
-    inserted_events = []
 
     with connection:  # one transaction for the whole round
         for envelope in request.pending_events:
             stored = events.read_event(connection, envelope.event_id)
             if stored is not None:
-                _kind, status, reason, response_json = stored
+                _kind, status, reason, _response_json = stored
                 event_results.append(
                     events_types.EventResult(
                         event_id=envelope.event_id,
@@ -126,7 +126,6 @@ def process_sync(
                     status="accepted",
                 )
             )
-            inserted_events.append(envelope)
 
     entries = events.read_content_log(connection, request.after_seq)
     upto_seq = events.current_upto_seq(connection)

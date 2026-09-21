@@ -74,6 +74,42 @@ class SubmissionTestBase(unittest.TestCase):
         )
 
 
+class StudentFromFilesTest(unittest.TestCase):
+    """The attributed header a hand-in carries in ``work/main.py``.
+
+    This is the only place a student name exists on the sync path: the
+    protocol's ``submit_code`` payload has no ``student`` field, so the
+    server reads the attribution out of the bytes the student wrote.
+    """
+
+    def student(self, line):
+        return submissions.student_from_files({"work/main.py": f"{line}\nprint(1)\n"})
+
+    def test_a_filled_header_names_the_student(self):
+        self.assertEqual(self.student("# 姓名：张三"), "张三")
+        self.assertEqual(self.student("# 姓名：张三 班级：1 班"), "张三（1 班）")
+
+    def test_the_labels_may_appear_in_any_order(self):
+        self.assertEqual(
+            self.student("# 班级：1 班 姓名：张三"), "张三（1 班）"
+        )
+
+    def test_the_header_may_sit_under_blank_lines(self):
+        self.assertEqual(self.student("\n\n# 姓名：张三"), "张三")
+
+    def test_no_header_is_not_a_student(self):
+        self.assertIsNone(self.student("print(1)"))
+        self.assertIsNone(self.student("# 姓名："))
+        self.assertIsNone(
+            submissions.student_from_files({"work/other.py": "# 姓名：张三"})
+        )
+        self.assertIsNone(submissions.student_from_files({}))
+        self.assertIsNone(submissions.student_from_files(None))
+
+    def test_an_unusable_name_is_not_a_student(self):
+        self.assertIsNone(self.student("# 姓名：" + "a" * 200))
+
+
 class DecodeSubmissionTest(SubmissionTestBase):
     """What a request body must look like before anything is stored."""
 

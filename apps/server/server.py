@@ -23,6 +23,8 @@ import events_types
 import manifests
 import pagination
 import permissions
+import sync
+import sync_handlers
 from bundles import (
     MAX_ARCHIVE_BYTES,
     MAX_TOTAL_BYTES,
@@ -86,6 +88,13 @@ FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
 CATALOG_PATH = "/api/v1/catalog"
 SUBMISSIONS_PATH = "/api/v1/submissions"
+SYNC_PATH = "/api/v1/sync"
+
+# One sync round may carry at most this many pending events. The body is
+# already bounded, so this only keeps a single request's per-event work (and
+# its response) proportional to what a client can legitimately have queued
+# offline.
+MAX_PENDING_EVENTS = 100
 
 # The idempotency scope of the single operator that publishes bundles.  A
 # submission uses the self-reported student name instead, so two students can
@@ -210,6 +219,8 @@ def _allowed_methods(path):
         return ALLOWED_METHODS
     if path == SUBMISSIONS_PATH:
         return ALLOWED_METHODS
+    if path == SYNC_PATH:
+        return ("POST",)
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
     if _match_playground(path) is not None:
@@ -223,6 +234,36 @@ def _allowed_methods(path):
     if _match_submission(path) is not None:
         return ALLOWED_METHODS
     return None
+
+
+def _decode_sync_request(payload):
+    """Parse and validate a ``SyncRequest`` body.
+
+    Returns the request, or ``None`` when the body is malformed. Unknown
+    *fields* are ignored, as protocol.md requires; an unknown event *kind* is
+    not malformed, so it is left for the engine to reject per event.
+    """
+
+    if type(payload) is not dict:
+        return None
+    pending = payload.get("pending_events")
+    after_seq = payload.get("after_seq")
+    if type(pending) is not list:
+        return None
+    if type(after_seq) is not int or after_seq < 0:
+        return None
+    if len(pending) > MAX_PENDING_EVENTS:
+        return None
+
+    envelopes = []
+    for entry in pending:
+        try:
+            envelopes.append(events_types.EventEnvelope.from_mapping(entry))
+        except ValueError:
+            return None
+    return events_types.SyncRequest(
+        pending_events=tuple(envelopes), after_seq=after_seq
+    )
 
 
 def _bundle_request(playground_id, bundle):
@@ -357,10 +398,48 @@ class Handler(BaseHTTPRequestHandler):
             self._post_playground_commit(_match_playground_commit(path))
         elif path == SUBMISSIONS_PATH:
             self._post_submission()
+        elif path == SYNC_PATH:
+            self._post_sync()
         elif _allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
+
+    def _post_sync(self):
+        """Process one ``SyncRequest`` and return a ``SyncResponse``.
+
+        Pending events are matched against the events table by ``event_id``
+        (a replay returns the stored result) and handed to the per-kind
+        handler otherwise. The response carries those results, every content
+        log entry the client has not yet seen, the new cursor and the two
+        protocol-negotiation fields.
+        """
+        payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
+        if payload is None:
+            return
+
+        request = _decode_sync_request(payload)
+        if request is None:
+            self._api_error(400, "invalid_request")
+            return
+
+        repository = self.server.repository
+        try:
+            with self._database() as connection:
+                response = sync.process_sync(
+                    connection,
+                    request,
+                    submit_handler=lambda connection, envelope: sync_handlers.submit_handler(
+                        connection, envelope, repository=repository
+                    ),
+                    publish_handler=sync_handlers.publish_handler,
+                    archive_handler=sync_handlers.archive_handler,
+                )
+        except ValueError:
+            self._api_error(400, "invalid_request")
+            return
+
+        self._respond_json(200, json.loads(response.to_json()))
 
     def _route_delete(self):
         path = urlsplit(self.path).path

@@ -57,8 +57,15 @@ class EventEnvelope:
         )
 
     @staticmethod
-    def from_json(text: str) -> "EventEnvelope":
-        value = json.loads(text)
+    def from_mapping(value: Any) -> "EventEnvelope":
+        """Build an envelope from a decoded JSON value.
+
+        Structural validation only: an ``event_id``, a ``kind`` and an object
+        ``payload`` are required. The ``kind`` is deliberately **not** checked
+        against a closed set — protocol.md says a kind is an open string, so an
+        unknown one is a well-formed event the sync engine rejects per event
+        (``unknown_kind``) rather than a malformed request.
+        """
         if not isinstance(value, dict):
             raise ValueError("event envelope is not a JSON object")
         event_id = value.get("event_id")
@@ -66,11 +73,15 @@ class EventEnvelope:
         payload = value.get("payload")
         if not isinstance(event_id, str) or not event_id:
             raise ValueError("event_id is missing or not a non-empty string")
-        if not isinstance(kind, str) or kind not in EVENT_KINDS:
-            raise ValueError(f"event kind is not one of {sorted(EVENT_KINDS)}: {kind!r}")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("event kind is missing or not a non-empty string")
         if not isinstance(payload, dict):
             raise ValueError("event payload is not a JSON object")
         return EventEnvelope(event_id=event_id, kind=kind, payload=payload)
+
+    @staticmethod
+    def from_json(text: str) -> "EventEnvelope":
+        return EventEnvelope.from_mapping(json.loads(text))
 
 
 @dataclass(frozen=True)
