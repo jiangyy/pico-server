@@ -56,7 +56,7 @@ class OpenDatabaseTest(unittest.TestCase):
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        self.assertEqual(versions, [1])
+        self.assertEqual(versions, [1, SCHEMA_VERSION])
 
     def test_foreign_keys_are_enforced(self):
         connection = open_database(self.path)

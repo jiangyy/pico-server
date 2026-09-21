@@ -7,7 +7,7 @@ from pathlib import Path
 import permissions
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaValidationError(RuntimeError):
@@ -43,6 +43,8 @@ _TABLE_COLUMNS = {
     "playgrounds": {
         "id": (1, 0),
         "created_at": (0, 1),
+        "state": (0, 1),
+        "current_version_id": (0, 1),
     },
     "idempotency_results": {
         "scope": (1, 1),
@@ -52,6 +54,21 @@ _TABLE_COLUMNS = {
         "response_status": (0, 1),
         "response_json": (0, 1),
         "created_at": (0, 1),
+    },
+    "events": {
+        "event_id": (1, 1),
+        "kind": (0, 1),
+        "payload": (0, 1),
+        "status": (0, 1),
+        "reason": (0, 1),
+        "response_json": (0, 1),
+        "created_at": (0, 1),
+    },
+    "content_log": {
+        "seq": (1, 1),
+        "event_id": (0, 1),
+        "kind": (0, 1),
+        "payload": (0, 1),
     },
     "submissions": {
         "id": (1, 1),
@@ -75,6 +92,8 @@ _REQUIRED_INDEXES = {
         "idempotency_results",
         ("created_at",),
     ),
+    "events_kind_created_at_idx": ("events", ("kind", "created_at")),
+    "content_log_kind_idx": ("content_log", ("kind",)),
     "submissions_playground_idx": (
         "submissions",
         ("playground_id", "created_at"),
@@ -192,6 +211,59 @@ def _initialize_schema(connection):
                 "ON submissions(playground_id, created_at)"
             )
             _record_migration(connection, 1)
+
+        if version < 2:
+            # `state` was not tracked in v1; a playground's active/stopped
+            # state was implied by the existence of its Git ref. The default
+            # 'active' matches the v1 behaviour for every existing row.
+            connection.execute(
+                "ALTER TABLE playgrounds ADD COLUMN state TEXT NOT NULL "
+                "DEFAULT 'active' CHECK (state IN ('active', 'stopped'))"
+            )
+            # `current_version_id` was derived from Git in v1. Leave the
+            # column empty for legacy rows; callers fall back to the ref
+            # when the column is empty, then back-fill it on the next publish.
+            connection.execute(
+                "ALTER TABLE playgrounds ADD COLUMN current_version_id TEXT "
+                "NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY NOT NULL
+                        CHECK (event_id <> '' AND length(event_id) <= 64),
+                    kind TEXT NOT NULL
+                        CHECK (kind IN ('submit_code', 'publish_playground', 'archive_playground')),
+                    payload TEXT NOT NULL CHECK (payload <> ''),
+                    status TEXT NOT NULL
+                        CHECK (status IN ('accepted', 'rejected')),
+                    reason TEXT NOT NULL DEFAULT '',
+                    response_json TEXT NOT NULL CHECK (response_json <> ''),
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX events_kind_created_at_idx "
+                "ON events(kind, created_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE content_log (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE
+                        REFERENCES events(event_id) ON DELETE RESTRICT,
+                    kind TEXT NOT NULL
+                        CHECK (kind IN ('publish_playground', 'archive_playground')),
+                    payload TEXT NOT NULL CHECK (payload <> '')
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX content_log_kind_idx "
+                "ON content_log(kind)"
+            )
+            _record_migration(connection, 2)
 
         validate_schema(connection)
 
