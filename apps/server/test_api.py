@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from events_types import PROTOCOL_VERSION  # noqa: E402
 from unittest import mock  # noqa: E402
 
+import bundles  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
 import server as server_module  # noqa: E402
@@ -418,6 +419,95 @@ class PublishBaseTest(ServerTestCase):
         self.assertEqual(self.publish(playground_id, key="same-key", base=False)[0], 400)
         status, _, _ = self.publish(playground_id, key="same-key", base=version_id)
         self.assertEqual(status, 201)
+
+
+class VersionReadPathTest(ServerTestCase):
+    """protocol.md §3 Read Version：读 Version 只认 version_id，不认 ref。
+
+    所以中间版本、被覆盖的版本、以及已经下线的 Playground 的历史都仍然可读 ——
+    可达性由 ref 保证，但寻址与它无关。
+    """
+
+    def manifest_status(self, playground_id, version_id):
+        return self.request(
+            "GET",
+            f"/api/v1/playgrounds/{playground_id}/versions/{version_id}/manifest",
+        )[0]
+
+    def test_every_version_ever_published_stays_readable(self):
+        self.create_playground("history")
+        _, _, first = self.publish("history", archive=self.build_zip(), key="h-1")
+        _, _, second = self.publish(
+            "history",
+            archive=self.variant_zip(b"two"),
+            key="h-2",
+            base=first["version_id"],
+        )
+        _, _, third = self.publish(
+            "history",
+            archive=self.variant_zip(b"three"),
+            key="h-3",
+            base=second["version_id"],
+        )
+
+        for version_id in (first["version_id"], second["version_id"], third["version_id"]):
+            with self.subTest(version=version_id[:8]):
+                self.assertEqual(self.manifest_status("history", version_id), 200)
+
+    def test_an_archived_playground_still_serves_its_history(self):
+        # Archive 只改 state：客户端可能正钉在某个 Version 上，它的字节必须还在。
+        self.create_playground("gone")
+        _, _, published = self.publish("gone", archive=self.build_zip(), key="g-1")
+        self.assertEqual(self.retire("gone")[0], 200)
+
+        self.assertEqual(self.manifest_status("gone", published["version_id"]), 200)
+        file_status, _, body = self.request(
+            "GET",
+            f"/api/v1/playgrounds/gone/versions/{published['version_id']}/files/picopg.json",
+        )
+        self.assertEqual(file_status, 200)
+        # The request helper decodes JSON bodies; this file is JSON.
+        self.assertEqual(body, json.loads(MANIFEST))
+
+    def test_a_version_that_was_never_accepted_is_not_readable(self):
+        # Prepare 出来的 commit 没有进过数据库：它属于"可以被 GC 收走"的那一类。
+        self.create_playground("never")
+        _, _, first = self.publish("never", archive=self.build_zip(), key="n-1")
+        unaccepted = bundles.validate_bundle(
+            [
+                bundles.BundleEntry("picopg.json", MANIFEST),
+                bundles.BundleEntry("course/index.html", b"<html>unaccepted</html>"),
+            ]
+        )
+        prepared = repository.publish_playground_prepare(
+            self.server.repository,
+            "never",
+            unaccepted,
+            repository.CommitMetadata(
+                name="PicoPG Operator",
+                email="operator@picopg.invalid",
+                timestamp="2026-01-01T00:00:00.000000Z",
+                message="Publish playground bundle",
+            ),
+            "evt-never-accepted",
+        )
+        self.assertNotEqual(prepared.commit_id, first["version_id"])
+
+        self.assertEqual(self.manifest_status("never", prepared.commit_id), 404)
+        self.assertEqual(self.manifest_status("never", first["version_id"]), 200)
+
+        # And start-up recovery sweeps it: it was never accepted, so nothing
+        # converges and only the pending ref goes away.
+        dropped, converged = playgrounds.recover_pending_refs(
+            self.recovery_connection(), self.server.repository
+        )
+        self.assertEqual((dropped, converged), (1, 0))
+
+    def recovery_connection(self):
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        return connection
 
 
 class PublishCreatesPlaygroundTest(ServerTestCase):

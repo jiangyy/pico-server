@@ -213,6 +213,39 @@ class ClientContractTest(unittest.TestCase):
         after = self.client("sync")
         self.assertEqual(after["active"], ["pg-e2e"])
 
+    def test_a_restored_course_comes_back_to_the_client(self):
+        """Restore reaches a client as an ordinary publish.
+
+        There is no "restored" kind: the server emits ``publish_playground`` for
+        the Version it puts back, which is a shape every client already handles
+        (install that Version, put it back in the active set). A new kind would
+        be dropped as unknown by §4 and the course would never return.
+        """
+        version_id = self.publish("pg-e2e")
+        self.client("bootstrap")
+
+        status, _ = self.operator("DELETE", "/api/v1/playgrounds/pg-e2e")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.client("sync")["active"], [])
+
+        status, body = self.operator("POST", "/api/v1/playgrounds/pg-e2e/restore")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {"status": "accepted"})
+
+        after = self.client("sync")
+        self.assertEqual(after["installed"], ["pg-e2e"], "恢复必须真的把它装回来")
+        self.assertEqual(after["active"], ["pg-e2e"])
+        # 内容就是原来那个 Version，不是新造的
+        manifest = self.read_local_manifest("pg-e2e", version_id)
+        self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>hello</html>")
+
+        # 幂等：再来一次是 no_op，客户端也不会看到第二个事件
+        self.assertEqual(
+            self.operator("POST", "/api/v1/playgrounds/pg-e2e/restore")[1],
+            {"status": "no_op"},
+        )
+        self.assertEqual(self.client("sync")["installed"], [])
+
     def test_a_second_launch_only_pulls_what_it_missed(self):
         self.publish("pg-e2e")
         first = self.client("bootstrap")
