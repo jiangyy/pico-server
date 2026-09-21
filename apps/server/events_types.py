@@ -154,8 +154,10 @@ class SyncResponse:
 REASON_PLAYGROUND_STOPPED = "playground_stopped"
 REASON_INVALID_VERSION = "invalid_version"
 REASON_INVALID_SUBMISSION = "invalid_submission"
+# Reserved by protocol.md: an event id reused with different content. Nothing
+# produces it — an event id is replayed from storage whatever its payload, which
+# is the whole point of the id — so it stays named rather than re-invented.
 REASON_EVENT_CONFLICT = "event_conflict"
 REASON_PLAYGROUND_NOT_FOUND = "playground_not_found"
 REASON_INVALID_EVENT = "invalid_event"
 REASON_UNKNOWN_KIND = "unknown_kind"
-REASON_INCOMPATIBLE_SERVER = "incompatible_server"
