@@ -647,7 +647,8 @@ class Handler(ApiHandler):
         # must decide before the history ref moves.
         #
         #   1. refuse anything the database alone can refuse, without building
-        #      a commit at all
+        #      a commit at all (an unknown Playground is not one of them: the
+        #      first publish of an id creates it, protocol.md §2 step 0)
         #   2. prepare the Version in Git, protected by a pending ref
         #   3. one short transaction: compare-and-swap, Event, Content Log
         #   4. converge the history ref onto what the database now says
@@ -659,9 +660,6 @@ class Handler(ApiHandler):
             prepared = publish_playground_prepare(
                 handle, playground_id, bundle, _commit_metadata(), event_id
             )
-        except MissingPlaygroundError:
-            self._api_error(404, "not_found")
-            return
         except InvalidRequestError:
             self._api_error(400, "invalid_request")
             return
@@ -698,9 +696,6 @@ class Handler(ApiHandler):
                 return
             except IdempotencyRequestError:
                 self._api_error(400, "invalid_request")
-                return
-            except MissingPlaygroundError:
-                self._api_error(404, "not_found")
                 return
             except InvalidRequestError:
                 self._api_error(400, "invalid_request")

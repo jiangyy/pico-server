@@ -29,10 +29,12 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/v1/playgrounds` | `{id}` 登记一门课（409 = 已存在） |
+| POST | `/api/v1/playgrounds` | `{id}` 登记一门课（409 = 已存在）。可选：发布到不存在的 id 也会创建它 |
 | POST | `/api/v1/playgrounds/{id}/versions` | ZIP + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}` |
 
-发布的 `status`：`accepted` / `no_op` / `conflict` / `playground_stopped`。`conflict` 表示
+发布的 `status`：`accepted` / `no_op` / `conflict` / `playground_stopped`。对一个还不存在的
+id 发布就是创建它（`base` 必须为空，否则 `conflict`）；已有 Version 时必须带 `base`，
+缺了是 `400`，过时是 `409 conflict`。`conflict` 表示
 `X-Base-Version-Id` 已经过时，这次什么都没有写；`playground_stopped` 表示这门课已下线，
 所以**不能靠重新发布让它回来**——用下面的 `restore`。
 | DELETE | `/api/v1/playgrounds/{id}` | 下线，返回 `{status}` |

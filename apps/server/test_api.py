@@ -420,6 +420,66 @@ class PublishBaseTest(ServerTestCase):
         self.assertEqual(status, 201)
 
 
+class PublishCreatesPlaygroundTest(ServerTestCase):
+    """protocol.md §2 step 0：不存在的 Playground 由第一次发布带出来。"""
+
+    def test_publishing_to_an_unknown_playground_creates_it(self):
+        # 不需要先登记：协议里 PublishRequest 的「Playground 不存在」分支就是创建。
+        status, _, body = self.publish("brand-new", archive=self.build_zip(), key="create-1")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(body["status"], "accepted")
+        self.assertIn("brand-new", self.catalog_ids())
+        self.assertEqual(self.current_version("brand-new"), body["version_id"])
+
+    def test_a_created_playground_is_published_like_any_other(self):
+        _, _, first = self.publish("fresh", archive=self.build_zip(), key="create-fresh")
+        status, _, second = self.publish(
+            "fresh",
+            archive=self.variant_zip(b"two"),
+            key="create-fresh-2",
+            base=first["version_id"],
+        )
+        self.assertEqual((status, second["status"]), (201, "accepted"))
+
+        # 相同内容再来一次是 no_op，和登记过的 Playground 完全一样
+        _, _, third = self.publish(
+            "fresh",
+            archive=self.variant_zip(b"two"),
+            key="create-fresh-3",
+            base=second["version_id"],
+        )
+        self.assertEqual(third, {"status": "no_op", "version_id": second["version_id"]})
+
+    def test_a_base_sent_for_a_playground_that_does_not_exist_is_a_conflict(self):
+        # 它声称的历史不存在：不是 404，也不是静默创建。
+        status, _, body = self.publish(
+            "never-existed", archive=self.build_zip(), key="create-bad-base", base="0" * 40
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body, {"status": "conflict"})
+        self.assertNotIn("never-existed", self.catalog_ids())
+
+    def test_creating_announces_the_version_to_clients(self):
+        # 创建和发布一样要进内容日志，否则客户端永远不知道该装它。
+        _, _, body = self.publish("announced", archive=self.build_zip(), key="create-announced")
+        entries = self.sync([], after_seq=0)["entries"]
+        published = [
+            entry for entry in entries
+            if entry["event"]["kind"] == "publish_playground"
+            and entry["event"]["payload"]["playground_id"] == "announced"
+        ]
+        self.assertEqual(len(published), 1)
+        self.assertEqual(published[0]["event"]["payload"]["version_id"], body["version_id"])
+
+    def test_a_publish_is_still_not_how_an_archived_playground_comes_back(self):
+        self.publish("revived", archive=self.build_zip(), key="revive-1")
+        self.retire("revived")
+        status, _, body = self.publish("revived", archive=self.variant_zip(b"x"), key="revive-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(body, {"status": "playground_stopped"})
+
+
 class PublishPhasesOverHttpTest(ServerTestCase):
     """三阶段在 HTTP 层的顺序与失败语义。
 
@@ -754,10 +814,20 @@ class PublishTest(ServerTestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["code"], "invalid_request")
 
-    def test_uploading_to_an_unknown_playground_is_not_found(self):
-        status, _, body = self.publish(f"pg-{uuid.uuid4().hex[:8]}")
-        self.assertEqual(status, 404)
-        self.assertEqual(body["code"], "not_found")
+    def test_uploading_to_an_unknown_playground_creates_it(self):
+        """This used to be 404.
+
+        protocol.md §2 step 0 is explicit that the first publish of an id is what
+        brings the Playground into existence, so a publisher that never
+        registered the id is not doing something malformed. Registration is
+        still there and still how an id is reserved before anything is published;
+        it is just no longer required first.
+        """
+        playground_id = f"pg-{uuid.uuid4().hex[:8]}"
+        status, _, body = self.publish(playground_id)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["status"], "accepted")
+        self.assertIn(playground_id, self.catalog_ids())
 
 
 class RetiringTest(ServerTestCase):

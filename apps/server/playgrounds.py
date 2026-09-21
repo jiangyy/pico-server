@@ -125,19 +125,27 @@ def require_publishable(connection, playground_id, base_version_id):
     """Check everything the database alone can refuse, and return the row.
 
     The first of the three publish phases that touches the database, and the
-    only one that runs before any Git work: an archived Playground, an unknown
-    one, or a stale base is refused without creating a commit. That is worth
-    doing up front — a refusal must not leave a prepared Version to clean up.
+    only one that runs before any Git work: an archived Playground or a stale
+    base is refused without creating a commit. That is worth doing up front — a
+    refusal must not leave a prepared Version to clean up.
 
-    Returns the row so the caller can pass ``current_version_id`` on to the
-    compare-and-swap rather than reading it twice.
+    A Playground that does not exist yet is *not* a refusal: protocol.md §2 step 0
+    makes the first publish of an id create it, so this returns ``None`` and the
+    commit phase creates the row. What such a request must not carry is a base —
+    `_require_base` reads a base with no observed version as a claim about a
+    history that does not exist.
+
+    Returns the row, or ``None`` for a Playground that is about to be created, so
+    the caller can pass ``current_version_id`` on to the compare-and-swap rather
+    than reading it twice.
     """
 
     playground_id = _require_opaque_id(playground_id)
 
     row = _playground_row(connection, playground_id)
     if row is None:
-        raise MissingPlaygroundError("playground does not exist")
+        _require_base(base_version_id, "")
+        return None
     if row["state"] == "stopped":
         raise PlaygroundStoppedError("playground is archived")
 
@@ -162,7 +170,7 @@ def commit_prepared_version(
 
     row = _playground_row(connection, playground_id)
     if row is None:
-        raise MissingPlaygroundError("playground does not exist")
+        return _create_from_prepared(connection, playground_id, prepared, base_version_id)
     if row["state"] == "stopped":
         raise PlaygroundStoppedError("playground is archived")
     if row["current_version_id"] != (base_version_id or ""):
@@ -181,6 +189,43 @@ def commit_prepared_version(
     )
     return PublishResult(
         playground_id=playground_id, commit_id=prepared.commit_id, no_op=False
+    )
+
+
+def _create_from_prepared(connection, playground_id, prepared, base_version_id):
+    """Create the Playground row for the first Version ever published to it.
+
+    protocol.md §2 step 0: an unknown id is not an error, it is a Playground that
+    does not exist until this moment. The row and the Version are accepted in one
+    transaction, so there is no window in which a Playground exists without the
+    Version that brought it into being.
+
+    The primary key is the compare-and-swap here. Two publishes of the same new
+    id cannot both insert — `idempotency.execute` runs this inside one immediate
+    transaction, so the second one reads the row the first wrote, finds it does
+    not match the (empty) base it sent, and is refused as ``conflict``. Nothing
+    is overwritten and nothing is retried.
+    """
+
+    if base_version_id:
+        raise PlaygroundBaseChangedError("playground has no history to base on")
+
+    connection.execute(
+        "INSERT INTO playgrounds (id, created_at, state, current_version_id)"
+        " VALUES (?, ?, 'active', ?)",
+        (playground_id, _now(), prepared.commit_id),
+    )
+    if not prepared.no_op:
+        record_publish_event(
+            connection,
+            playground_id,
+            prepared.commit_id,
+            event_id=prepared.event_id,
+        )
+    return PublishResult(
+        playground_id=playground_id,
+        commit_id=prepared.commit_id,
+        no_op=prepared.no_op,
     )
 
 

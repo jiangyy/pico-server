@@ -90,16 +90,28 @@ class PlaygroundTest(unittest.TestCase):
 
     # ----- publishing ----------------------------------------------------
 
-    def test_publishing_an_unknown_playground_leaves_git_untouched(self):
-        with self.assertRaises(playgrounds.MissingPlaygroundError):
-            playgrounds.publish_playground(
-                self.connection,
-                "pg-none",
-                self.repository,
-                self.bundle(),
-                self.metadata(),
-            )
+    def test_publishing_an_unknown_playground_creates_it(self):
+        # protocol.md §2 step 0：第一次发布就是它的诞生，没有可以作 base 的东西。
+        result = playgrounds.publish_playground(
+            self.connection,
+            "pg-none",
+            self.repository,
+            self.bundle(),
+            self.metadata(),
+        )
 
+        self.assertFalse(result.no_op)
+        row = self.connection.execute(
+            "SELECT state, current_version_id FROM playgrounds WHERE id = 'pg-none'"
+        ).fetchone()
+        self.assertEqual(row["state"], "active")
+        self.assertEqual(row["current_version_id"], result.commit_id)
+        self.assertTrue(
+            repository.commit_in_playground_history(
+                self.repository, "pg-none", result.commit_id
+            )
+        )
+        # 旧命名空间不再被写
         self.assertFalse(
             (self.repository.path / "refs" / "heads" / "playgrounds").exists()
         )
