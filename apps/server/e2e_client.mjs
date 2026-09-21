@@ -69,6 +69,8 @@ async function bootstrap() {
       playgroundId: item.playgroundId,
       versionId: item.versionId,
     })),
+    active: installed.items.map((item) => item.playgroundId),
+    problems: installed.problems.map((problem) => problem.code),
     cursor: snapshot.lastContentSeq,
   };
 }

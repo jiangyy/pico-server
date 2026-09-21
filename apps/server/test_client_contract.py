@@ -184,6 +184,35 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(after["retired"], ["pg-e2e"])
         self.assertEqual(after["active"], [])
 
+    def test_a_repair_bootstrap_matches_the_catalog_snapshot(self):
+        """The one bootstrap that has something to reconcile.
+
+        A brand-new client has no local set to disagree with the snapshot, but a
+        *repaired* install does: `stateAfterStartup` re-runs bootstrap when the
+        local content is damaged, and adopting the snapshot's cursor skips past
+        the archive entry that would have retired anything the server dropped in
+        the meantime — permanently, because a cursor never moves backwards.
+        """
+        self.publish("pg-e2e")
+        self.publish("pg-other")
+        self.client("bootstrap")
+
+        # The server drops one of them while this machine is not looking.
+        status, _ = self.operator("DELETE", "/api/v1/playgrounds/pg-other")
+        self.assertEqual(status, 200)
+
+        # Rebuilding the install (a damaged blob, a lost cursor) must land on
+        # the catalog exactly: what the snapshot names, and nothing else.
+        boot = self.client("bootstrap")
+        self.assertEqual(boot["active"], ["pg-e2e"])
+        self.assertEqual(boot["problems"], [])
+        self.assertEqual(boot["cursor"], boot["upto_seq"])
+
+        # And the retired course really is gone from the local set, not merely
+        # absent from this response.
+        after = self.client("sync")
+        self.assertEqual(after["active"], ["pg-e2e"])
+
     def test_a_second_launch_only_pulls_what_it_missed(self):
         self.publish("pg-e2e")
         first = self.client("bootstrap")
