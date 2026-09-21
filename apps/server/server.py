@@ -44,6 +44,7 @@ from playgrounds import (
     create_playground,
     get_playground,
     publish_playground,
+    record_archive_event,
 )
 from repository import (
     DEFAULT_REPOSITORY_PATH,
@@ -397,33 +398,34 @@ class Handler(BaseHTTPRequestHandler):
                 if stored is None:
                     self._not_found()
                     return
-                # Drop the recorded publishes so an exact replay of an old
-                # idempotency key cannot report a 201 for a course nobody can
-                # read. The events table keeps the archive record intact, so
-                # a Sync round can still see what happened.
-                connection.execute(
-                    "DELETE FROM idempotency_results "
-                    "WHERE scope = ? AND endpoint = ?",
-                    (
-                        OPERATOR_SCOPE,
-                        _playground_commits_endpoint(playground_id),
-                    ),
-                )
-                if stored.state == "stopped":
-                    self._respond_json(
-                        200,
-                        {"playgroundId": playground_id, "status": "no_op"},
-                    )
-                    return
-                from playgrounds import record_archive_event
-
-                record_archive_event(connection, playground_id)
+                already_stopped = stored.state == "stopped"
+                if not already_stopped:
+                    # One transaction: the archive event, its content log row
+                    # and the state flip all land together, or none of them do.
+                    with connection:
+                        # Drop the recorded publishes so an exact replay of an
+                        # old idempotency key cannot report a 201 for a course
+                        # nobody can read. The events table keeps the archive
+                        # record, so a sync round still sees what happened.
+                        connection.execute(
+                            "DELETE FROM idempotency_results "
+                            "WHERE scope = ? AND endpoint = ?",
+                            (
+                                OPERATOR_SCOPE,
+                                _playground_commits_endpoint(playground_id),
+                            ),
+                        )
+                        record_archive_event(connection, playground_id)
         except InvalidRequestError:
             self._api_error(400, "invalid_request")
             return
 
         self._respond_json(
-            200, {"playgroundId": playground_id, "status": "accepted"}
+            200,
+            {
+                "playgroundId": playground_id,
+                "status": "no_op" if already_stopped else "accepted",
+            },
         )
 
     def _respond_bytes(

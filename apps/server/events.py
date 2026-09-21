@@ -11,26 +11,26 @@ content events (publish and archive) in the order they were accepted.
 protocol says they belong to the client-facing ``EventResult`` stream,
 not the history students see.
 
-The store never writes partial state. Each public function runs in its
-caller's transaction (``with connection:``), so the events row, the log
-row, and the playground state change either all land or none of them do.
+This module never manages transactions. Every function runs inside the
+caller's open transaction; the caller is the only one that opens
+(``with connection:``) and commits, so a whole sync round is one unit:
+either every event row, log row and Playground state change lands, or
+none of them do. Python's ``sqlite3`` ``with connection:`` is a
+commit-on-exit, not a savepoint, so a nested one inside an outer
+transaction would commit the outer work early — there is deliberately
+none here.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
-from typing import Iterable, Mapping
+from typing import Mapping
 
 from events_types import (
     CONTENT_EVENT_KINDS,
-    EVENT_KIND_ARCHIVE_PLAYGROUND,
-    EVENT_KIND_PUBLISH_PLAYGROUND,
-    EVENT_KIND_SUBMIT_CODE,
     EVENT_KINDS,
     ContentLogEntry,
     EventEnvelope,
-    EventResult,
 )
 
 
@@ -142,9 +142,11 @@ def accept_event(
     fields are stored verbatim so a re-submitted event_id produces the
     exact same wire bytes.
 
-    Returns ``"stored"`` when the event was a replay (the caller should
-    hand back the stored response) and ``"inserted"`` for a fresh
-    acceptance.
+    Runs in the caller's transaction and never commits. The caller checks
+    :func:`read_event` first, so a duplicate id here means a genuine
+    race: the ``IntegrityError`` propagates and rolls the caller's whole
+    transaction back, which is what makes the retry return the winner's
+    stored result instead of a half-applied round.
     """
     event_id = _require_event_id(envelope.event_id)
     kind = _require_kind(envelope.kind)
@@ -157,20 +159,15 @@ def accept_event(
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     response_json = json.dumps(response_payload, separators=(",", ":"), sort_keys=True)
 
-    try:
-        with connection:
-            connection.execute(
-                """
-                INSERT INTO events (
-                    event_id, kind, payload, status, reason, response_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                """,
-                (event_id, kind, payload_json, response_status, reason, response_json),
-            )
-    except sqlite3.IntegrityError:
-        return "stored"
-    return "inserted"
+    connection.execute(
+        """
+        INSERT INTO events (
+            event_id, kind, payload, status, reason, response_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        """,
+        (event_id, kind, payload_json, response_status, reason, response_json),
+    )
 
 
 def append_content_log(connection, envelope):
@@ -179,6 +176,8 @@ def append_content_log(connection, envelope):
     Returns the seq assigned to the new row. Only ``publish_playground``
     and ``archive_playground`` may enter the log; ``submit_code`` is
     rejected here so a caller cannot silently mix in non-content events.
+
+    Runs in the caller's transaction and never commits.
     """
     event_id = _require_event_id(envelope.event_id)
     kind = _require_kind(envelope.kind)
@@ -186,25 +185,8 @@ def append_content_log(connection, envelope):
         raise ValueError(f"content log only accepts {sorted(CONTENT_EVENT_KINDS)}")
     payload = _require_payload(envelope.payload)
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    with connection:
-        cursor = connection.execute(
-            "INSERT INTO content_log (event_id, kind, payload) VALUES (?, ?, ?)",
-            (event_id, kind, payload_json),
-        )
-    return int(cursor.lastrowid)
-
-
-# --- Replay helpers ------------------------------------------------------
-
-def event_result_from_stored(stored_row):
-    """Reconstruct an :class:`EventResult` from a stored row tuple."""
-    _kind, status, reason, response_json = stored_row
-    return EventResult(
-        event_id=None,  # filled by the caller; the row tuple does not include it
-        status=status,
-        reason=reason,
+    cursor = connection.execute(
+        "INSERT INTO content_log (event_id, kind, payload) VALUES (?, ?, ?)",
+        (event_id, kind, payload_json),
     )
-
-
-__all_event_kinds = (EVENT_KIND_SUBMIT_CODE, EVENT_KIND_PUBLISH_PLAYGROUND, EVENT_KIND_ARCHIVE_PLAYGROUND)
-_ = __all_event_kinds  # silence "unused" tools
+    return int(cursor.lastrowid)

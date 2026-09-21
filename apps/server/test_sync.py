@@ -121,6 +121,43 @@ class SyncEngineTests(unittest.TestCase):
         self.assertEqual(response.entries[0].event.event_id, "e4")
         self.assertEqual(response.upto_seq, response.entries[0].seq)
 
+    def test_an_unexpected_handler_failure_rolls_the_whole_round_back(self):
+        """One round is one transaction: an accepted first event and a
+        hard failure on the second must leave no trace of either."""
+
+        def boom(_connection, _envelope):
+            raise RuntimeError("unexpected")
+
+        first = events_types.EventEnvelope(
+            event_id="e-first",
+            kind=events_types.EVENT_KIND_PUBLISH_PLAYGROUND,
+            payload={"playground_id": "pg", "version_id": "v"},
+        )
+        second = events_types.EventEnvelope(
+            event_id="e-second",
+            kind=events_types.EVENT_KIND_PUBLISH_PLAYGROUND,
+            payload={"playground_id": "pg", "version_id": "w"},
+        )
+        with self.assertRaises(RuntimeError):
+            sync.process_sync(
+                self.connection,
+                events_types.SyncRequest(pending_events=(first, second), after_seq=0),
+                submit_handler=_rejecting(events_types.REASON_INVALID_SUBMISSION),
+                publish_handler=boom,
+                archive_handler=_rejecting(events_types.REASON_UNKNOWN_KIND),
+            )
+
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) AS n FROM content_log"
+            ).fetchone()["n"],
+            0,
+        )
+
 
 def _rejecting(reason):
     def handler(_connection, _envelope):

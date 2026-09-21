@@ -128,26 +128,26 @@ def record_publish_event(connection, playground_id, version_id):
     """Record a server-generated ``publish_playground`` event.
 
     Writes the event row, appends to the content log and updates the
-    playground's ``current_version_id`` in a single transaction. Returns the
-    generated event id so the caller can echo it back.
+    playground's ``current_version_id``. Runs in the caller's transaction
+    and never commits, so the event lands only if the publish that produced
+    it does too. Returns the generated event id.
     """
     envelope = events_types.EventEnvelope(
         event_id=uuid4().hex,
         kind=events_types.EVENT_KIND_PUBLISH_PLAYGROUND,
         payload={"playground_id": playground_id, "version_id": version_id},
     )
-    with connection:
-        events.accept_event(
-            connection,
-            envelope,
-            response_status="accepted",
-            response_payload={"version_id": version_id},
-        )
-        events.append_content_log(connection, envelope)
-        connection.execute(
-            "UPDATE playgrounds SET current_version_id = ? WHERE id = ?",
-            (version_id, playground_id),
-        )
+    events.accept_event(
+        connection,
+        envelope,
+        response_status="accepted",
+        response_payload={"version_id": version_id},
+    )
+    events.append_content_log(connection, envelope)
+    connection.execute(
+        "UPDATE playgrounds SET current_version_id = ? WHERE id = ?",
+        (version_id, playground_id),
+    )
     return envelope.event_id
 
 
@@ -155,24 +155,24 @@ def record_archive_event(connection, playground_id):
     """Record a server-generated ``archive_playground`` event.
 
     Writes the event row, appends to the content log and flips the playground
-    to ``state = stopped`` in a single transaction. The Git ref is left
-    intact: archive means "stop using it", not "delete the bytes".
+    to ``state = stopped``. The Git ref is left intact: archive means "stop
+    using it", not "delete the bytes". Runs in the caller's transaction and
+    never commits.
     """
     envelope = events_types.EventEnvelope(
         event_id=uuid4().hex,
         kind=events_types.EVENT_KIND_ARCHIVE_PLAYGROUND,
         payload={"playground_id": playground_id},
     )
-    with connection:
-        events.accept_event(
-            connection,
-            envelope,
-            response_status="accepted",
-            response_payload={"playground_id": playground_id},
-        )
-        events.append_content_log(connection, envelope)
-        connection.execute(
-            "UPDATE playgrounds SET state = 'stopped' WHERE id = ?",
-            (playground_id,),
-        )
+    events.accept_event(
+        connection,
+        envelope,
+        response_status="accepted",
+        response_payload={"playground_id": playground_id},
+    )
+    events.append_content_log(connection, envelope)
+    connection.execute(
+        "UPDATE playgrounds SET state = 'stopped' WHERE id = ?",
+        (playground_id,),
+    )
     return envelope.event_id
