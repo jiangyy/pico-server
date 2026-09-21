@@ -205,6 +205,20 @@ class SyncEndpointTests(ServerTestCase):
         self.assertEqual(body["event_results"][0]["status"], "rejected")
         self.assertEqual(body["event_results"][0]["reason"], "playground_stopped")
 
+    def test_a_cursor_ahead_of_the_log_is_walked_back_into_range(self):
+        """A restored database (or an edited cursor) can leave a client asking
+        for entries that will never exist; it must be pulled back rather than
+        waiting forever."""
+        self.seed("pg-sync-ahead")
+        body = self.sync([], after_seq=10**9)
+        self.assertEqual(body["entries"], [])
+        self.assertLess(body["upto_seq"], 10**9)
+
+        # From the clamped cursor the client is in step again.
+        again = self.sync([], after_seq=body["upto_seq"])
+        self.assertEqual(again["upto_seq"], body["upto_seq"])
+        self.assertEqual(again["entries"], [])
+
     def test_a_client_cannot_publish_or_archive_through_sync(self):
         playground_id, commit_id = self.seed("pg-sync-cannot-write")
         body = self.sync(

@@ -142,7 +142,16 @@ def process_sync(
     )
     # The cursor is the last seq *delivered*, not the log's maximum: advancing
     # past entries this response did not carry would lose them for good.
-    upto_seq = entries[-1].seq if entries else request.after_seq
+    #
+    # With nothing left to deliver the cursor stays where it is — except that
+    # it is clamped to the log's end, so a client whose cursor is ahead of the
+    # server (a restored database, a hand-edited cursor) walks back into range
+    # instead of asking for entries that will never exist.
+    upto_seq = (
+        entries[-1].seq
+        if entries
+        else min(request.after_seq, events.current_upto_seq(connection))
+    )
 
     return events_types.SyncResponse(
         event_results=tuple(event_results),
