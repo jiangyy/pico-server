@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import events
+import events_types
 import manifests
 import pagination
 import permissions
@@ -471,6 +473,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with self._database() as connection:
                 page = self._build_catalog_page(connection, limit, after)
+                upto_seq = events.current_upto_seq(connection)
         except RepositoryError:
             self._api_error(500, "internal_error", head_only=head_only)
             return
@@ -478,6 +481,11 @@ class Handler(BaseHTTPRequestHandler):
         self._respond_json(
             200,
             {
+                "upto_seq": upto_seq,
+                "protocol_version": events_types.PROTOCOL_VERSION,
+                "minimum_client_protocol_version": (
+                    events_types.MINIMUM_CLIENT_PROTOCOL_VERSION
+                ),
                 "catalog": list(page.items),
                 "nextCursor": self._next_cursor(
                     pagination.CATALOG_ROUTE, page.next_key
@@ -530,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if commit_id is None:
                     continue
-                items.append({"playgroundId": row["id"], "commitId": commit_id})
+                items.append({"playgroundId": row["id"], "current_version_id": commit_id})
                 if len(items) >= limit:
                     break
 

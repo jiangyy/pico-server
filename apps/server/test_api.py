@@ -172,7 +172,7 @@ class DistributionTest(ServerTestCase):
         status, _, body = self.request("GET", "/api/v1/catalog")
         self.assertEqual(status, 200)
         self.assertIn(
-            {"playgroundId": playground_id, "commitId": commit_id},
+            {"playgroundId": playground_id, "current_version_id": commit_id},
             body["catalog"],
         )
 
