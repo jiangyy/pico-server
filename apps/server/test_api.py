@@ -10,6 +10,8 @@ about an in-process call.
 import hashlib
 import io
 import json
+import sqlite3
+import threading
 import os
 import sys
 import tempfile
@@ -263,6 +265,72 @@ class DistributionTest(ServerTestCase):
             "/files/course/../picopg.json",
         )
         self.assertEqual(status, 404)
+
+
+class CatalogSourceTest(ServerTestCase):
+    """The catalog reads the database, and start-up keeps it complete.
+
+    Resolving each row's ref with Git was one subprocess per course per request
+    (measured at 2.2s for 300 courses, on every launch and refresh), so
+    ``current_version_id`` is now the catalog's source. That makes it an
+    invariant every writer must keep — these pin the two ways it could break.
+    """
+
+    def catalog_ids(self):
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        return [entry["playground_id"] for entry in body["playgrounds"]]
+
+    def test_a_registered_but_unpublished_course_is_not_in_the_catalog(self):
+        # POST /playgrounds creates the row; the version comes from the publish.
+        # Half a registration must not look like a course.
+        playground_id = "pg-registered-only"
+        self.create_playground(playground_id)
+        self.assertNotIn(playground_id, self.catalog_ids())
+
+        # ...and the publish is what makes it appear.
+        status, _, body = self.publish(playground_id)
+        self.assertEqual(status, 201)
+        self.assertIn(playground_id, self.catalog_ids())
+        entry = next(
+            item for item in self.request("GET", "/api/v1/catalog")[2]["playgrounds"]
+            if item["playground_id"] == playground_id
+        )
+        self.assertEqual(entry["current_version_id"], body["version_id"])
+
+    def test_a_row_from_before_the_column_existed_survives_a_restart(self):
+        # A v1 row has a readable ref and an empty column. Restarting the server
+        # is the upgrade path, and the course must still be there afterwards —
+        # otherwise upgrading silently empties the catalog.
+        playground_id, commit_id = self.seed("pg-upgrade")
+        with self.server.database_path.open("rb") as _:
+            pass
+        connection = sqlite3.connect(self.server.database_path)
+        with connection:
+            connection.execute(
+                "UPDATE playgrounds SET current_version_id = '' WHERE id = ?",
+                (playground_id,),
+            )
+        connection.close()
+        self.assertNotIn(playground_id, self.catalog_ids())
+
+        restarted = make_server(
+            host="127.0.0.1",
+            port=0,
+            database_path=self.server.database_path,
+            repository_path=self.server.repository_path,
+            operator_token=OPERATOR_TOKEN,
+        )
+        self.addCleanup(restarted.server_close)
+        self.addCleanup(restarted.shutdown)
+        threading.Thread(target=restarted.serve_forever, daemon=True).start()
+
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        entry = next(
+            item for item in body["playgrounds"] if item["playground_id"] == playground_id
+        )
+        self.assertEqual(entry["current_version_id"], commit_id)
 
 
 class PublishTest(ServerTestCase):

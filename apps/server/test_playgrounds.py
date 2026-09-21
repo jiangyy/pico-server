@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bundles  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
+import manifests  # noqa: E402
+
+
+def repository_module_head(repo, playground_id):
+    return manifests.current_playground_commit(repo, playground_id)
 from database import open_database  # noqa: E402
 
 MANIFEST_BYTES = b'{"schemaVersion":1,"runtime":"python"}'
@@ -127,6 +132,93 @@ class PlaygroundTest(unittest.TestCase):
                 self.repository, "pg-one", first.commit_id
             )
         )
+
+
+class BackfillCurrentVersionsTest(PlaygroundTest):
+    """`current_version_id` is what the catalog reads, so it must be complete.
+
+    A row from before that column existed has no value; start-up fills it in
+    from the ref once, instead of the catalog running a Git subprocess per row
+    per request. A row that never stored one is *not* in the catalog, so this is
+    the step that keeps an upgraded deployment from losing its courses.
+    """
+
+    def stored(self, playground_id):
+        row = self.connection.execute(
+            "SELECT current_version_id FROM playgrounds WHERE id = ?",
+            (playground_id,),
+        ).fetchone()
+        return None if row is None else row["current_version_id"]
+
+    def blank(self, playground_id):
+        """Erase the column, as a v1 → v2 migration leaves it."""
+
+        with self.connection:
+            self.connection.execute(
+                "UPDATE playgrounds SET current_version_id = '' WHERE id = ?",
+                (playground_id,),
+            )
+
+    def unfilled(self, playground_id):
+        """A registered row that predates the column."""
+
+        playgrounds.create_playground(self.connection, playground_id)
+        self.blank(playground_id)
+
+    def test_a_row_with_a_readable_ref_is_filled_in(self):
+        playgrounds.create_playground(self.connection, "pg")
+        result = playgrounds.publish_playground(
+            self.connection, "pg", self.repository, self.bundle(), self.metadata()
+        )
+        self.blank("pg")
+        self.assertEqual(self.stored("pg"), "")
+
+        filled = playgrounds.backfill_current_versions(
+            self.connection,
+            lambda playground_id: repository_module_head(self.repository, playground_id),
+        )
+        self.assertEqual(filled, 1)
+        self.assertEqual(self.stored("pg"), result.commit_id)
+
+    def test_a_row_with_no_ref_is_left_alone(self):
+        self.unfilled("pg-never-published")
+        filled = playgrounds.backfill_current_versions(
+            self.connection, lambda playground_id: None
+        )
+        self.assertEqual(filled, 0)
+        self.assertEqual(self.stored("pg-never-published"), "")
+
+    def test_a_row_that_already_has_a_version_is_not_resolved_again(self):
+        playgrounds.create_playground(self.connection, "pg")
+        playgrounds.publish_playground(
+            self.connection, "pg", self.repository, self.bundle(), self.metadata()
+        )
+        asked = []
+        filled = playgrounds.backfill_current_versions(
+            self.connection, lambda playground_id: asked.append(playground_id)
+        )
+        self.assertEqual(filled, 0)
+        self.assertEqual(asked, [], "an already-filled row must cost nothing")
+
+    def test_an_archived_row_is_not_resolved(self):
+        self.unfilled("pg-archived")
+        with self.connection:
+            self.connection.execute(
+                "UPDATE playgrounds SET state = 'stopped' WHERE id = ?",
+                ("pg-archived",),
+            )
+        asked = []
+        playgrounds.backfill_current_versions(
+            self.connection, lambda playground_id: asked.append(playground_id)
+        )
+        self.assertEqual(asked, [], "a stopped row is not in the catalog anyway")
+
+    def test_it_is_idempotent(self):
+        self.unfilled("pg")
+        resolve = lambda playground_id: "a" * 40
+        self.assertEqual(playgrounds.backfill_current_versions(self.connection, resolve), 1)
+        self.assertEqual(playgrounds.backfill_current_versions(self.connection, resolve), 0)
+        self.assertEqual(self.stored("pg"), "a" * 40)
 
 
 if __name__ == "__main__":

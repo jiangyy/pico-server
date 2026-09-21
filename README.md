@@ -65,6 +65,16 @@
 4. **学生姓名在文件里。** `submit_code` 的 payload 没有 `student`
    （见 `protocol.md`），服务端从 `work/main.py` 首行的 `# 姓名：… 班级：…` 读出。
 5. **读取全公开。** 没有会话、没有角色、没有请求级判断；只有写操作要 token。
+6. **目录只读数据库。** 每门课的 `current_version_id` 由 publish 写在同一次事务里，
+   启动时补齐旧行（`playgrounds.backfill_current_versions`）。catalog 不再对每行跑
+   `git rev-parse`：300 门课从 2.2 秒降到 5 毫秒。**代价**是一行若没有这个值就不出现在
+   目录里——所以任何写 `playgrounds` 行的代码都必须维护它。
+
+## 已知上限
+
+catalog 是一个整体响应，客户端单次读取上限 1 MiB，每条约 89 字节，即**约 11800 门课**。
+到那个量级需要分页，而 protocol.md 的 `CatalogRequest` 是无参数的，所以分页要同时改协议。
+当前量级远远不到。
 
 ## 运维
 

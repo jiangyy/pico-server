@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 import events
 import events_types
 import manifests
+import playgrounds as playgrounds_module
 import pagination
 import routes
 import sync
@@ -464,12 +465,18 @@ class Handler(BaseHTTPRequestHandler):
 
         Archived Playgrounds are filtered out by ``state`` rather than by the
         absence of a Git ref, so their history stays readable for a client
-        already pinned to it. A row whose ref cannot be resolved is skipped
-        instead of failing the whole catalog; a row whose stored identifier
-        is not representable fails closed.
+        already pinned to it. A row whose stored identifier is not representable
+        fails closed.
+
+        Everything comes from the database alone. Resolving each row's ref with
+        Git would be one subprocess per Playground per request — measured at 2.2
+        seconds for 300 courses, paid on every launch and every refresh — and
+        ``current_version_id`` is stored precisely so that is not necessary. A
+        row that has never had one is left out; start-up fills those in
+        (`playgrounds.backfill_current_versions`).
         """
         rows = connection.execute(
-            "SELECT id FROM playgrounds WHERE state = 'active' "
+            "SELECT id, current_version_id FROM playgrounds WHERE state = 'active' "
             "ORDER BY created_at, id"
         ).fetchall()
 
@@ -477,10 +484,11 @@ class Handler(BaseHTTPRequestHandler):
         for row in rows:
             if not valid_playground_id(row["id"]):
                 raise RepositoryError("stored playground identifier is invalid")
-            version_id = manifests.current_playground_commit(
-                self.server.repository, row["id"]
-            )
-            if version_id is None:
+            version_id = row["current_version_id"]
+            if not version_id:
+                # Never written: no publish has ever stored one. It is not in
+                # the catalog rather than resolved here, so a request never
+                # pays for another row's missing value.
                 continue
             items.append(
                 {"playground_id": row["id"], "current_version_id": version_id}
@@ -935,6 +943,17 @@ def make_server(
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
+
+    # Rows written before `current_version_id` existed have no value, and the
+    # catalog no longer resolves one on demand. Fill them in once, here, so a
+    # request never pays a Git subprocess per row.
+    with closing(open_database(database_path)) as connection:
+        playgrounds_module.backfill_current_versions(
+            connection,
+            lambda playground_id: manifests.current_playground_commit(
+                repository, playground_id
+            ),
+        )
 
     server = SlimHTTPServer((host, port), Handler)
     server.database_path = database_path

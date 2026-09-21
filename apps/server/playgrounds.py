@@ -135,6 +135,40 @@ def publish_playground(connection, playground_id, repository, bundle, metadata):
     return result
 
 
+def backfill_current_versions(connection, resolve_version):
+    """Remember the current version of every row that never stored one.
+
+    ``current_version_id`` is written by every publish and read by the catalog,
+    so the catalog never has to ask Git which commit a Playground is on. Rows
+    from before that column existed have no value; resolving those costs one Git
+    subprocess each, so it is done once here at start-up rather than once per row
+    per catalog request.
+
+    ``resolve_version(playground_id)`` returns the version id or ``None`` when
+    the Playground has no readable ref. A row that cannot be resolved is left
+    alone: the catalog skips it, exactly as it did before.
+
+    Returns how many rows were filled in.
+    """
+    rows = connection.execute(
+        "SELECT id FROM playgrounds "
+        "WHERE current_version_id = '' AND state = 'active'"
+    ).fetchall()
+
+    filled = 0
+    with connection:
+        for row in rows:
+            version_id = resolve_version(row["id"])
+            if version_id is None:
+                continue
+            connection.execute(
+                "UPDATE playgrounds SET current_version_id = ? WHERE id = ?",
+                (version_id, row["id"]),
+            )
+            filled += 1
+    return filled
+
+
 def record_publish_event(connection, playground_id, version_id):
     """Record a server-generated ``publish_playground`` event.
 
