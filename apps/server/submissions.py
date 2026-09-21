@@ -394,6 +394,55 @@ def write_submission_files(
     return directory
 
 
+def backfill_submission_files(connection, root):
+    """Write the readable copy of every stored submission that has none.
+
+    The row is the record and the folder is a copy of it, so a copy can always
+    be made again: this covers submissions stored before the projection existed,
+    and a `submissions/` directory that was deleted or half-written. It runs
+    once at start-up, like the Playground version backfill, rather than only
+    when a submission is next handed in.
+
+    Returns how many folders were written.
+    """
+
+    rows = connection.execute(
+        "SELECT id, playground_id, playground_commit_id, student, files_json, created_at"
+        " FROM submissions ORDER BY created_at, id"
+    ).fetchall()
+
+    written = 0
+    for row in rows:
+        ordinal = submission_ordinal(
+            connection, row["student"], row["id"], row["created_at"]
+        )
+        directory = submission_directory(
+            root, row["student"], row["playground_id"], ordinal
+        )
+        # The manifest is the marker that a folder is complete, so a half-written
+        # one is repaired rather than skipped.
+        if (directory / MANIFEST_NAME).is_file():
+            continue
+        try:
+            files = json.loads(row["files_json"])
+        except (TypeError, ValueError):
+            continue
+        if type(files) is not dict:
+            continue
+        write_submission_files(
+            root,
+            row["id"],
+            row["student"],
+            row["playground_id"],
+            row["playground_commit_id"],
+            row["created_at"],
+            files,
+            ordinal,
+        )
+        written += 1
+    return written
+
+
 def _submission_from_row(row):
     """Return the Submission a durable row describes, or fail closed."""
 

@@ -59,6 +59,7 @@ from repository import (
     valid_playground_id,
 )
 from submissions import (
+    backfill_submission_files as submissions_backfill,
     InvalidSubmissionRequestError,
     MissingSubmissionError,
     StoredSubmissionError,
@@ -834,6 +835,9 @@ def make_server(
                 repository, playground_id
             ),
         )
+        # Same idea for the readable copy of handed-in work: the row is the
+        # record, so a missing folder is written rather than reported.
+        submissions_backfill(connection, submissions_path)
 
     server = SlimHTTPServer((host, port), Handler)
     server.database_path = database_path

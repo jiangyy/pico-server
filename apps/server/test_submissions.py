@@ -381,6 +381,68 @@ class ReadSubmissionTest(SubmissionTestBase):
         )
 
 
+class BackfillSubmissionFilesTest(unittest.TestCase):
+    """补齐：记录在库里，文件夹只是它的副本，所以可以再写一遍。"""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        base = Path(self.temporary_directory.name)
+        self.connection = open_database(base / "app.db")
+        self.addCleanup(self.connection.close)
+        self.root = base / "submissions"
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO playgrounds (id, created_at) VALUES ('pg-one', '2026-01-01T00:00:00Z')"
+            )
+
+    def store(self, submission_id, student, text="print(1)\n", created_at="2026-09-18T10:11:12Z"):
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO submissions (id, playground_id, playground_commit_id, student,"
+                " files_json, created_at) VALUES (?, 'pg-one', ?, ?, ?, ?)",
+                (submission_id, "c1" + "0" * 38, student, json.dumps({"work/main.py": text}), created_at),
+            )
+
+    def test_a_stored_submission_without_a_folder_gets_one(self):
+        self.store("s1", "张三（1 班）")
+        self.assertEqual(submissions.backfill_submission_files(self.connection, self.root), 1)
+        self.assertEqual(
+            (self.root / "1 班" / "张三" / "pg-one" / "work" / "main.py").read_text(encoding="utf-8"),
+            "print(1)\n",
+        )
+
+    def test_it_is_idempotent(self):
+        self.store("s1", "张三（1 班）")
+        self.assertEqual(submissions.backfill_submission_files(self.connection, self.root), 1)
+        self.assertEqual(submissions.backfill_submission_files(self.connection, self.root), 0)
+
+    def test_each_of_a_students_hand_ins_gets_its_own_numbered_folder(self):
+        self.store("s1", "李四", "print(1)\n", "2026-09-18T10:00:00Z")
+        self.store("s2", "李四", "print(2)\n", "2026-09-18T11:00:00Z")
+        self.assertEqual(submissions.backfill_submission_files(self.connection, self.root), 2)
+        base = self.root / "李四"
+        self.assertEqual(sorted(p.name for p in base.iterdir()), ["pg-one", "pg-one-2"])
+        self.assertEqual((base / "pg-one-2" / "work" / "main.py").read_text(encoding="utf-8"), "print(2)\n")
+
+    def test_a_half_written_folder_is_repaired(self):
+        # 没有 submission.json 就说明上次没写完（可能是断电），要重写
+        self.store("s1", "王五")
+        partial = self.root / "王五" / "pg-one" / "work"
+        partial.mkdir(parents=True)
+        (partial / "main.py").write_text("half", encoding="utf-8")
+
+        self.assertEqual(submissions.backfill_submission_files(self.connection, self.root), 1)
+        self.assertEqual((partial / "main.py").read_text(encoding="utf-8"), "print(1)\n")
+        self.assertTrue((self.root / "王五" / "pg-one" / submissions.MANIFEST_NAME).is_file())
+
+    def test_an_unreadable_row_is_skipped_not_fatal(self):
+        self.store("s1", "张三")
+        with self.connection:
+            self.connection.execute("UPDATE submissions SET files_json = 'not json' WHERE id = 's1'")
+        self.assertEqual(submissions.backfill_submission_files(self.connection, self.root), 0)
+
+
 class SubmissionFileLayoutTest(unittest.TestCase):
     """Where a handed-in file set lands on disk.
 
