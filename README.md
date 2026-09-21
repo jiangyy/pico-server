@@ -36,7 +36,7 @@
 id 发布就是创建它（`base` 必须为空，否则 `conflict`）；已有 Version 时必须带 `base`，
 缺了是 `400`，过时是 `409 conflict`。`conflict` 表示
 `X-Base-Version-Id` 已经过时，这次什么都没有写；`playground_stopped` 表示这门课已下线，
-所以**不能靠重新发布让它回来**——用下面的 `restore`。
+所以不能靠重新发布让它回来——用下面的 `restore`。
 | DELETE | `/api/v1/playgrounds/{id}` | 下线，返回 `{status}` |
 | POST | `/api/v1/playgrounds/{id}/restore` | 重新上线，返回 `{status}` |
 | GET | `/api/v1/submissions` | 分页列出交上来的作业 |
@@ -74,4 +74,4 @@ data/submissions/<班级>/<姓名>/<playgroundId>[-N]/work/main.py
 
 `-N` 是同一个人对同一门课再交一次时的编号；`submission.json` 记着这份是谁的、基于
 哪个 Version。学生名来自请求（`work/main.py` 首行），所以每一段都做了过滤——名字
-不能变成路径。**真正的记录是数据库**，这份副本可以整份删掉再从 API 重新读。
+不能变成路径。真正的记录是数据库，这份副本可以整份删掉再从 API 重新读。
