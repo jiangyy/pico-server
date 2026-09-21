@@ -84,6 +84,7 @@ ALLOWED_METHODS = ("GET", "HEAD")
 PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_COMMITS_SUFFIX = "/commits"
 COMMITS_SEGMENT = "commits"
+VERSIONS_SEGMENT = "versions"
 FILES_SEGMENT = "files"
 MANIFEST_SEGMENT = "manifest"
 CATALOG_PATH = "/api/v1/catalog"
@@ -151,13 +152,14 @@ def _playground_commits_endpoint(playground_id):
     return f"POST {PLAYGROUNDS_PATH}/{playground_id}{PLAYGROUND_COMMITS_SUFFIX}"
 
 
-def _commit_route_parts(path):
-    """Split ``.../<playground>/commits/<commit>/<tail>`` for read routes.
+def _version_route_parts(path):
+    """Split ``.../<playground>/versions/<version>/<tail>`` for read routes.
 
-    Returns ``(playground_id, commit_id, tail)`` where ``tail`` is
-    everything after ``<commit>/`` and may still contain literal slashes.
+    Returns ``(playground_id, version_id, tail)`` where ``tail`` is
+    everything after ``<version>/`` and may still contain literal slashes.
     Returns ``None`` for any other shape, so a missing or extra segment never
-    matches.
+    matches. ``version_id`` is a Git commit id in this implementation; the
+    protocol only promises it addresses a Version.
     """
 
     prefix = PLAYGROUNDS_PATH + "/"
@@ -167,38 +169,38 @@ def _commit_route_parts(path):
     parts = path[len(prefix):].split("/", 3)
     if len(parts) != 4:
         return None
-    playground_id, segment, commit_id, tail = parts
-    if segment != COMMITS_SEGMENT or not playground_id or not commit_id:
+    playground_id, segment, version_id, tail = parts
+    if segment != VERSIONS_SEGMENT or not playground_id or not version_id:
         return None
-    return playground_id, commit_id, tail
+    return playground_id, version_id, tail
 
 
 def _match_manifest(path):
-    """Return ``(playground_id, commit_id)`` for a manifest read path."""
+    """Return ``(playground_id, version_id)`` for a manifest read path."""
 
-    parts = _commit_route_parts(path)
+    parts = _version_route_parts(path)
     if parts is None:
         return None
-    playground_id, commit_id, tail = parts
+    playground_id, version_id, tail = parts
     if tail != MANIFEST_SEGMENT:
         return None
-    return playground_id, commit_id
+    return playground_id, version_id
 
 
-def _match_commit_files(path):
-    """Return ``(playground_id, commit_id, encoded_path)`` for a file path."""
+def _match_version_files(path):
+    """Return ``(playground_id, version_id, encoded_path)`` for a file path."""
 
-    parts = _commit_route_parts(path)
+    parts = _version_route_parts(path)
     if parts is None:
         return None
-    playground_id, commit_id, tail = parts
+    playground_id, version_id, tail = parts
     prefix = FILES_SEGMENT + "/"
     if not tail.startswith(prefix):
         return None
     encoded_path = tail[len(prefix):]
     if not encoded_path:
         return None
-    return playground_id, commit_id, encoded_path
+    return playground_id, version_id, encoded_path
 
 
 def _match_submission(path):
@@ -229,7 +231,7 @@ def _allowed_methods(path):
         return ("POST",)
     if _match_manifest(path) is not None:
         return ALLOWED_METHODS
-    if _match_commit_files(path) is not None:
+    if _match_version_files(path) is not None:
         return ALLOWED_METHODS
     if _match_submission(path) is not None:
         return ALLOWED_METHODS
@@ -374,9 +376,9 @@ class Handler(BaseHTTPRequestHandler):
             self._get_catalog(head_only=head_only)
         elif _match_manifest(path) is not None:
             self._get_manifest(*_match_manifest(path), head_only=head_only)
-        elif _match_commit_files(path) is not None:
-            self._get_commit_file(
-                *_match_commit_files(path), head_only=head_only
+        elif _match_version_files(path) is not None:
+            self._get_version_file(
+                *_match_version_files(path), head_only=head_only
             )
         elif path == SUBMISSIONS_PATH:
             self._get_submissions(head_only=head_only)
@@ -546,14 +548,17 @@ class Handler(BaseHTTPRequestHandler):
         self._headers_sent = True
 
     def _get_catalog(self, head_only=False):
-        parsed = self._list_query(pagination.CATALOG_ROUTE, head_only)
-        if parsed is None:
-            return
-        limit, after = parsed
+        """Return the current snapshot: the cursor plus every active version.
 
+        protocol.md's ``Catalog`` is a whole snapshot, not a paged list: a new
+        client installs exactly this set and adopts ``upto_seq`` as its
+        cursor, then follows the content log through sync. The Playgrounds
+        are ordered by the order they were first published, so a client that
+        re-reads the catalog sees a stable list.
+        """
         try:
             with self._database() as connection:
-                page = self._build_catalog_page(connection, limit, after)
+                playgrounds = self._active_playgrounds(connection)
                 upto_seq = events.current_upto_seq(connection)
         except RepositoryError:
             self._api_error(500, "internal_error", head_only=head_only)
@@ -567,70 +572,43 @@ class Handler(BaseHTTPRequestHandler):
                 "minimum_client_protocol_version": (
                     events_types.MINIMUM_CLIENT_PROTOCOL_VERSION
                 ),
-                "catalog": list(page.items),
-                "nextCursor": self._next_cursor(
-                    pagination.CATALOG_ROUTE, page.next_key
-                ),
+                "playgrounds": playgrounds,
             },
             head_only=head_only,
         )
 
-    def _build_catalog_page(self, connection, limit, after):
-        """Return one bounded page of published Playground commits.
+    def _active_playgrounds(self, connection):
+        """Every ``{playground_id, current_version_id}`` a client may install.
 
-        The order is the order a teacher published the courses in
-        (``created_at``, then ``id`` as the tie-break), which is also the cursor's
-        key.  The page is read as an ordered batch of ``limit + 1`` rows and
-        trimmed to ``limit``, so the cursor is stable and a page never grows past
-        the caller's limit.  A playground whose id violates the identifier rules
-        fails closed instead of being skipped silently.
+        Archived Playgrounds are filtered out by ``state`` rather than by the
+        absence of a Git ref, so their history stays readable for a client
+        already pinned to it. A row whose ref cannot be resolved is skipped
+        instead of failing the whole catalog; a row whose stored identifier
+        is not representable fails closed.
         """
-
-        after_key = tuple(after) if after is not None else None
+        rows = connection.execute(
+            "SELECT id FROM playgrounds WHERE state = 'active' "
+            "ORDER BY created_at, id"
+        ).fetchall()
 
         items = []
-        next_key = None
-        while len(items) < limit:
-            where = " WHERE state = 'active'"
-            parameters = []
-            if after_key is not None:
-                # Row-value comparison: the ordering key and the cursor key are the
-                # same pair, so a page can neither skip nor repeat a playground.
-                where += " AND (created_at, id) > (?, ?)"
-                parameters.extend(after_key)
-            parameters.append(limit + 1 - len(items))
-            rows = connection.execute(
-                f"SELECT id, created_at FROM playgrounds{where} "
-                "ORDER BY created_at, id LIMIT ?",
-                parameters,
-            ).fetchall()
-            if not rows:
-                break
-            for row in rows:
-                # The cursor follows the last row *read*, not the last one returned:
-                # a row skipped for having no commit must not be offered again.
-                after_key = (row["created_at"], row["id"])
-                if not valid_playground_id(row["id"]):
-                    raise RepositoryError(
-                        "stored playground identifier is invalid"
-                    )
-                commit_id = manifests.current_playground_commit(
-                    self.server.repository, row["id"]
-                )
-                if commit_id is None:
-                    continue
-                items.append({"playgroundId": row["id"], "current_version_id": commit_id})
-                if len(items) >= limit:
-                    break
+        for row in rows:
+            if not valid_playground_id(row["id"]):
+                raise RepositoryError("stored playground identifier is invalid")
+            version_id = manifests.current_playground_commit(
+                self.server.repository, row["id"]
+            )
+            if version_id is None:
+                continue
+            items.append(
+                {"playground_id": row["id"], "current_version_id": version_id}
+            )
+        return items
 
-        if len(items) >= limit and next_key is None and after_key is not None:
-            next_key = list(after_key)
-        return pagination.Page(items=tuple(items), next_key=next_key)
-
-    def _get_manifest(self, playground_id, commit_id, head_only=False):
+    def _get_manifest(self, playground_id, version_id, head_only=False):
         try:
             manifest = manifests.generate_manifest(
-                self.server.repository, playground_id, commit_id
+                self.server.repository, playground_id, version_id
             )
         except manifests.ManifestError:
             self._not_found(head_only=head_only)
@@ -640,13 +618,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._respond_json(
-            200,
-            {"manifest": manifests.manifest_to_mapping(manifest)},
-            head_only=head_only,
+            200, manifests.manifest_to_mapping(manifest), head_only=head_only
         )
 
-    def _get_commit_file(
-        self, playground_id, commit_id, encoded_path, head_only=False
+    def _get_version_file(
+        self, playground_id, version_id, encoded_path, head_only=False
     ):
         path = _decode_content_path(encoded_path)
         if path is None:
@@ -655,7 +631,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             content = manifests.read_commit_file(
-                self.server.repository, playground_id, commit_id, path
+                self.server.repository, playground_id, version_id, path
             )
         except manifests.ManifestError:
             self._not_found(head_only=head_only)
@@ -664,11 +640,16 @@ class Handler(BaseHTTPRequestHandler):
             self._api_error(500, "internal_error", head_only=head_only)
             return
 
+        # The client verifies every download against the manifest's sha256;
+        # sending its own digest lets it refuse a body that changed in
+        # transit without hashing against a value it took from the same
+        # response.
         self._respond_bytes(
             200,
             content.data,
             content_type="application/octet-stream",
             etag=content.sha256,
+            extra_headers=(("X-Content-SHA256", content.sha256),),
             cache_control=COURSE_FILE_CACHE_CONTROL,
             head_only=head_only,
         )

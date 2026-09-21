@@ -19,7 +19,6 @@ from urllib.parse import parse_qs
 
 
 __all__ = [
-    "CATALOG_ROUTE",
     "CURSOR_VERSION",
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
@@ -37,7 +36,6 @@ DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
 
 SUBMISSIONS_ROUTE = "submissions"
-CATALOG_ROUTE = "catalog"
 
 _BASE64URL_ALPHABET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"

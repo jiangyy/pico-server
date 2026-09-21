@@ -240,10 +240,10 @@ class ManifestGenerationTest(ManifestTestBase):
         manifest = self.generate(self.playground_id, result.commit_id)
 
         mapping = manifests.manifest_to_mapping(manifest)
-        self.assertEqual(mapping["commitId"], result.commit_id)
-        self.assertEqual(
-            list(mapping["files"][0]), ["path", "size", "sha256", "blobId"]
-        )
+        self.assertEqual(mapping["playground_id"], self.playground_id)
+        self.assertEqual(mapping["version_id"], result.commit_id)
+        self.assertEqual(sorted(mapping), ["files", "playground_id", "version_id"])
+        self.assertEqual(sorted(mapping["files"][0]), ["path", "sha256", "size"])
         self.assertEqual(
             [entry["path"] for entry in mapping["files"]],
             [manifest_file.path for manifest_file in manifest.files],

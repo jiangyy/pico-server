@@ -7,6 +7,7 @@ directory, so a passing test is evidence about the HTTP contract rather than
 about an in-process call.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -171,66 +172,44 @@ class DistributionTest(ServerTestCase):
 
         status, _, body = self.request("GET", "/api/v1/catalog")
         self.assertEqual(status, 200)
+        self.assertEqual(
+            sorted(body),
+            [
+                "minimum_client_protocol_version",
+                "playgrounds",
+                "protocol_version",
+                "upto_seq",
+            ],
+        )
         self.assertIn(
-            {"playgroundId": playground_id, "current_version_id": commit_id},
-            body["catalog"],
+            {"playground_id": playground_id, "current_version_id": commit_id},
+            body["playgrounds"],
         )
-
-    def test_catalog_walks_every_page_without_repeating_an_entry(self):
-        first, _ = self.seed("pg-page-a")
-        second, _ = self.seed("pg-page-b")
-
-        # The server is shared by this whole test class, so the walk has to
-        # read the catalog as it really is rather than assume only two rows.
-        ids = []
-        cursor = None
-        while True:
-            query = "?limit=2" if cursor is None else f"?limit=2&cursor={cursor}"
-            status, _, body = self.request("GET", f"/api/v1/catalog{query}")
-            self.assertEqual(status, 200)
-            self.assertLessEqual(len(body["catalog"]), 2)
-            ids.extend(entry["playgroundId"] for entry in body["catalog"])
-            cursor = body["nextCursor"]
-            if cursor is None:
-                break
-
-        self.assertEqual(len(ids), len(set(ids)))
-        self.assertIn(first, ids)
-        self.assertIn(second, ids)
-
-    def test_catalog_rejects_a_cursor_from_another_route(self):
-        self.seed()
-        _, _, catalog = self.request("GET", "/api/v1/catalog")
-
-        status, _, body = self.request(
-            "GET", f"/api/v1/catalog?cursor={catalog['nextCursor']}"
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(body["code"], "invalid_request")
 
     def test_manifest_lists_the_published_files(self):
         playground_id, commit_id = self.seed()
 
         status, _, body = self.request(
             "GET",
-            f"/api/v1/playgrounds/{playground_id}/commits/{commit_id}/manifest",
+            f"/api/v1/playgrounds/{playground_id}/versions/{commit_id}/manifest",
         )
         self.assertEqual(status, 200)
-        manifest = body["manifest"]
-        self.assertEqual(manifest["commitId"], commit_id)
+        self.assertEqual(body["playground_id"], playground_id)
+        self.assertEqual(body["version_id"], commit_id)
         self.assertEqual(
-            sorted(entry["path"] for entry in manifest["files"]),
+            sorted(entry["path"] for entry in body["files"]),
             ["course/module/app.py", "picopg.json", "starter/setup.py"],
         )
-        for entry in manifest["files"]:
+        for entry in body["files"]:
+            self.assertEqual(sorted(entry), ["path", "sha256", "size"])
             self.assertEqual(len(entry["sha256"]), 64)
 
-    def test_commit_file_returns_exact_bytes(self):
+    def test_version_file_returns_exact_bytes_with_its_digest(self):
         playground_id, commit_id = self.seed()
 
         status, headers, body = self.request(
             "GET",
-            f"/api/v1/playgrounds/{playground_id}/commits/{commit_id}"
+            f"/api/v1/playgrounds/{playground_id}/versions/{commit_id}"
             "/files/course/module/app.py",
         )
         self.assertEqual(status, 200)
@@ -239,23 +218,28 @@ class DistributionTest(ServerTestCase):
         self.assertEqual(
             headers["cache-control"], "public, max-age=31536000, immutable"
         )
+        # The client refuses a download whose digest header is absent or
+        # malformed, so the header is part of the contract, not a nicety.
+        self.assertEqual(
+            headers["x-content-sha256"], hashlib.sha256(b"print(1)").hexdigest()
+        )
 
-    def test_manifest_of_an_unknown_commit_is_not_found(self):
+    def test_manifest_of_an_unknown_version_is_not_found(self):
         playground_id, _ = self.seed()
 
         status, _, body = self.request(
             "GET",
-            f"/api/v1/playgrounds/{playground_id}/commits/{'0' * 40}/manifest",
+            f"/api/v1/playgrounds/{playground_id}/versions/{'0' * 40}/manifest",
         )
         self.assertEqual(status, 404)
         self.assertEqual(body["code"], "not_found")
 
-    def test_commit_file_outside_the_tree_is_not_found(self):
+    def test_a_version_file_outside_the_tree_is_not_found(self):
         playground_id, commit_id = self.seed()
 
         status, _, body = self.request(
             "GET",
-            f"/api/v1/playgrounds/{playground_id}/commits/{commit_id}"
+            f"/api/v1/playgrounds/{playground_id}/versions/{commit_id}"
             "/files/course/../picopg.json",
         )
         self.assertEqual(status, 404)
@@ -374,7 +358,7 @@ class RetiringTest(ServerTestCase):
     def catalog_ids(self):
         status, _, body = self.request("GET", "/api/v1/catalog")
         self.assertEqual(status, 200)
-        return [entry["playgroundId"] for entry in body["catalog"]]
+        return [entry["playground_id"] for entry in body["playgrounds"]]
 
     def retire(self, playground_id, token=OPERATOR_TOKEN):
         return self.request(
@@ -394,7 +378,7 @@ class RetiringTest(ServerTestCase):
         # manifest for the version it had installed before the archive.
         status, _, _ = self.request(
             "GET",
-            f"/api/v1/playgrounds/pg-archive-catalog/commits/{commit_id}/manifest",
+            f"/api/v1/playgrounds/pg-archive-catalog/versions/{commit_id}/manifest",
         )
         self.assertEqual(status, 200)
 

@@ -13,26 +13,17 @@ import pagination  # noqa: E402
 
 class CursorTest(unittest.TestCase):
     def test_round_trip_and_route_binding(self):
-        for route in (
-            pagination.CATALOG_ROUTE,
-            pagination.SUBMISSIONS_ROUTE,
-        ):
-            with self.subTest(route=route):
-                cursor = pagination.encode_cursor(route, "row-1")
-                self.assertEqual(
-                    pagination.decode_cursor(cursor, route), "row-1"
-                )
-                other = (
-                    pagination.SUBMISSIONS_ROUTE
-                    if route == pagination.CATALOG_ROUTE
-                    else pagination.CATALOG_ROUTE
-                )
-                with self.assertRaises(pagination.PaginationError):
-                    pagination.decode_cursor(cursor, other)
+        route = pagination.SUBMISSIONS_ROUTE
+        cursor = pagination.encode_cursor(route, "row-1")
+        self.assertEqual(pagination.decode_cursor(cursor, route), "row-1")
+        # A cursor is bound to the route that minted it, so one route can
+        # never accept another route's cursor.
+        with self.assertRaises(pagination.PaginationError):
+            pagination.decode_cursor(cursor, "another-route")
 
     def test_cursor_is_canonical_base64url_json(self):
         cursor = pagination.encode_cursor(
-            pagination.CATALOG_ROUTE, "user-1"
+            pagination.SUBMISSIONS_ROUTE, "user-1"
         )
         self.assertNotIn("=", cursor)
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
@@ -41,13 +32,13 @@ class CursorTest(unittest.TestCase):
             payload,
             {
                 "key": "user-1",
-                "route": pagination.CATALOG_ROUTE,
+                "route": pagination.SUBMISSIONS_ROUTE,
                 "v": pagination.CURSOR_VERSION,
             },
         )
 
     def test_non_canonical_or_malformed_cursors_are_rejected(self):
-        route = pagination.CATALOG_ROUTE
+        route = pagination.SUBMISSIONS_ROUTE
         canonical = pagination.encode_cursor(route, "user-1")
 
         def encoded(payload):
@@ -73,7 +64,7 @@ class CursorTest(unittest.TestCase):
 
 
 class ParsePaginationTest(unittest.TestCase):
-    ROUTE = pagination.CATALOG_ROUTE
+    ROUTE = pagination.SUBMISSIONS_ROUTE
 
     def test_default_and_explicit_limit(self):
         self.assertEqual(
@@ -118,9 +109,7 @@ class ParsePaginationTest(unittest.TestCase):
                     pagination.parse_pagination(query, self.ROUTE)
 
     def test_cursor_from_another_route_is_rejected(self):
-        cursor = pagination.encode_cursor(
-            pagination.SUBMISSIONS_ROUTE, "pg-1"
-        )
+        cursor = pagination.encode_cursor("another-route", "pg-1")
         with self.assertRaises(pagination.PaginationError):
             pagination.parse_pagination(f"cursor={cursor}", self.ROUTE)
 

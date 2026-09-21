@@ -114,6 +114,7 @@ class CommitFile:
 class CommitManifest:
     """Deterministic manifest of one immutable Playground commit."""
 
+    playground_id: str
     commit_id: str
     files: tuple
 
@@ -143,7 +144,7 @@ def _path_is_allowed(path):
     return True
 
 
-def _build_manifest(repository, commit_id):
+def _build_manifest(repository, playground_id, commit_id):
     entries = repository_module.list_commit_tree(repository, commit_id)
     if len(entries) > MAX_ENTRY_COUNT:
         raise ManifestError(REASON_TOO_MANY_ENTRIES)
@@ -198,7 +199,9 @@ def _build_manifest(repository, commit_id):
         )
 
     files.sort(key=lambda manifest_file: manifest_file.path)
-    return CommitManifest(commit_id=commit_id, files=tuple(files))
+    return CommitManifest(
+        playground_id=playground_id, commit_id=commit_id, files=tuple(files)
+    )
 
 
 def generate_manifest(repository, playground_id, commit_id):
@@ -212,7 +215,7 @@ def generate_manifest(repository, playground_id, commit_id):
     """
 
     _require_published(repository, playground_id, commit_id)
-    return _build_manifest(repository, commit_id)
+    return _build_manifest(repository, playground_id, commit_id)
 
 
 def _require_published(repository, playground_id, commit_id):
@@ -305,18 +308,24 @@ def read_commit_file(repository, playground_id, commit_id, path):
 
 
 def manifest_to_mapping(manifest):
-    """Return the canonical camelCase mapping for a manifest."""
+    """Return the canonical mapping for a manifest.
+
+    The shape is exactly protocol.md's ``Manifest``: the Playground, the
+    version and one entry per file with ``path``, ``size`` and ``sha256``. The
+    Git blob id each entry was read from stays a storage detail and is not
+    exposed.
+    """
 
     if type(manifest) is not CommitManifest:
         raise TypeError("manifest must be a CommitManifest")
     return {
-        "commitId": manifest.commit_id,
+        "playground_id": manifest.playground_id,
+        "version_id": manifest.commit_id,
         "files": [
             {
                 "path": manifest_file.path,
                 "size": manifest_file.size,
                 "sha256": manifest_file.sha256,
-                "blobId": manifest_file.blob_id,
             }
             for manifest_file in manifest.files
         ],
