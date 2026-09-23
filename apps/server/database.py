@@ -8,7 +8,7 @@ from pathlib import Path
 import permissions
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @contextmanager
@@ -95,8 +95,7 @@ _TABLE_COLUMNS = {
     },
     "submissions": {
         "id": (1, 1),
-        "source_kind": (0, 1),
-        "source_id": (0, 1),
+        "assignment_id": (0, 1),
         "version_id": (0, 1),
         "student": (0, 1),
         "files_json": (0, 1),
@@ -106,9 +105,8 @@ _TABLE_COLUMNS = {
 
 # ``(table, column, referenced table, referenced column, on-delete action)``
 #
-# Submissions no longer name a playground: `source_id` may address a Playground
-# or an Assignment, so the old foreign key (and the table rebuild it needed) is
-# gone. Both tables keep their rows, so nothing it protected is lost.
+# A submission names an Assignment, so there is nothing here to point at: the
+# same-named Playground column is gone, and with it the foreign key v1 needed.
 _FOREIGN_KEYS = ()
 
 # Exact ordered column names for every index a production query relies on.
@@ -119,9 +117,9 @@ _REQUIRED_INDEXES = {
         ("created_at",),
     ),
     "assignments_created_at_idx": ("assignments", ("created_at",)),
-    "submissions_source_idx": (
+    "submissions_assignment_idx": (
         "submissions",
-        ("source_id", "created_at"),
+        ("assignment_id", "created_at"),
     ),
 }
 
@@ -353,6 +351,38 @@ def _initialize_schema(connection):
                 " ON submissions(source_id, created_at)"
             )
             _record_migration(connection, 5)
+
+        if version < 6:
+            # v6：一次提交对准的只有 Assignment。v5 的中性三件套是给"两类对象"
+            # 准备的，而课程不再收作业，所以列名收成 assignment_id。v5 之前指向课程
+            # 的提交（历史上都是验收记录）不在这里迁移：它们在新模型里没有一个诚实
+            # 的写法——把它们改写成 assignment_id 会凭空造出"交到一门作业上"的记录。
+            connection.execute("ALTER TABLE submissions RENAME TO submissions_v5")
+            connection.execute(
+                """
+                CREATE TABLE submissions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    assignment_id TEXT NOT NULL CHECK (assignment_id <> ''),
+                    version_id TEXT NOT NULL CHECK (version_id <> ''),
+                    student TEXT NOT NULL
+                        CHECK (student <> '' AND length(student) <= 128),
+                    files_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO submissions (id, assignment_id, version_id,"
+                " student, files_json, created_at)"
+                " SELECT id, source_id, version_id, student, files_json, created_at"
+                " FROM submissions_v5 WHERE source_kind = 'assignment'"
+            )
+            connection.execute("DROP TABLE submissions_v5")
+            connection.execute(
+                "CREATE INDEX submissions_assignment_idx"
+                " ON submissions(assignment_id, created_at)"
+            )
+            _record_migration(connection, 6)
 
         validate_schema(connection)
 

@@ -9,7 +9,7 @@
  *
  *   node e2e_client.mjs <port> <clientDir> <dataDir> bootstrap
  *   node e2e_client.mjs <port> <clientDir> <dataDir> sync
- *   node e2e_client.mjs <port> <clientDir> <dataDir> submit <playgroundId> <versionId> <name>
+ *   node e2e_client.mjs <port> <clientDir> <dataDir> submit <assignmentId> <versionId> <name>
  *
  * The data directory is reused between invocations, so the local store (the
  * installed blobs and the queue of hand-ins the server has not answered)
@@ -117,12 +117,11 @@ async function syncOnce() {
 }
 
 /** Queue one hand-in and push it, as the submit view does. */
-async function submit([playgroundId, versionId, name]) {
+async function submit([assignmentId, versionId, name]) {
   const text = await readFile(join(dataDir, "hand-in.py"), "utf8").catch(() => null);
   const body = text ?? `# 姓名：${name}\nprint(1)\n`;
   const queued = await submitModule.enqueueSubmission(dataDir, {
-    sourceKind: "playground",
-    sourceId: playgroundId,
+    assignmentId,
     versionId,
     files: { "work/main.py": body },
   });

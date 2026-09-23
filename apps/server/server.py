@@ -62,7 +62,6 @@ from repository import (
     CommitMetadata,
     RepositoryError,
     commit_in_assignment_history,
-    commit_in_playground_history,
     converge_assignment_ref,
     converge_history_ref,
     delete_pending_ref,
@@ -293,8 +292,7 @@ class Handler(ApiHandler):
                 "status": write.status,
                 "submission": {
                     "id": delivery.submission_id,
-                    "source_kind": delivery.source_kind,
-                    "source_id": delivery.source_id,
+                    "assignment_id": delivery.assignment_id,
                     "version_id": delivery.version_id,
                     "student": delivery.student,
                     "created_at": write.created_at,
@@ -305,29 +303,19 @@ class Handler(ApiHandler):
     def _submission_refusal(self, connection, repository, delivery):
         """``None`` when this hand-in may be stored, or ``(status, code)``.
 
-        Which object the Version has to belong to comes from `source_kind`: a
-        Playground and an Assignment each keep their own history, and a Version
-        that belongs to neither is not something a hand-in can be based on.
+        A hand-in answers one Assignment, and the Version it names has to belong
+        to that Assignment's own history — a Version of a different Assignment,
+        or of a Playground, is not something a hand-in can be based on.
         """
 
-        if delivery.source_kind == "playground":
-            source = get_playground(connection, delivery.source_id)
-            if source is None:
-                return 404, "invalid_version"
-            if source.state == "stopped":
-                return 409, "playground_stopped"
-            known = commit_in_playground_history(
-                repository, delivery.source_id, delivery.version_id
-            )
-        else:
-            source = assignments_module.get_assignment(connection, delivery.source_id)
-            if source is None:
-                return 404, "invalid_version"
-            if source.state == "stopped":
-                return 409, "assignment_stopped"
-            known = commit_in_assignment_history(
-                repository, delivery.source_id, delivery.version_id
-            )
+        source = assignments_module.get_assignment(connection, delivery.assignment_id)
+        if source is None:
+            return 404, "invalid_version"
+        if source.state == "stopped":
+            return 409, "assignment_stopped"
+        known = commit_in_assignment_history(
+            repository, delivery.assignment_id, delivery.version_id
+        )
         return None if known else (404, "invalid_version")
 
     def _write_submitted_work(self, delivery, created_at):
@@ -350,7 +338,7 @@ class Handler(ApiHandler):
                 self.server.submissions_path,
                 delivery.submission_id,
                 delivery.student,
-                delivery.source_id,
+                delivery.assignment_id,
                 delivery.version_id,
                 created_at,
                 dict(delivery.files),

@@ -19,13 +19,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bundles  # noqa: E402
 from unittest import mock  # noqa: E402
-import playgrounds  # noqa: E402
+import assignments  # noqa: E402
+import database  # noqa: E402
 import repository  # noqa: E402
 import submissions  # noqa: E402
 import uuid  # noqa: E402
 from database import immediate_transaction, open_database  # noqa: E402
-
-MANIFEST_BYTES = b'{"schemaVersion":1,"runtime":"python"}'
 
 
 class SubmissionTestBase(unittest.TestCase):
@@ -37,34 +36,45 @@ class SubmissionTestBase(unittest.TestCase):
         self.addCleanup(self.connection.close)
         self.repository = repository.open_repository(base / "picopg.git")
 
-        self.playground_id = "pg-one"
-        playgrounds.create_playground(self.connection, self.playground_id)
-        self.commit_id = playgrounds.publish_playground(
-            self.connection,
-            self.playground_id,
+        self.assignment_id = "hw-one"
+        self.publishes = 0
+        self.version_id = self.publish("# 作业一\n")
+
+    def publish(self, markdown):
+        """Publish one Assignment version, the way the application layer does."""
+
+        self.publishes += 1
+        row = assignments.require_publishable(self.connection, self.assignment_id, None)
+        encoded = markdown.encode("utf-8")
+        prepared = repository.prepare_assignment_version(
             self.repository,
-            bundles.validate_bundle(
-                [
-                    bundles.BundleEntry("picopg.json", MANIFEST_BYTES),
-                    bundles.BundleEntry("course/module/app.py", b"print(1)"),
-                ]
-            ),
+            self.assignment_id,
+            encoded,
             repository.CommitMetadata(
                 name="PicoPG Operator",
                 email="operator@picopg.invalid",
                 timestamp="2026-01-01T00:00:00.000000Z",
-                message="Publish playground bundle",
+                message="Publish assignment",
             ),
-        ).commit_id
+            f"publish-{self.publishes}",
+            assignments.observed_version(row),
+        )
+        with database.immediate_transaction(self.connection):
+            commit_id = assignments.commit_prepared_assignment(
+                self.connection, self.assignment_id, prepared, None, "作业一"
+            )
+        if not prepared.no_op:
+            repository.converge_assignment_ref(self.repository, self.assignment_id, commit_id)
+            repository.delete_pending_ref(self.repository, prepared.publish_id)
+        return commit_id
 
     def payload(self, **overrides):
         """One hand-in body, in the shape a client sends it."""
 
         payload = {
             "submission_id": submission_id(),
-            "source_kind": "playground",
-            "source_id": self.playground_id,
-            "version_id": self.commit_id,
+            "assignment_id": self.assignment_id,
+            "version_id": self.version_id,
             "files": {"work/main.py": "# 姓名：2026-001\nprint(1)\n"},
         }
         payload.update(overrides)
@@ -77,9 +87,8 @@ class SubmissionTestBase(unittest.TestCase):
         delivery = submissions.decode_delivery(
             {
                 "submission_id": submission_id or globals()["submission_id"](),
-                "source_kind": "playground",
-                "source_id": self.playground_id,
-                "version_id": self.commit_id,
+                "assignment_id": self.assignment_id,
+                "version_id": self.version_id,
                 "files": files,
             }
         )
@@ -88,8 +97,7 @@ class SubmissionTestBase(unittest.TestCase):
         self.assertNotEqual(write.status, "conflict")
         return {
             "id": delivery.submission_id,
-            "source_kind": delivery.source_kind,
-            "source_id": delivery.source_id,
+            "assignment_id": delivery.assignment_id,
             "version_id": delivery.version_id,
             "student": delivery.student,
             "created_at": write.created_at,
@@ -148,9 +156,8 @@ class DecodeSubmissionTest(SubmissionTestBase):
         self.assertIsInstance(request, submissions.SubmissionDelivery)
 
         self.assertIsInstance(request, submissions.SubmissionDelivery)
-        self.assertEqual(request.source_kind, "playground")
-        self.assertEqual(request.source_id, self.playground_id)
-        self.assertEqual(request.version_id, self.commit_id)
+        self.assertEqual(request.assignment_id, self.assignment_id)
+        self.assertEqual(request.version_id, self.version_id)
         self.assertEqual(request.submission_id, body["submission_id"])
         self.assertEqual(request.student, "2026-001")
         self.assertEqual(
@@ -206,7 +213,7 @@ class DecodeSubmissionTest(SubmissionTestBase):
             submissions.decode_delivery(self.payload(files={"work/a.py": "x" * (1024 * 1024 + 1)}))
 
     def test_shape_errors_are_rejected(self):
-        for payload in (None, [], "text", {}, {"source_id": "pg-one"}):
+        for payload in (None, [], "text", {}, {"assignment_id": "pg-one"}):
             with self.subTest(payload=payload):
                 with self.assertRaises(submissions.InvalidSubmissionRequestError):
                     submissions.decode_delivery(payload)
@@ -232,8 +239,7 @@ class FileSetValidationTest(unittest.TestCase):
             submissions.decode_delivery(
                 {
                     "submission_id": submission_id(),
-                    "source_kind": "playground",
-                    "source_id": "pg-one",
+                    "assignment_id": "pg-one",
                     "version_id": "0" * 40,
                     "files": files,
                 }
@@ -278,8 +284,7 @@ class FileSetValidationTest(unittest.TestCase):
         request = submissions.decode_delivery(
             {
                 "submission_id": submission_id(),
-                "source_kind": "playground",
-                "source_id": "pg-one",
+                "assignment_id": "pg-one",
                 "version_id": "0" * 40,
                 "files": {
                     "work/main.py": "# 姓名：2026-001\n",
@@ -336,8 +341,7 @@ class FileSetValidationTest(unittest.TestCase):
         request = submissions.decode_delivery(
             {
                 "submission_id": submission_id(),
-                "source_kind": "playground",
-                "source_id": "pg-one",
+                "assignment_id": "pg-one",
                 "version_id": "0" * 40,
                 "files": {"work/b.py": "2", "work/a.py": "1", "work/main.py": "# 姓名：2026-001\n"},
             }
@@ -363,10 +367,10 @@ class ReadSubmissionTest(SubmissionTestBase):
         # handing a caller a value the API could never have produced.
         with self.connection:
             self.connection.execute(
-                "INSERT INTO submissions (id, source_kind, source_id,"
+                "INSERT INTO submissions (id, assignment_id,"
                 " version_id, student, files_json, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("sub-1", "playground", self.playground_id, "HEAD", "a", "{}", "2026-01-01T00:00:00Z"),
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("sub-1", self.assignment_id, "HEAD", "a", "{}", "2026-01-01T00:00:00Z"),
             )
         with self.assertRaises(submissions.StoredSubmissionError):
             submissions.get_submission(self.connection, "sub-1")
@@ -374,10 +378,10 @@ class ReadSubmissionTest(SubmissionTestBase):
     def test_a_malformed_files_column_fails_closed(self):
         with self.connection:
             self.connection.execute(
-                "INSERT INTO submissions (id, source_kind, source_id,"
+                "INSERT INTO submissions (id, assignment_id,"
                 " version_id, student, files_json, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("sub-2", "playground", self.playground_id, self.commit_id, "a", "[]", "x"),
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("sub-2", self.assignment_id, self.version_id, "a", "[]", "x"),
             )
         with self.assertRaises(submissions.StoredSubmissionError):
             submissions.get_submission(self.connection, "sub-2")
@@ -433,16 +437,11 @@ class BackfillSubmissionFilesTest(unittest.TestCase):
         self.connection = open_database(base / "app.db")
         self.addCleanup(self.connection.close)
         self.root = base / "submissions"
-        with self.connection:
-            self.connection.execute(
-                "INSERT INTO playgrounds (id, created_at) VALUES ('pg-one', '2026-01-01T00:00:00Z')"
-            )
-
     def store(self, submission_id, student, text="print(1)\n", created_at="2026-09-18T10:11:12Z"):
         with self.connection:
             self.connection.execute(
-                "INSERT INTO submissions (id, source_kind, source_id, version_id, student,"
-                " files_json, created_at) VALUES (?, 'playground', 'pg-one', ?, ?, ?, ?)",
+                "INSERT INTO submissions (id, assignment_id, version_id, student,"
+                " files_json, created_at) VALUES (?, 'pg-one', ?, ?, ?, ?)",
                 (submission_id, "c1" + "0" * 38, student, json.dumps({"work/main.py": text}), created_at),
             )
 
@@ -503,7 +502,7 @@ class SubmissionFileLayoutTest(unittest.TestCase):
             root=self.root,
             submission_id="abcdef1234567890",
             student=student,
-            source_id="pg-one",
+            assignment_id="pg-one",
             version_id="c1" + "0" * 38,
             created_at="2026-09-18T10:11:12Z",
             files=files if files is not None else {"work/main.py": "print(1)\n"},
@@ -540,7 +539,7 @@ class SubmissionFileLayoutTest(unittest.TestCase):
                 "files": ["work/main.py"],
                 "id": "abcdef1234567890",
                 "ordinal": 1,
-                "sourceId": "pg-one",
+                "assignmentId": "pg-one",
                 "student": "张三（1 班）",
             },
         )

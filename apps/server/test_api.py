@@ -208,10 +208,50 @@ class ServerTestCase(unittest.TestCase):
         assert status == 201, (status, body)
         return playground_id, body["version_id"]
 
+    def current_assignment_version(self, assignment_id):
+        """The Version a publish of this Assignment would have to name as base."""
+
+        for entry in self.listed_assignments():
+            if entry["assignment_id"] == assignment_id:
+                return entry["current_version_id"]
+        return None
+
+    def seed_assignment(self, assignment_id=None, markdown="# 作业一\n"):
+        """Publish one Assignment; return ``(id, version_id)``."""
+
+        assignment_id = assignment_id or self.new_id()
+        status, _, body = self.publish_assignment(assignment_id, markdown)
+        assert status == 201, (status, body)
+        return assignment_id, body["version_id"]
+
+    def new_id(self, prefix="hw"):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def publish_assignment(self, assignment_id, markdown="# 标题\n", base=None, key=None):
+        headers = {"Idempotency-Key": key or uuid.uuid4().hex}
+        if base is not None:
+            headers["X-Base-Version-Id"] = base
+        return self.request(
+            "POST",
+            f"/api/v1/assignments/{assignment_id}/versions",
+            raw_body=markdown.encode("utf-8"),
+            token=OPERATOR_TOKEN,
+            content_type="text/markdown",
+            extra_headers=headers,
+        )
+
+    def listed_assignments(self):
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        return body["assignments"]
+
+    def listed_assignment_ids(self):
+        return [entry["assignment_id"] for entry in self.listed_assignments()]
+
     def hand_in(
         self,
-        playground_id,
-        commit_id,
+        assignment_id,
+        version_id,
         header="# 姓名：2026-001",
         files=None,
         submission_id=None,
@@ -230,9 +270,8 @@ class ServerTestCase(unittest.TestCase):
             "/api/v1/submissions",
             payload={
                 "submission_id": delivery_id,
-                "source_kind": "playground",
-                "source_id": playground_id,
-                "version_id": commit_id,
+                "assignment_id": assignment_id,
+                "version_id": version_id,
                 "files": files if files is not None else {"work/main.py": f"{header}\nprint(1)\n"},
             },
         )
@@ -244,7 +283,7 @@ class ServerTestCase(unittest.TestCase):
             "submission_id": delivery_id,
         }
 
-    def stored_submissions(self, playground_id):
+    def stored_submissions(self, assignment_id):
         status, _, body = self.request(
             "GET", "/api/v1/submissions", token=OPERATOR_TOKEN
         )
@@ -252,7 +291,7 @@ class ServerTestCase(unittest.TestCase):
         return [
             entry
             for entry in body["submissions"]
-            if entry["sourceId"] == playground_id
+            if entry["assignmentId"] == assignment_id
         ]
 
 
@@ -1060,35 +1099,38 @@ class RetiringTest(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "no_op")
 
-    def test_a_retired_course_keeps_the_work_already_handed_in(self):
-        playground_id, commit_id = self.seed("pg-archive-keeps")
-        self.assertEqual(self.hand_in(playground_id, commit_id)["status"], "accepted")
-        (stored,) = self.stored_submissions(playground_id)
+    def test_a_stopped_assignment_keeps_the_work_already_handed_in(self):
+        assignment_id, version_id = self.seed_assignment()
+        self.assertEqual(self.hand_in(assignment_id, version_id)["status"], "accepted")
+        (stored,) = self.stored_submissions(assignment_id)
         submission_id = stored["id"]
 
-        self.assertEqual(self.retire(playground_id)[0], 200)
+        status, _, _ = self.request(
+            "DELETE", f"/api/v1/assignments/{assignment_id}", token=OPERATOR_TOKEN
+        )
+        self.assertEqual(status, 200)
 
-        # The submission is still readable, and its Playground still exists for it.
+        # The hand-in is still readable: 取消发布撤的是题目，不是已经交上来的作业。
         status, _, body = self.request(
             "GET", f"/api/v1/submissions/{submission_id}", token=OPERATOR_TOKEN
         )
         self.assertEqual(status, 200)
-        self.assertEqual(body["submission"]["sourceId"], playground_id)
+        self.assertEqual(body["submission"]["assignmentId"], assignment_id)
 
-        # A new submission against a retired course is refused.
-        result = self.hand_in(playground_id, commit_id)
+        # A new submission against a stopped assignment is refused.
+        result = self.hand_in(assignment_id, version_id)
         self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["reason"], "playground_stopped")
+        self.assertEqual(result["reason"], "assignment_stopped")
 
 
 class SubmissionTest(ServerTestCase):
     """Submissions arrive through sync; the operator only reads them back."""
 
     def test_the_operator_reads_the_submitted_files_back(self):
-        playground_id, commit_id = self.seed()
-        self.assertEqual(self.hand_in(playground_id, commit_id)["status"], "accepted")
+        assignment_id, version_id = self.seed_assignment()
+        self.assertEqual(self.hand_in(assignment_id, version_id)["status"], "accepted")
 
-        (stored,) = self.stored_submissions(playground_id)
+        (stored,) = self.stored_submissions(assignment_id)
         status, _, body = self.request(
             "GET",
             f"/api/v1/submissions/{stored['id']}",
@@ -1101,8 +1143,8 @@ class SubmissionTest(ServerTestCase):
         )
 
     def test_listing_submissions_requires_the_operator_token(self):
-        playground_id, commit_id = self.seed()
-        self.hand_in(playground_id, commit_id)
+        assignment_id, version_id = self.seed_assignment()
+        self.hand_in(assignment_id, version_id)
 
         anonymous = self.request("GET", "/api/v1/submissions")
         self.assertEqual(anonymous[0], 401)
@@ -1114,35 +1156,34 @@ class SubmissionTest(ServerTestCase):
             self.assertNotIn("files", entry)
 
     def test_a_hand_in_records_the_exact_version_and_files(self):
-        playground_id, commit_id = self.seed()
-        self.hand_in(playground_id, commit_id)
+        assignment_id, version_id = self.seed_assignment()
+        self.hand_in(assignment_id, version_id)
 
-        (stored,) = self.stored_submissions(playground_id)
-        self.assertEqual(stored["versionId"], commit_id)
-        self.assertEqual(stored["sourceKind"], "playground")
-        self.assertEqual(stored["sourceId"], playground_id)
+        (stored,) = self.stored_submissions(assignment_id)
+        self.assertEqual(stored["versionId"], version_id)
+        self.assertEqual(stored["assignmentId"], assignment_id)
         self.assertEqual(stored["student"], "2026-001")
 
     def test_the_same_delivery_name_twice_is_one_submission(self):
         # 重发同一个名字（响应丢了、客户端重试）必须落回同一行：客户端拿到的是
         # 同一个结果，服务端不会多出一份作业。
-        playground_id, commit_id = self.seed()
-        first = self.hand_in(playground_id, commit_id, submission_id="same-name")
-        second = self.hand_in(playground_id, commit_id, submission_id="same-name")
+        assignment_id, version_id = self.seed_assignment()
+        first = self.hand_in(assignment_id, version_id, submission_id="same-name")
+        second = self.hand_in(assignment_id, version_id, submission_id="same-name")
 
         self.assertEqual(
             [first["status"], second["status"]], ["accepted", "existing_same"]
         )
-        self.assertEqual(len(self.stored_submissions(playground_id)), 1)
+        self.assertEqual(len(self.stored_submissions(assignment_id)), 1)
 
     def test_one_delivery_name_with_different_content_is_refused(self):
         # 同一个名字配不同内容：这是两份不同的作业抢一个名字，不是重试。什么都不写，
         # 而且重发也没用（所以是稳定的拒绝码，不是"再试一次"）。
-        playground_id, commit_id = self.seed()
-        self.hand_in(playground_id, commit_id, submission_id="collision")
+        assignment_id, version_id = self.seed_assignment()
+        self.hand_in(assignment_id, version_id, submission_id="collision")
         again = self.hand_in(
-            playground_id,
-            commit_id,
+            assignment_id,
+            version_id,
             header="# 姓名：另一个学生",
             files={"work/main.py": "# 姓名：另一个学生\nprint(2)\n"},
             submission_id="collision",
@@ -1150,17 +1191,17 @@ class SubmissionTest(ServerTestCase):
 
         self.assertEqual(again["status"], "rejected")
         self.assertEqual(again["reason"], "submission_conflict")
-        (stored,) = self.stored_submissions(playground_id)
+        (stored,) = self.stored_submissions(assignment_id)
         self.assertEqual(stored["student"], "2026-001", "先到的那份没被改写")
 
     def test_a_hand_in_without_an_attribution_is_refused(self):
         # The name lives in the hand-in's own header, so an empty file set
         # carries none and cannot be filed under anyone.
-        playground_id, commit_id = self.seed()
-        result = self.hand_in(playground_id, commit_id, files={})
+        assignment_id, version_id = self.seed_assignment()
+        result = self.hand_in(assignment_id, version_id, files={})
         self.assertEqual(result["status"], "rejected")
         self.assertEqual(result["reason"], "invalid_submission")
-        self.assertEqual(self.stored_submissions(playground_id), [])
+        self.assertEqual(self.stored_submissions(assignment_id), [])
 
 
 class ProtocolVersionTest(ServerTestCase):
@@ -1220,39 +1261,15 @@ class AssignmentTest(ServerTestCase):
     "已有作业没给 base"。
     """
 
-    def new_id(self, prefix="hw"):
-        return f"{prefix}-{uuid.uuid4().hex[:8]}"
-
-    def publish(self, assignment_id, markdown="# 标题\n", base=None, key=None):
-        headers = {"Idempotency-Key": key or uuid.uuid4().hex}
-        if base is not None:
-            headers["X-Base-Version-Id"] = base
-        return self.request(
-            "POST",
-            f"/api/v1/assignments/{assignment_id}/versions",
-            raw_body=markdown.encode("utf-8"),
-            token=OPERATOR_TOKEN,
-            content_type="text/markdown",
-            extra_headers=headers,
-        )
-
-    def listed(self):
-        status, _, body = self.request("GET", "/api/v1/catalog")
-        self.assertEqual(status, 200)
-        return body["assignments"]
-
-    def listed_ids(self):
-        return [entry["assignment_id"] for entry in self.listed()]
-
     def test_publishing_a_title_puts_it_in_the_catalog(self):
         first, second = self.new_id(), self.new_id()
         for assignment_id, title in ((first, "题目一"), (second, "题目二")):
-            status, _, body = self.publish(assignment_id, f"# {title}\n")
+            status, _, body = self.publish_assignment(assignment_id, f"# {title}\n")
             self.assertEqual(status, 201, body)
             self.assertEqual(body["status"], "accepted")
             self.assertTrue(body["version_id"])
 
-        entries = {entry["assignment_id"]: entry for entry in self.listed()}
+        entries = {entry["assignment_id"]: entry for entry in self.listed_assignments()}
         self.assertEqual(entries[first]["title"], "题目一")
         self.assertEqual(entries[second]["title"], "题目二")
         self.assertNotEqual(
@@ -1261,36 +1278,36 @@ class AssignmentTest(ServerTestCase):
 
     def test_the_same_content_again_is_a_no_op(self):
         assignment_id = self.new_id()
-        _, _, first = self.publish(assignment_id, "# one\n")
-        status, _, second = self.publish(assignment_id, "# one\n", base=first["version_id"])
+        _, _, first = self.publish_assignment(assignment_id, "# one\n")
+        status, _, second = self.publish_assignment(assignment_id, "# one\n", base=first["version_id"])
 
         self.assertEqual(status, 201)
         self.assertEqual(second["status"], "no_op")
         self.assertEqual(second["version_id"], first["version_id"])
-        self.assertEqual(self.listed_ids().count(assignment_id), 1)
+        self.assertEqual(self.listed_assignment_ids().count(assignment_id), 1)
 
     def test_a_stale_base_is_a_conflict(self):
         assignment_id = self.new_id()
-        _, _, first = self.publish(assignment_id, "# one\n")
-        self.publish(assignment_id, "# two\n", base=first["version_id"])
+        _, _, first = self.publish_assignment(assignment_id, "# one\n")
+        self.publish_assignment(assignment_id, "# two\n", base=first["version_id"])
 
-        status, _, body = self.publish(assignment_id, "# three\n", base=first["version_id"])
+        status, _, body = self.publish_assignment(assignment_id, "# three\n", base=first["version_id"])
         self.assertEqual((status, body), (409, {"status": "conflict"}))
 
     def test_the_first_publish_must_not_name_a_base(self):
         assignment_id = self.new_id()
-        status, _, body = self.publish(assignment_id, "# one\n", base="a" * 40)
+        status, _, body = self.publish_assignment(assignment_id, "# one\n", base="a" * 40)
         self.assertEqual((status, body), (409, {"status": "conflict"}))
 
     def test_a_body_that_is_not_a_title_is_refused(self):
         assignment_id = self.new_id()
-        status, _, body = self.publish(assignment_id, "no title here\n")
+        status, _, body = self.publish_assignment(assignment_id, "no title here\n")
         self.assertEqual(status, 400)
         self.assertEqual(body["code"], "invalid_assignment")
-        self.assertNotIn(assignment_id, self.listed_ids())
+        self.assertNotIn(assignment_id, self.listed_assignment_ids())
 
     def test_an_oversized_body_is_refused_before_it_is_parsed(self):
-        status, _, _ = self.publish(self.new_id(), "# t\n" + "x" * (64 * 1024))
+        status, _, _ = self.publish_assignment(self.new_id(), "# t\n" + "x" * (64 * 1024))
         self.assertEqual(status, 413)
 
     def test_publishing_needs_the_operator_token(self):
@@ -1305,30 +1322,30 @@ class AssignmentTest(ServerTestCase):
 
     def test_a_replayed_key_answers_the_same(self):
         assignment_id, key = self.new_id(), uuid.uuid4().hex
-        _, _, first = self.publish(assignment_id, "# one\n", key=key)
-        status, _, second = self.publish(assignment_id, "# one\n", key=key)
+        _, _, first = self.publish_assignment(assignment_id, "# one\n", key=key)
+        status, _, second = self.publish_assignment(assignment_id, "# one\n", key=key)
         self.assertEqual(status, 201)
         self.assertEqual(second, first)
 
     def test_unpublishing_hides_it_and_publishing_again_brings_it_back(self):
         assignment_id = self.new_id()
-        _, _, first = self.publish(assignment_id, "# one\n")
+        _, _, first = self.publish_assignment(assignment_id, "# one\n")
 
         status, _, body = self.request(
             "DELETE", f"/api/v1/assignments/{assignment_id}", token=OPERATOR_TOKEN
         )
         self.assertEqual((status, body), (200, {"status": "accepted"}))
-        self.assertNotIn(assignment_id, self.listed_ids(), "取消发布之后学生端看不到")
+        self.assertNotIn(assignment_id, self.listed_assignment_ids(), "取消发布之后学生端看不到")
 
         status, _, body = self.request(
             "DELETE", f"/api/v1/assignments/{assignment_id}", token=OPERATOR_TOKEN
         )
         self.assertEqual((status, body), (200, {"status": "no_op"}))
 
-        status, _, again = self.publish(assignment_id, "# two\n", base=first["version_id"])
+        status, _, again = self.publish_assignment(assignment_id, "# two\n", base=first["version_id"])
         self.assertEqual(status, 201)
         self.assertEqual(again["status"], "accepted")
-        entry = next(e for e in self.listed() if e["assignment_id"] == assignment_id)
+        entry = next(e for e in self.listed_assignments() if e["assignment_id"] == assignment_id)
         self.assertEqual(entry["title"], "two", "发布就是重新上线，标题也跟着换")
 
     def test_unpublishing_an_unknown_assignment_is_not_found(self):
@@ -1339,11 +1356,11 @@ class AssignmentTest(ServerTestCase):
 
     def test_a_stopped_assignment_stays_out_of_the_catalog(self):
         stopped, kept = self.new_id(), self.new_id()
-        self.publish(stopped, "# one\n")
-        self.publish(kept, "# two\n")
+        self.publish_assignment(stopped, "# one\n")
+        self.publish_assignment(kept, "# two\n")
         self.request("DELETE", f"/api/v1/assignments/{stopped}", token=OPERATOR_TOKEN)
 
-        ids = self.listed_ids()
+        ids = self.listed_assignment_ids()
         self.assertNotIn(stopped, ids)
         self.assertIn(kept, ids)
 
@@ -1357,14 +1374,14 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
     def root(self):
         return Path(self.server.submissions_path)
 
-    def hand_in(self, student, files=None, course=None):
-        # 每个用例一门新课：`ServerTestCase` 共享一个库，同名 id 会撞幂等键。
-        playground_id, version_id = self.seed(course)
+    def hand_in(self, student, files=None, assignment=None):
+        # 每个用例一道新作业：`ServerTestCase` 共享一个库，同名 id 会撞幂等键。
+        assignment_id, version_id = self.seed_assignment(assignment)
         text = files or {"work/main.py": f"# 姓名：{student}\nprint(1)\n"}
-        result = self.hand_in_event(playground_id, version_id, text)
-        return playground_id, version_id, result
+        result = self.hand_in_event(assignment_id, version_id, text)
+        return assignment_id, version_id, result
 
-    def hand_in_event(self, playground_id, version_id, files, submission_id=None):
+    def hand_in_event(self, assignment_id, version_id, files, submission_id=None):
         """One hand-in, exactly as the endpoint receives it."""
 
         status, _, body = self.request(
@@ -1372,8 +1389,7 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
             "/api/v1/submissions",
             payload={
                 "submission_id": submission_id or uuid.uuid4().hex,
-                "source_kind": "playground",
-                "source_id": playground_id,
+                "assignment_id": assignment_id,
                 "version_id": version_id,
                 "files": files,
             },
@@ -1383,10 +1399,10 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
         return {"status": "rejected", "reason": body.get("code", ""), "submission_id": submission_id}
 
     def test_an_accepted_hand_in_lands_in_a_folder(self):
-        playground_id, version_id, result = self.hand_in("张三（1 班）")
+        assignment_id, version_id, result = self.hand_in("张三（1 班）")
         self.assertEqual(result["status"], "accepted")
 
-        folder = self.root() / "1 班" / "张三" / playground_id
+        folder = self.root() / "1 班" / "张三" / assignment_id
         self.assertTrue(folder.is_dir(), f"没有这个目录：{folder}")
         self.assertEqual(
             (folder / "work" / "main.py").read_text(encoding="utf-8"),
@@ -1397,49 +1413,49 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
         manifest = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["student"], "张三（1 班）")
         self.assertEqual(manifest["versionId"], version_id)
-        self.assertEqual(manifest["sourceId"], playground_id)
+        self.assertEqual(manifest["assignmentId"], assignment_id)
         self.assertEqual(manifest["files"], ["work/main.py"])
 
-    def test_a_second_hand_in_of_the_same_course_is_numbered(self):
-        playground_id, version_id = self.seed("hello-twice")
-        first = self.hand_in_event(playground_id, version_id, {"work/main.py": "# 姓名：李四\nprint(1)\n"})
-        second = self.hand_in_event(playground_id, version_id, {"work/main.py": "# 姓名：李四\nprint(2)\n"})
+    def test_a_second_hand_in_of_the_same_assignment_is_numbered(self):
+        assignment_id, version_id = self.seed_assignment()
+        first = self.hand_in_event(assignment_id, version_id, {"work/main.py": "# 姓名：李四\nprint(1)\n"})
+        second = self.hand_in_event(assignment_id, version_id, {"work/main.py": "# 姓名：李四\nprint(2)\n"})
         self.assertEqual([first["status"], second["status"]], ["accepted", "accepted"])
 
         base = self.root() / "李四"
-        self.assertEqual(sorted(p.name for p in base.iterdir()), [playground_id, f"{playground_id}-2"])
+        self.assertEqual(sorted(p.name for p in base.iterdir()), [assignment_id, f"{assignment_id}-2"])
         self.assertEqual(
-            (base / f"{playground_id}-2" / "work" / "main.py").read_text(encoding="utf-8"),
+            (base / f"{assignment_id}-2" / "work" / "main.py").read_text(encoding="utf-8"),
             "# 姓名：李四\nprint(2)\n",
         )
 
     def test_a_replay_repaints_the_same_folder(self):
         # 响应丢了、客户端原样重试：同一个 delivery 名字，落回同一行、同一个文件夹，
         # 不会多出一个编号目录。
-        playground_id, version_id = self.seed("hello-replay")
+        assignment_id, version_id = self.seed_assignment()
         files = {"work/main.py": "# 姓名：王五\nprint(1)\n"}
 
-        first = self.hand_in_event(playground_id, version_id, files, submission_id="disk-replay-1")
-        second = self.hand_in_event(playground_id, version_id, files, submission_id="disk-replay-1")
+        first = self.hand_in_event(assignment_id, version_id, files, submission_id="disk-replay-1")
+        second = self.hand_in_event(assignment_id, version_id, files, submission_id="disk-replay-1")
         self.assertEqual(
             [first["status"], second["status"]], ["accepted", "existing_same"]
         )
 
         base = self.root() / "王五"
-        self.assertEqual([p.name for p in base.iterdir()], [playground_id])
+        self.assertEqual([p.name for p in base.iterdir()], [assignment_id])
 
     def test_a_rejected_hand_in_writes_nothing(self):
-        playground_id, version_id = self.seed("hello-rejected")
-        result = self.hand_in_event(playground_id, version_id, {"course/index.html": "x"})
+        assignment_id, version_id = self.seed_assignment()
+        result = self.hand_in_event(assignment_id, version_id, {"course/index.html": "x"})
         self.assertEqual(result["status"], "rejected")
         # 只有目录被建出来（或根本没有），不该有内容
         for path in self.root().rglob("*") if self.root().exists() else []:
             self.assertNotIn("course", path.parts)
 
     def test_a_hostile_student_name_stays_inside_the_root(self):
-        playground_id, version_id = self.seed("hello-hostile")
+        assignment_id, version_id = self.seed_assignment()
         result = self.hand_in_event(
-            playground_id,
+            assignment_id,
             version_id,
             {"work/main.py": "# 姓名：../../etc/passwd 班级：../../..\nprint(1)\n"},
         )
@@ -1456,8 +1472,8 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
     def test_the_folder_is_not_world_readable(self):
         # 独立的姓名：同一个人同一门课再交一次会被编号成 `-2`，那是另一条用例在测的
         # 行为，不该在这里悄悄影响路径。
-        playground_id, _, _ = self.hand_in("权限（9 班）")
-        folder = self.root() / "9 班" / "权限" / playground_id
+        assignment_id, _, _ = self.hand_in("权限（9 班）")
+        folder = self.root() / "9 班" / "权限" / assignment_id
         mode = folder.stat().st_mode & 0o777
         self.assertEqual(mode & 0o077, 0, f"目录权限 {oct(mode)} 对同组/其他用户开放了")
 

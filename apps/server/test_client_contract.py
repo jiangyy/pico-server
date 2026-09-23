@@ -151,6 +151,24 @@ class ClientContractTest(unittest.TestCase):
         self.assertIn(status, (200, 201), body)
         return body["version_id"]
 
+    def publish_assignment(self, assignment_id, markdown="# 标题\n", base=None):
+        """Publish one Assignment, returning its new version id."""
+
+        headers = {
+            "Content-Type": "text/markdown",
+            "Idempotency-Key": uuid.uuid4().hex,
+        }
+        if base is not None:
+            headers["X-Base-Version-Id"] = base
+        status, body = self.operator(
+            "POST",
+            f"/api/v1/assignments/{assignment_id}/versions",
+            markdown.encode("utf-8"),
+            headers,
+        )
+        self.assertIn(status, (200, 201), body)
+        return body["version_id"]
+
     # --- the client's side ---------------------------------------------------
 
     def client(self, step, *args, data=None):
@@ -172,6 +190,7 @@ class ClientContractTest(unittest.TestCase):
 
     def test_the_client_can_bootstrap_install_submit_and_retire(self):
         version_id = self.publish("pg-e2e")
+        assignment_version = self.publish_assignment("hw-e2e")
 
         # 1. First launch: read the catalog and install its content.
         boot = self.client("bootstrap")
@@ -192,16 +211,17 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>hello</html>")
 
         # 3. A hand-in travels as one named delivery and comes back stored.
-        hand_in = self.client("submit", "pg-e2e", version_id, "张三")
+        hand_in = self.client("submit", "hw-e2e", assignment_version, "张三")
         self.assertEqual(hand_in["outcome"], "stored")
         self.assertEqual(hand_in["pending"], 0)
         # 一次投递一次请求：客户端不是把队列攒成一批发出去的。
         self.assertEqual(hand_in["http"]["submissions"], 1)
 
-        # 4. The server stored it under the name the file carries.
-        (stored,) = self.stored_submissions("pg-e2e")
+        # 4. The server stored it under the name the file carries, against the
+        #    assignment version it answered.
+        (stored,) = self.stored_submissions("hw-e2e")
         self.assertEqual(stored["student"], "张三")
-        self.assertEqual(stored["versionId"], version_id)
+        self.assertEqual(stored["versionId"], assignment_version)
 
         # 5. Archiving reaches the client as the course disappearing from the
         #    catalog, and the next round retires it without deleting bytes.
@@ -273,49 +293,38 @@ class ClientContractTest(unittest.TestCase):
         )
         self.assertEqual(self.client("sync")["installed"], [])
 
-    def test_a_hand_in_written_offline_is_still_accepted_after_the_course_moves_on(self):
-        """断网时写好的作业，等联网时课程已经发了新版本 —— 这份作业仍然收。
+    def test_a_hand_in_written_offline_is_still_accepted_after_the_assignment_moves_on(self):
+        """断网时写好的作业，等联网时作业已经发了新版本 —— 这份作业仍然收。
 
-        implementation.md §8 只要求 ``version_id`` 属于该 Playground，
-        实现里就是「在该课程已发布的 history 里」。而 history 不会被删（Archive
-        只改 state），所以一份钉在旧版本上、隔了一段时间才送到的作业仍然有效，
-        并且被记在它真正依据的那个版本上 —— 这一点很重要：学生是按那个版本做的。
+        The rule only asks that ``version_id`` belong to that Assignment, which
+        in the implementation means "is in its published history". History is
+        never deleted (unpublishing only changes state), so a hand-in pinned to
+        an older version and delivered later is still valid — and it is recorded
+        against the version it really answered, which is the one the student
+        worked from.
         """
-        first = self.publish("pg-offline")
+        first = self.publish_assignment("hw-offline", "# 作业一\n")
         self.client("bootstrap")
 
         # 断网：驱动指向一个没有监听的端口，所以本地入队成功、上传失败。
         self.write_hand_in("# 姓名：王五\nprint(3)\n")
-        offline = self.client_on(self.dead_port(), "submit", "pg-offline", first, "王五")
+        offline = self.client_on(self.dead_port(), "submit", "hw-offline", first, "王五")
         self.assertEqual(offline["pending"], 1, "断网时作业必须留在队列里")
 
-        # 网络不在的这段时间，课程往前走了一个版本
-        second = self.publish(
-            "pg-offline",
-            files={
-                "picopg.json": json.dumps({"schemaVersion": 1, "runtime": "python"}),
-                "course/index.html": "<html>second</html>",
-            },
-            base=first,
-        )
+        # 网络不在的这段时间，作业往前走了一个版本
+        second = self.publish_assignment("hw-offline", "# 作业一\n\n改了一处\n", base=first)
         self.assertNotEqual(second, first)
 
-        # 联网后一次常规同步：先把作业送上去，再把新版本拉下来
+        # 联网后一次常规同步：先把作业送上去
         after = self.client("sync")
         self.assertEqual(len(after["stored"]), 1, after)
         self.assertEqual(after["refused"], [])
         self.assertEqual(after["undelivered"], [])
         self.assertEqual(after["pending"], 0)
-        self.assertEqual(after["installed"], ["pg-offline"], "新版本要自动拉下来")
-        self.assertEqual(after["retired"], [])
 
-        (stored,) = self.stored_submissions("pg-offline")
+        (stored,) = self.stored_submissions("hw-offline")
         self.assertEqual(stored["student"], "王五")
         self.assertEqual(stored["versionId"], first, "记在它依据的那个版本上，不是当前版本")
-
-        # 而本地现在钉在新版本上
-        manifest = self.read_local_manifest("pg-offline", second)
-        self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>second</html>")
 
     def test_each_queued_hand_in_is_one_request_and_one_answer(self):
         """A queue of hand-ins drains one delivery at a time.
@@ -326,18 +335,18 @@ class ClientContractTest(unittest.TestCase):
         request each — the client never catches a refusal it cannot attribute to
         a delivery, which is what the old whole-round cap made impossible.
         """
-        version_id = self.publish("pg-queue")
+        version_id = self.publish_assignment("hw-queue")
         self.client("bootstrap")
 
         self.write_hand_in("# 姓名：甲\nprint(1)\n")
         queued_offline = self.client_on(
-            self.dead_port(), "submit", "pg-queue", version_id, "甲"
+            self.dead_port(), "submit", "hw-queue", version_id, "甲"
         )
         self.assertEqual(queued_offline["pending"], 1)
         self.write_hand_in("# 姓名：乙\nprint(2)\n")
-        self.client_on(self.dead_port(), "submit", "pg-queue", version_id, "乙")
+        self.client_on(self.dead_port(), "submit", "hw-queue", version_id, "乙")
         self.write_hand_in("# 姓名：丙\nprint(3)\n")
-        self.client_on(self.dead_port(), "submit", "pg-queue", version_id, "丙")
+        self.client_on(self.dead_port(), "submit", "hw-queue", version_id, "丙")
         self.assertEqual(self.pending_count(), 3)
 
         after = self.client("sync")
@@ -348,7 +357,7 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(after["http"]["submissions"], 3, "三条待送 = 三次请求")
         self.assertEqual(after["http"]["catalog"], 1, "目录一轮读一次")
         self.assertEqual(
-            sorted(entry["student"] for entry in self.stored_submissions("pg-queue")),
+            sorted(entry["student"] for entry in self.stored_submissions("hw-queue")),
             ["丙", "乙", "甲"],
         )
 
@@ -367,32 +376,25 @@ class ClientContractTest(unittest.TestCase):
             and end up with the same installed set and the same current Version,
             without any reconciliation.
 
-        A hand-in written offline is accepted even though the course moved on in
-        the meantime: implementation.md §8 only asks that the Version belong to that
-        Playground's published history.
+        A hand-in written offline is accepted even though the assignment moved on
+        in the meantime: the rule only asks that the Version belong to that
+        Assignment's published history.
         """
-        first = self.publish("pg-two")
+        first = self.publish_assignment("hw-two")
         mine = self.client_data
         theirs = self.client_data.parent / "client-b"
         self.client("bootstrap", data=mine)
         self.client("bootstrap", data=theirs)
 
-        # 两台都断网，各写一份不同的（同一门课、同一版本）
+        # 两台都断网，各写一份不同的（同一道题、同一版本）
         self.write_hand_in("# 姓名：甲\nprint(1)\n", data=mine)
         self.write_hand_in("# 姓名：乙\nprint(2)\n", data=theirs)
         for machine, who in ((mine, "甲"), (theirs, "乙")):
-            offline = self.client_on(self.dead_port(), "submit", "pg-two", first, who, data=machine)
+            offline = self.client_on(self.dead_port(), "submit", "hw-two", first, who, data=machine)
             self.assertEqual(offline["pending"], 1, f"{who} 的作业必须留在自己队列里")
 
-        # 网络不在的这段时间，课程往前走了一版
-        second = self.publish(
-            "pg-two",
-            files={
-                "picopg.json": json.dumps({"schemaVersion": 1, "runtime": "python"}),
-                "course/index.html": "<html>second</html>",
-            },
-            base=first,
-        )
+        # 网络不在的这段时间，作业往前走了一版
+        second = self.publish_assignment("hw-two", "# 作业一\n\n改了一处\n", base=first)
         self.assertNotEqual(second, first)
 
         # 各自联网：各送各的作业，各拉同一版
@@ -401,10 +403,10 @@ class ClientContractTest(unittest.TestCase):
             self.assertEqual(len(after["stored"]), 1, f"{who}: {after}")
             self.assertEqual(after["refused"], [], who)
             self.assertEqual(after["pending"], 0, who)
-            self.assertEqual(after["installed"], ["pg-two"], f"{who} 要把新版拉下来")
+            self.assertEqual(after["installed"], [], f"{who} 这一轮没有新内容")
 
         # 服务端：两份都在，各自记在自己依据的那个版本上
-        stored = self.stored_submissions("pg-two")
+        stored = self.stored_submissions("hw-two")
         self.assertEqual(sorted(entry["student"] for entry in stored), ["乙", "甲"])
         self.assertEqual(
             {entry["versionId"] for entry in stored},
@@ -447,7 +449,7 @@ class ClientContractTest(unittest.TestCase):
         self.assertTrue(second)
 
     def test_an_offline_hand_in_survives_a_restart_and_is_sent_once(self):
-        version_id = self.publish("pg-e2e")
+        version_id = self.publish_assignment("hw-restart")
         self.client("bootstrap")
 
         # Queue a hand-in while the server is unreachable, then restart the
@@ -455,7 +457,7 @@ class ClientContractTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.write_hand_in("# 姓名：李四\nprint(2)\n")
-        queued = self.run_driver_expecting_failure("submit", "pg-e2e", version_id, "李四")
+        queued = self.run_driver_expecting_failure("submit", "hw-restart", version_id, "李四")
         self.assertEqual(queued["pending"], 1)
 
         # A fresh server on the same data directory: the client retries the
@@ -465,7 +467,7 @@ class ClientContractTest(unittest.TestCase):
         retry = self.client("sync")
         self.assertEqual(len(retry["stored"]), 1)
         self.assertEqual(retry["pending"], 0)
-        (stored,) = self.stored_submissions("pg-e2e")
+        (stored,) = self.stored_submissions("hw-restart")
         self.assertEqual(stored["student"], "李四")
         self.assertEqual(stored["versionId"], version_id)
 
@@ -521,13 +523,13 @@ class ClientContractTest(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.shutdown)
 
-    def stored_submissions(self, playground_id):
+    def stored_submissions(self, assignment_id):
         status, body = self.operator("GET", "/api/v1/submissions")
         self.assertEqual(status, 200)
         return [
             entry
             for entry in body["submissions"]
-            if entry["sourceId"] == playground_id
+            if entry["assignmentId"] == assignment_id
         ]
 
     def read_local_manifest(self, playground_id, version_id):

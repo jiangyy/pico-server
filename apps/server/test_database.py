@@ -60,21 +60,23 @@ class OpenDatabaseTest(unittest.TestCase):
         # already-current file must not add a second record for any step.
         self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
 
-    def test_a_submission_must_name_a_known_source_kind(self):
-        # 提交对准的对象有两种（Playground 与 Assignment），而且它们在不同的表里，
-        # 所以"这个对象存在"由应用层检查；数据库这一层守的是形状本身。
+    def test_a_submission_names_an_assignment_and_a_version(self):
+        # 提交对准的对象只有一种（Assignment）。"这道作业存在"由应用层检查——数据库
+        # 这一层守形状：两个 id 都不能是空串。
         connection = open_database(self.path)
         self.addCleanup(connection.close)
 
-        for kind in ("", "course", None, 7):
-            with self.subTest(kind=kind):
+        for column in ("assignment_id", "version_id"):
+            with self.subTest(column=column):
+                values = {"assignment_id": "hw", "version_id": "0" * 40}
+                values[column] = ""
                 with self.assertRaises(sqlite3.IntegrityError):
                     with connection:
                         connection.execute(
-                            "INSERT INTO submissions (id, source_kind, source_id,"
+                            "INSERT INTO submissions (id, assignment_id,"
                             " version_id, student, files_json, created_at)"
-                            " VALUES ('s', ?, 'pg', ?, 'a', '{}', 'now')",
-                            (kind, "0" * 40),
+                            " VALUES ('s', ?, ?, 'a', '{}', 'now')",
+                            (values["assignment_id"], values["version_id"]),
                         )
 
     def test_a_submission_may_not_be_named_twice(self):
@@ -82,41 +84,34 @@ class OpenDatabaseTest(unittest.TestCase):
         self.addCleanup(connection.close)
         with connection:
             connection.execute(
-                "INSERT INTO playgrounds (id, created_at) VALUES ('pg', 'now')"
-            )
-            connection.execute(
-                "INSERT INTO submissions (id, source_kind, source_id,"
+                "INSERT INTO submissions (id, assignment_id,"
                 " version_id, student, files_json, created_at)"
-                " VALUES ('s', 'playground', 'pg', ?, 'a', '{}', 'now')",
+                " VALUES ('s', 'hw', ?, 'a', '{}', 'now')",
                 ("0" * 40,),
             )
 
         with self.assertRaises(sqlite3.IntegrityError):
             with connection:
                 connection.execute(
-                    "INSERT INTO submissions (id, source_kind, source_id,"
+                    "INSERT INTO submissions (id, assignment_id,"
                     " version_id, student, files_json, created_at)"
-                    " VALUES ('s', 'playground', 'pg', ?, 'b', '{}', 'now')",
+                    " VALUES ('s', 'hw', ?, 'b', '{}', 'now')",
                     ("0" * 40,),
                 )
 
     def test_the_database_enforces_the_student_length(self):
         connection = open_database(self.path)
         self.addCleanup(connection.close)
-        with connection:
-            connection.execute(
-                "INSERT INTO playgrounds (id, created_at) VALUES ('pg', 'now')"
-            )
 
         for student in ("", "a" * 129):
             with self.subTest(student=student):
                 with self.assertRaises(sqlite3.IntegrityError):
                     with connection:
                         connection.execute(
-                            "INSERT INTO submissions (id, source_kind, source_id,"
+                            "INSERT INTO submissions (id, assignment_id,"
                             " version_id, student, files_json,"
                             " created_at)"
-                            " VALUES (?, 'playground', 'pg', ?, ?, '{}', 'now')",
+                            " VALUES (?, 'hw', ?, ?, '{}', 'now')",
                             ("s", "0" * 40, student),
                         )
 
@@ -169,7 +164,7 @@ class ValidateSchemaTest(unittest.TestCase):
 
     def test_a_missing_index_is_reported(self):
         with self.connection:
-            self.connection.execute("DROP INDEX submissions_source_idx")
+            self.connection.execute("DROP INDEX submissions_assignment_idx")
         with self.assertRaises(SchemaValidationError):
             validate_schema(self.connection)
 
@@ -186,7 +181,7 @@ class ValidateSchemaTest(unittest.TestCase):
                 " created_at TEXT NOT NULL)"
             )
             self.connection.execute(
-                "CREATE INDEX submissions_source_idx"
+                "CREATE INDEX submissions_assignment_idx"
                 " ON submissions(playground_id, created_at)"
             )
         with self.assertRaises(SchemaValidationError):

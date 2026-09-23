@@ -16,7 +16,7 @@
 | 方法 | 路径 | 返回 |
 | --- | --- | --- |
 | GET | `/healthz` | `ok` |
-| GET | `/api/v1/catalog` | `{protocol_version, minimum_client_protocol_version, playgrounds:[{playground_id, current_version_id}]}` |
+| GET | `/api/v1/catalog` | `{protocol_version, minimum_client_protocol_version, playgrounds:[{playground_id, current_version_id}], assignments:[{assignment_id, current_version_id, title}]}` |
 | GET | `/api/v1/playgrounds/{id}/versions/{vid}/manifest` | `{playground_id, version_id, files:[{path,size,sha256}]}` |
 | GET | `/api/v1/playgrounds/{id}/versions/{vid}/files/{path}` | 原始字节 + `X-Content-SHA256` |
 
@@ -24,11 +24,12 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/v1/submissions` | `{submission_id, playground_id, version_id, files}` → `201 {status:"accepted", submission}` / `200 {status:"existing_same", submission}`；拒绝是 `400 invalid_submission`、`404 invalid_version`、`409 playground_stopped`、`409 submission_conflict` |
+| POST | `/api/v1/submissions` | `{submission_id, assignment_id, version_id, files}` → `201 {status:"accepted", submission}` / `200 {status:"existing_same", submission}`；拒绝是 `400 invalid_submission`、`404 invalid_version`、`409 assignment_stopped`、`409 submission_conflict` |
 
-`submission_id` 由客户端生成：同名重发得到同一个结果，同名不同内容被拒绝。学生名不
-在请求里，服务器从 `work/main.py` 首行（`# 姓名：… 班级：…`）读出来，作为老师那份
-可读副本的署名。
+一份提交对准一道作业：`version_id` 必须属于该 Assignment 的已发布历史，作业已下线就是
+`409 assignment_stopped`。`submission_id` 由客户端生成：同名重发得到同一个结果，同名不同
+内容被拒绝。学生名不在请求里，服务器从 `work/main.py` 首行（`# 姓名：… 班级：…`）读出来，
+作为老师那份可读副本的署名。
 
 需要 operator token（`Authorization: Bearer …`）：
 
@@ -36,6 +37,8 @@
 | --- | --- | --- |
 | POST | `/api/v1/playgrounds` | `{id}` 登记一门课（409 = 已存在）。可选：发布到不存在的 id 也会创建它 |
 | POST | `/api/v1/playgrounds/{id}/versions` | ZIP + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}` |
+| POST | `/api/v1/assignments/{id}/versions` | Markdown + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}`；第一行必须是 `# 标题` |
+| DELETE | `/api/v1/assignments/{id}` | 取消发布，返回 `{status}` |
 
 发布的 `status`：`accepted` / `no_op` / `conflict` / `playground_stopped`。对一个还不存在的
 id 发布就是创建它（`base` 必须为空，否则 `conflict`）；已有 Version 时必须带 `base`，
@@ -52,12 +55,14 @@ id 发布就是创建它（`base` 必须为空，否则 `conflict`）；已有 V
 `data/app.db`：
 
 - `playgrounds` —— 每门课一行：`state`（active/stopped）与 `current_version_id`。
+- `assignments` —— 每道作业一行：`state`、`current_version_id`，外加从内容派生的 `title`。
 - `submissions` —— 交上来的作业，只追加，文件正文在 `files_json`；`id` 就是客户端给的
-  `submission_id`，唯一约束就是幂等。
+  `submission_id`，唯一约束就是幂等；`assignment_id` + `version_id` 说明它交的是哪一版。
 - `idempotency_results` —— operator 发布端点的 `Idempotency-Key` 重放结果（它只服务那
   一个端点，不是通用事件表）。
 
 `data/picopg.git` —— 一个 bare 仓库，一个 Version 就是一个 commit，内容不可变、天然去重。
+课程的历史在 `refs/picopg/history/<playground_id>`，作业的历史在 `refs/picopg/assignment/<assignment_id>`。
 两类 ref：
 
 - `refs/picopg/history/<playground_id>` —— 稳定的可达性根。它**从数据库的
