@@ -17,6 +17,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import assignments as assignments_module
 import manifests
 import playgrounds as playgrounds_module
 import pagination
@@ -60,10 +61,13 @@ from repository import (
     DEFAULT_REPOSITORY_PATH,
     CommitMetadata,
     RepositoryError,
+    commit_in_assignment_history,
     commit_in_playground_history,
+    converge_assignment_ref,
     converge_history_ref,
     delete_pending_ref,
     open_repository,
+    prepare_assignment_version,
     publish_playground_prepare,
     valid_playground_id,
 )
@@ -102,6 +106,20 @@ OPERATOR_SCOPE = "operator"
 # no session, and no password.
 OPERATOR_ENVIRONMENT_VARIABLE = "PICOPG_OPERATOR_TOKEN"
 MIN_OPERATOR_TOKEN_BYTES = 16
+
+
+def _markdown_request(assignment_id, markdown, base_version_id):
+    """The canonical identity of one Assignment upload.
+
+    Same idea as a bundle request: the content hash (not the raw bytes) plus the
+    base decides whether two requests are the same logical publish.
+    """
+
+    return {
+        "assignmentId": assignment_id,
+        "baseVersionId": base_version_id,
+        "sha256": hashlib.sha256(markdown).hexdigest(),
+    }
 
 
 def _bundle_request(playground_id, bundle, base_version_id):
@@ -217,6 +235,8 @@ class Handler(ApiHandler):
             self._post_playground_versions(routes.match_playground_versions(path))
         elif routes.match_playground_restore(path) is not None:
             self._post_restore(routes.match_playground_restore(path))
+        elif routes.match_assignment_versions(path) is not None:
+            self._post_assignment_versions(routes.match_assignment_versions(path))
         elif path == routes.SUBMISSIONS_PATH:
             self._post_submission()
         elif routes.allowed_methods(path) is not None:
@@ -250,19 +270,10 @@ class Handler(ApiHandler):
         repository = self.server.repository
         try:
             with self._database() as connection:
-                playground = get_playground(connection, delivery.playground_id)
-                if playground is None:
-                    self._api_error(404, "invalid_version")
-                    return
-                if playground.state == "stopped":
-                    self._api_error(409, "playground_stopped")
-                    return
-                if not commit_in_playground_history(
-                    repository,
-                    delivery.playground_id,
-                    delivery.playground_commit_id,
-                ):
-                    self._api_error(404, "invalid_version")
+                refusal = self._submission_refusal(connection, repository, delivery)
+                if refusal is not None:
+                    status, code = refusal
+                    self._api_error(status, code)
                     return
 
                 with immediate_transaction(connection):
@@ -282,13 +293,42 @@ class Handler(ApiHandler):
                 "status": write.status,
                 "submission": {
                     "id": delivery.submission_id,
-                    "playground_id": delivery.playground_id,
-                    "version_id": delivery.playground_commit_id,
+                    "source_kind": delivery.source_kind,
+                    "source_id": delivery.source_id,
+                    "version_id": delivery.version_id,
                     "student": delivery.student,
                     "created_at": write.created_at,
                 },
             },
         )
+
+    def _submission_refusal(self, connection, repository, delivery):
+        """``None`` when this hand-in may be stored, or ``(status, code)``.
+
+        Which object the Version has to belong to comes from `source_kind`: a
+        Playground and an Assignment each keep their own history, and a Version
+        that belongs to neither is not something a hand-in can be based on.
+        """
+
+        if delivery.source_kind == "playground":
+            source = get_playground(connection, delivery.source_id)
+            if source is None:
+                return 404, "invalid_version"
+            if source.state == "stopped":
+                return 409, "playground_stopped"
+            known = commit_in_playground_history(
+                repository, delivery.source_id, delivery.version_id
+            )
+        else:
+            source = assignments_module.get_assignment(connection, delivery.source_id)
+            if source is None:
+                return 404, "invalid_version"
+            if source.state == "stopped":
+                return 409, "assignment_stopped"
+            known = commit_in_assignment_history(
+                repository, delivery.source_id, delivery.version_id
+            )
+        return None if known else (404, "invalid_version")
 
     def _write_submitted_work(self, delivery, created_at):
         """Write a folder per hand-in, for a human to open.
@@ -310,8 +350,8 @@ class Handler(ApiHandler):
                 self.server.submissions_path,
                 delivery.submission_id,
                 delivery.student,
-                delivery.playground_id,
-                delivery.playground_commit_id,
+                delivery.source_id,
+                delivery.version_id,
                 created_at,
                 dict(delivery.files),
                 ordinal,
@@ -320,8 +360,11 @@ class Handler(ApiHandler):
     def _route_delete(self):
         path = urlsplit(self.path).path
         playground_id = routes.match_playground(path)
+        assignment_id = routes.match_assignment(path)
 
-        if playground_id is not None:
+        if assignment_id is not None:
+            self._delete_assignment(assignment_id)
+        elif playground_id is not None:
             self._delete_playground(playground_id)
         elif routes.allowed_methods(path) is not None:
             self._method_not_allowed()
@@ -415,6 +458,7 @@ class Handler(ApiHandler):
         try:
             with self._database() as connection:
                 playgrounds = self._active_playgrounds(connection)
+                assignments = assignments_module.active_assignments(connection)
         except RepositoryError:
             self._api_error(500, "internal_error", head_only=head_only)
             return
@@ -425,6 +469,7 @@ class Handler(ApiHandler):
                 "protocol_version": PROTOCOL_VERSION,
                 "minimum_client_protocol_version": MINIMUM_CLIENT_PROTOCOL_VERSION,
                 "playgrounds": playgrounds,
+                "assignments": assignments,
             },
             head_only=head_only,
         )
@@ -728,6 +773,172 @@ class Handler(ApiHandler):
             delete_pending_ref(handle, publish_id)
         except RepositoryError as error:
             print(f"[picopg] pending ref not removed: {error}", flush=True)
+
+    def _post_assignment_versions(self, assignment_id):
+        """Publish one Assignment: a Markdown body becomes an immutable Version.
+
+        The same three phases as a Playground — Git prepare, one short
+        transaction, Git finalize — over the assignment ref namespace. There is
+        no bundle to validate: the body *is* the content, and the only shape it
+        has to satisfy is a title on the first line.
+        """
+
+        if not self._require_operator():
+            return
+        request_key = self._idempotency_key()
+        if request_key is None:
+            return
+
+        base_version_id = self.headers.get(BASE_VERSION_HEADER, "").strip() or None
+        publish_id = uuid.uuid4().hex
+
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._api_error(400, "invalid_request")
+            return
+        if content_length < 0:
+            self._api_error(400, "invalid_request")
+            return
+        if content_length > assignments_module.MAX_MARKDOWN_BYTES:
+            self._api_error(413, "request_too_large")
+            return
+
+        markdown = self.rfile.read(content_length)
+        try:
+            title = assignments_module.decode_markdown(markdown)
+            with self._database() as connection:
+                stored = idempotency_lookup(
+                    connection,
+                    OPERATOR_SCOPE,
+                    routes.assignment_versions_endpoint(assignment_id),
+                    request_key,
+                    _markdown_request(assignment_id, markdown, base_version_id),
+                )
+        except assignments_module.InvalidAssignmentError:
+            self._api_error(400, "invalid_assignment")
+            return
+        except IdempotencyConflict:
+            self._api_error(409, "idempotency_conflict")
+            return
+        except IdempotencyRequestError:
+            self._api_error(400, "invalid_request")
+            return
+        if stored is not None:
+            self._respond_json(*stored)
+            return
+
+        handle = self.server.repository
+        prepared = None
+        try:
+            with self._database() as connection:
+                row = assignments_module.require_publishable(
+                    connection, assignment_id, base_version_id
+                )
+                observed_version_id = assignments_module.observed_version(row)
+            prepared = prepare_assignment_version(
+                handle,
+                assignment_id,
+                markdown,
+                _commit_metadata(),
+                publish_id,
+                observed_version_id,
+            )
+        except assignments_module.InvalidAssignmentError:
+            self._api_error(400, "invalid_assignment")
+            return
+        except assignments_module.AssignmentBaseChangedError:
+            self._respond_json(409, {"status": "conflict"})
+            return
+        except RepositoryError:
+            self._api_error(500, "internal_error")
+            return
+
+        settled = False
+        try:
+            try:
+                with self._database() as connection:
+                    status, body = execute_idempotent(
+                        connection,
+                        OPERATOR_SCOPE,
+                        routes.assignment_versions_endpoint(assignment_id),
+                        request_key,
+                        _markdown_request(assignment_id, markdown, base_version_id),
+                        lambda connection: self._accept_prepared_assignment(
+                            connection, assignment_id, prepared, base_version_id, title
+                        ),
+                    )
+            except IdempotencyConflict:
+                self._api_error(409, "idempotency_conflict")
+                return
+            except IdempotencyRequestError:
+                self._api_error(400, "invalid_request")
+                return
+            except assignments_module.InvalidAssignmentError:
+                self._api_error(400, "invalid_assignment")
+                return
+            except assignments_module.AssignmentBaseChangedError:
+                self._respond_json(409, {"status": "conflict"})
+                return
+            except RepositoryError:
+                self._api_error(500, "internal_error")
+                return
+
+            if prepared is not None and not prepared.no_op:
+                self._finish_assignment_publish(assignment_id, prepared.publish_id)
+            settled = True
+            self._respond_json(status, body)
+        finally:
+            if not settled and prepared is not None and not prepared.no_op:
+                self._abandon_prepared(prepared.publish_id)
+
+    def _accept_prepared_assignment(self, connection, assignment_id, prepared, base_version_id, title):
+        """The database half of an Assignment publish, inside its transaction.
+
+        A stopped Assignment is accepted here too: this write is also what puts
+        it back on the students' list.
+        """
+
+        result = assignments_module.commit_prepared_assignment(
+            connection, assignment_id, prepared, base_version_id, title
+        )
+        return 201, {
+            "status": "no_op" if prepared.no_op else "accepted",
+            "version_id": result,
+        }
+
+    def _finish_assignment_publish(self, assignment_id, publish_id):
+        """Converge the assignment ref and drop the pending ref, best effort."""
+
+        handle = self.server.repository
+        try:
+            with self._database() as connection:
+                row = assignments_module.get_assignment(connection, assignment_id)
+            if row is not None and row.current_version_id:
+                converge_assignment_ref(handle, assignment_id, row.current_version_id)
+        except (RepositoryError, assignments_module.InvalidAssignmentError) as error:
+            print(f"[picopg] assignment ref not converged: {error}", flush=True)
+        try:
+            delete_pending_ref(handle, publish_id)
+        except RepositoryError as error:
+            print(f"[picopg] pending ref not removed: {error}", flush=True)
+
+    def _delete_assignment(self, assignment_id):
+        """取消发布：把它从学生的目录里拿掉，历史一个字节都不动。"""
+
+        if not self._require_operator():
+            return
+        try:
+            with self._database() as connection:
+                changed = assignments_module.unpublish(connection, assignment_id)
+        except assignments_module.InvalidAssignmentError:
+            self._api_error(400, "invalid_request")
+            return
+        except assignments_module.MissingAssignmentError:
+            self._not_found()
+            return
+
+        self._respond_json(200, {"status": "accepted" if changed else "no_op"})
 
     def _accept_prepared(self, connection, playground_id, prepared, base_version_id):
         """The database half of a publish, inside the idempotency transaction.

@@ -8,7 +8,7 @@ from pathlib import Path
 import permissions
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 @contextmanager
@@ -86,10 +86,18 @@ _TABLE_COLUMNS = {
         "response_json": (0, 1),
         "created_at": (0, 1),
     },
+    "assignments": {
+        "id": (1, 0),
+        "created_at": (0, 1),
+        "state": (0, 1),
+        "current_version_id": (0, 1),
+        "title": (0, 1),
+    },
     "submissions": {
         "id": (1, 1),
-        "playground_id": (0, 1),
-        "playground_commit_id": (0, 1),
+        "source_kind": (0, 1),
+        "source_id": (0, 1),
+        "version_id": (0, 1),
         "student": (0, 1),
         "files_json": (0, 1),
         "created_at": (0, 1),
@@ -97,9 +105,11 @@ _TABLE_COLUMNS = {
 }
 
 # ``(table, column, referenced table, referenced column, on-delete action)``
-_FOREIGN_KEYS = (
-    ("submissions", "playground_id", "playgrounds", "id", "RESTRICT"),
-)
+#
+# Submissions no longer name a playground: `source_id` may address a Playground
+# or an Assignment, so the old foreign key (and the table rebuild it needed) is
+# gone. Both tables keep their rows, so nothing it protected is lost.
+_FOREIGN_KEYS = ()
 
 # Exact ordered column names for every index a production query relies on.
 _REQUIRED_INDEXES = {
@@ -108,9 +118,10 @@ _REQUIRED_INDEXES = {
         "idempotency_results",
         ("created_at",),
     ),
-    "submissions_playground_idx": (
+    "assignments_created_at_idx": ("assignments", ("created_at",)),
+    "submissions_source_idx": (
         "submissions",
-        ("playground_id", "created_at"),
+        ("source_id", "created_at"),
     ),
 }
 
@@ -288,6 +299,60 @@ def _initialize_schema(connection):
             connection.execute("DROP TABLE IF EXISTS content_log")
             connection.execute("DROP TABLE IF EXISTS events")
             _record_migration(connection, 3)
+
+        if version < 4:
+            # v4 加了 Assignment：和 Playground 同样的当前状态，另加一个从内容派生的
+            # title（免得目录每次去读 Git）。内容本身仍然只在 Git 里。
+            connection.execute(
+                """
+                CREATE TABLE assignments (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    created_at TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'active'
+                        CHECK (state IN ('active', 'stopped')),
+                    current_version_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX assignments_created_at_idx "
+                "ON assignments(created_at)"
+            )
+            _record_migration(connection, 4)
+
+        if version < 5:
+            # v5：一次提交对准的对象不再只是 Playground。列名换成中性的三件套
+            # （source_kind / source_id / version_id），并去掉指向 playgrounds 的外键——
+            # 作业的提交住在同一张表里，那条外键已经不成立。SQLite 改不了外键，重建表。
+            connection.execute("ALTER TABLE submissions RENAME TO submissions_v4")
+            connection.execute(
+                """
+                CREATE TABLE submissions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    source_kind TEXT NOT NULL
+                        CHECK (source_kind IN ('playground', 'assignment')),
+                    source_id TEXT NOT NULL CHECK (source_id <> ''),
+                    version_id TEXT NOT NULL CHECK (version_id <> ''),
+                    student TEXT NOT NULL
+                        CHECK (student <> '' AND length(student) <= 128),
+                    files_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO submissions (id, source_kind, source_id, version_id,"
+                " student, files_json, created_at)"
+                " SELECT id, 'playground', playground_id, playground_commit_id,"
+                " student, files_json, created_at FROM submissions_v4"
+            )
+            connection.execute("DROP TABLE submissions_v4")
+            connection.execute(
+                "CREATE INDEX submissions_source_idx"
+                " ON submissions(source_id, created_at)"
+            )
+            _record_migration(connection, 5)
 
         validate_schema(connection)
 

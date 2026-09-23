@@ -60,18 +60,22 @@ class OpenDatabaseTest(unittest.TestCase):
         # already-current file must not add a second record for any step.
         self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
 
-    def test_foreign_keys_are_enforced(self):
+    def test_a_submission_must_name_a_known_source_kind(self):
+        # 提交对准的对象有两种（Playground 与 Assignment），而且它们在不同的表里，
+        # 所以"这个对象存在"由应用层检查；数据库这一层守的是形状本身。
         connection = open_database(self.path)
         self.addCleanup(connection.close)
 
-        with self.assertRaises(sqlite3.IntegrityError):
-            with connection:
-                connection.execute(
-                    "INSERT INTO submissions (id, playground_id,"
-                    " playground_commit_id, student, files_json, created_at)"
-                    " VALUES ('s', 'pg-missing', ?, 'a', '{}', 'now')",
-                    ("0" * 40,),
-                )
+        for kind in ("", "course", None, 7):
+            with self.subTest(kind=kind):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    with connection:
+                        connection.execute(
+                            "INSERT INTO submissions (id, source_kind, source_id,"
+                            " version_id, student, files_json, created_at)"
+                            " VALUES ('s', ?, 'pg', ?, 'a', '{}', 'now')",
+                            (kind, "0" * 40),
+                        )
 
     def test_a_submission_may_not_be_named_twice(self):
         connection = open_database(self.path)
@@ -81,18 +85,18 @@ class OpenDatabaseTest(unittest.TestCase):
                 "INSERT INTO playgrounds (id, created_at) VALUES ('pg', 'now')"
             )
             connection.execute(
-                "INSERT INTO submissions (id, playground_id,"
-                " playground_commit_id, student, files_json, created_at)"
-                " VALUES ('s', 'pg', ?, 'a', '{}', 'now')",
+                "INSERT INTO submissions (id, source_kind, source_id,"
+                " version_id, student, files_json, created_at)"
+                " VALUES ('s', 'playground', 'pg', ?, 'a', '{}', 'now')",
                 ("0" * 40,),
             )
 
         with self.assertRaises(sqlite3.IntegrityError):
             with connection:
                 connection.execute(
-                    "INSERT INTO submissions (id, playground_id,"
-                    " playground_commit_id, student, files_json, created_at)"
-                    " VALUES ('s', 'pg', ?, 'b', '{}', 'now')",
+                    "INSERT INTO submissions (id, source_kind, source_id,"
+                    " version_id, student, files_json, created_at)"
+                    " VALUES ('s', 'playground', 'pg', ?, 'b', '{}', 'now')",
                     ("0" * 40,),
                 )
 
@@ -109,9 +113,10 @@ class OpenDatabaseTest(unittest.TestCase):
                 with self.assertRaises(sqlite3.IntegrityError):
                     with connection:
                         connection.execute(
-                            "INSERT INTO submissions (id, playground_id,"
-                            " playground_commit_id, student, files_json,"
-                            " created_at) VALUES (?, 'pg', ?, ?, '{}', 'now')",
+                            "INSERT INTO submissions (id, source_kind, source_id,"
+                            " version_id, student, files_json,"
+                            " created_at)"
+                            " VALUES (?, 'playground', 'pg', ?, ?, '{}', 'now')",
                             ("s", "0" * 40, student),
                         )
 
@@ -164,25 +169,24 @@ class ValidateSchemaTest(unittest.TestCase):
 
     def test_a_missing_index_is_reported(self):
         with self.connection:
-            self.connection.execute("DROP INDEX submissions_playground_idx")
+            self.connection.execute("DROP INDEX submissions_source_idx")
         with self.assertRaises(SchemaValidationError):
             validate_schema(self.connection)
 
-    def test_a_missing_foreign_key_is_reported(self):
+    def test_a_table_with_the_wrong_columns_is_reported(self):
         with self.connection:
-            self.connection.execute("PRAGMA foreign_keys = OFF")
             self.connection.execute("DROP TABLE submissions")
             self.connection.execute(
                 "CREATE TABLE submissions ("
                 " id TEXT PRIMARY KEY NOT NULL,"
                 " playground_id TEXT NOT NULL,"
-                " playground_commit_id TEXT NOT NULL,"
+                " version_id TEXT NOT NULL,"
                 " student TEXT NOT NULL,"
                 " files_json TEXT NOT NULL,"
                 " created_at TEXT NOT NULL)"
             )
             self.connection.execute(
-                "CREATE INDEX submissions_playground_idx"
+                "CREATE INDEX submissions_source_idx"
                 " ON submissions(playground_id, created_at)"
             )
         with self.assertRaises(SchemaValidationError):

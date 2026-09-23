@@ -282,9 +282,9 @@ def recover_pending_refs(connection, repository):
     replays a publish. Idempotent by construction: it only ever removes refs and
     converges one ref to a commit, all of which are no-ops the second time.
 
-    A pending ref is matched to a Playground by the Version it protects: the
-    database is asked which Playground, if any, has that Version as current.
-    That question needs no record of the publish itself — a Version the
+    A pending ref is matched to what it protects by the Version it protects: the
+    database is asked which Playground or Assignment, if any, has that Version as
+    current. That question needs no record of the publish itself — a Version the
     database never accepted is current nowhere, so its ref is simply dropped.
 
     Returns ``(dropped, converged)``: how many pending refs were discarded and
@@ -300,12 +300,25 @@ def recover_pending_refs(connection, repository):
         ).fetchone()
         if row is not None:
             # Converge to what the *database* says is current, never to the
-            # commit the pending ref points at: a later publish may already
-            # have moved on, and the ref must not be pulled backwards.
+            # commit the pending ref points at: a later publish may already have
+            # moved on, and the ref must not be pulled backwards.
             _repository.converge_history_ref(
                 repository, row["id"], row["current_version_id"]
             )
             converged += 1
+        else:
+            # The same Version may be an Assignment's current one instead; the
+            # two namespaces are separate, so which ref to move comes from which
+            # table answered.
+            assignment = connection.execute(
+                "SELECT id, current_version_id FROM assignments WHERE current_version_id = ?",
+                (commit_id,),
+            ).fetchone()
+            if assignment is not None:
+                _repository.converge_assignment_ref(
+                    repository, assignment["id"], assignment["current_version_id"]
+                )
+                converged += 1
         _repository.delete_pending_ref(repository, publish_id)
         dropped += 1
     return dropped, converged

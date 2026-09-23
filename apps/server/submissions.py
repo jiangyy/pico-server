@@ -87,8 +87,9 @@ class SubmissionDelivery:
     """
 
     submission_id: str
-    playground_id: str
-    playground_commit_id: str
+    source_kind: str
+    source_id: str
+    version_id: str
     student: str
     """Canonical ``work/**`` path to text, sorted; the files handed in."""
     files: Mapping[str, str]
@@ -116,8 +117,9 @@ class Submission:
     """One stored Submission without its files."""
 
     id: str
-    playground_id: str
-    playground_commit_id: str
+    source_kind: str
+    source_id: str
+    version_id: str
     student: str
     created_at: str
 
@@ -130,9 +132,17 @@ class StoredSubmission:
     files: tuple
 
 
-def _require_playground_id(value):
+def _require_source_id(value):
     if not repository_module.valid_playground_id(value):
-        raise InvalidSubmissionRequestError("playground_id is not valid")
+        raise InvalidSubmissionRequestError("source_id is not valid")
+    return value
+
+
+def _require_source_kind(value):
+    """Which published object this hand-in is for."""
+
+    if value not in ("playground", "assignment"):
+        raise InvalidSubmissionRequestError("source_kind must be playground or assignment")
     return value
 
 
@@ -246,8 +256,9 @@ def decode_delivery(payload):
 
     return SubmissionDelivery(
         submission_id=_require_submission_id(payload.get("submission_id")),
-        playground_id=_require_playground_id(payload.get("playground_id")),
-        playground_commit_id=_require_version_id(payload.get("version_id")),
+        source_kind=_require_source_kind(payload.get("source_kind")),
+        source_id=_require_source_id(payload.get("source_id")),
+        version_id=_require_version_id(payload.get("version_id")),
         student=_require_student(student),
         files=files,
     )
@@ -383,14 +394,14 @@ def submission_ordinal(connection, student, submission_id, created_at):
     return int(row[0]) if row is not None else 1
 
 
-def submission_directory(root, student, playground_id, ordinal):
+def submission_directory(root, student, source_id, ordinal):
     """Return the directory one submission's files belong in, as a path.
 
     One folder per handed-in course: ``<班级>/<姓名>/<playgroundId>``, and
     ``<playgroundId>-2``, ``-3`` … for the same course handed in again.
     """
 
-    folder = playground_id if ordinal <= 1 else f"{playground_id}-{ordinal}"
+    folder = source_id if ordinal <= 1 else f"{source_id}-{ordinal}"
     class_room, name = student_segments(student)
     parts = [part for part in (class_room, name, _safe_segment(folder) or folder) if part]
 
@@ -404,8 +415,8 @@ def write_submission_files(
     root,
     submission_id,
     student,
-    playground_id,
-    playground_commit_id,
+    source_id,
+    version_id,
     created_at,
     files,
     ordinal=1,
@@ -420,7 +431,7 @@ def write_submission_files(
     """
 
     directory = permissions.ensure_private_directory(
-        submission_directory(root, student, playground_id, ordinal)
+        submission_directory(root, student, source_id, ordinal)
     )
 
     for path, text in files.items():
@@ -431,8 +442,8 @@ def write_submission_files(
 
     manifest = {
         "id": submission_id,
-        "playgroundId": playground_id,
-        "commitId": playground_commit_id,
+        "sourceId": source_id,
+        "versionId": version_id,
         "student": student,
         "createdAt": created_at,
         "ordinal": ordinal,
@@ -460,7 +471,7 @@ def backfill_submission_files(connection, root):
     """
 
     rows = connection.execute(
-        "SELECT id, playground_id, playground_commit_id, student, files_json, created_at"
+        "SELECT id, source_kind, source_id, version_id, student, files_json, created_at"
         " FROM submissions ORDER BY created_at, id"
     ).fetchall()
 
@@ -470,7 +481,7 @@ def backfill_submission_files(connection, root):
             connection, row["student"], row["id"], row["created_at"]
         )
         directory = submission_directory(
-            root, row["student"], row["playground_id"], ordinal
+            root, row["student"], row["source_id"], ordinal
         )
         # The manifest is the marker that a folder is complete, so a half-written
         # one is repaired rather than skipped.
@@ -486,8 +497,8 @@ def backfill_submission_files(connection, root):
             root,
             row["id"],
             row["student"],
-            row["playground_id"],
-            row["playground_commit_id"],
+            row["source_id"],
+            row["version_id"],
             row["created_at"],
             files,
             ordinal,
@@ -511,15 +522,16 @@ def create_if_absent(connection, delivery):
 
     files_json = json.dumps(dict(delivery.files), separators=(",", ":"), sort_keys=True)
     row = connection.execute(
-        "SELECT id, playground_id, playground_commit_id, student, files_json,"
+        "SELECT id, source_kind, source_id, version_id, student, files_json,"
         " created_at FROM submissions WHERE id = ?",
         (delivery.submission_id,),
     ).fetchone()
 
     if row is not None:
         same = (
-            row["playground_id"] == delivery.playground_id
-            and row["playground_commit_id"] == delivery.playground_commit_id
+            row["source_kind"] == delivery.source_kind
+            and row["source_id"] == delivery.source_id
+            and row["version_id"] == delivery.version_id
             and row["student"] == delivery.student
             and row["files_json"] == files_json
         )
@@ -533,14 +545,15 @@ def create_if_absent(connection, delivery):
     connection.execute(
         """
         INSERT INTO submissions (
-            id, playground_id, playground_commit_id, student,
+            id, source_kind, source_id, version_id, student,
             files_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             delivery.submission_id,
-            delivery.playground_id,
-            delivery.playground_commit_id,
+            delivery.source_kind,
+            delivery.source_id,
+            delivery.version_id,
             delivery.student,
             files_json,
             created_at,
@@ -556,8 +569,9 @@ def _submission_from_row(row):
 
     try:
         submission_id = row["id"]
-        playground_id = row["playground_id"]
-        playground_commit_id = row["playground_commit_id"]
+        source_kind = row["source_kind"]
+        source_id = row["source_id"]
+        version_id = row["version_id"]
         student = row["student"]
         created_at = row["created_at"]
     except (IndexError, KeyError) as error:
@@ -566,9 +580,10 @@ def _submission_from_row(row):
     if (
         type(submission_id) is not str
         or not submission_id
-        or not repository_module.valid_playground_id(playground_id)
-        or type(playground_commit_id) is not str
-        or _COMMIT_ID_PATTERN.match(playground_commit_id) is None
+        or source_kind not in ("playground", "assignment")
+        or not repository_module.valid_playground_id(source_id)
+        or type(version_id) is not str
+        or _COMMIT_ID_PATTERN.match(version_id) is None
         or type(student) is not str
         or not student
         or type(created_at) is not str
@@ -578,8 +593,9 @@ def _submission_from_row(row):
 
     return Submission(
         id=submission_id,
-        playground_id=playground_id,
-        playground_commit_id=playground_commit_id,
+        source_kind=source_kind,
+        source_id=source_id,
+        version_id=version_id,
         student=student,
         created_at=created_at,
     )
@@ -592,7 +608,7 @@ def get_submission(connection, submission_id):
         raise MissingSubmissionError("submission does not exist")
 
     row = connection.execute(
-        "SELECT id, playground_id, playground_commit_id, student,"
+        "SELECT id, source_kind, source_id, version_id, student,"
         " files_json, created_at FROM submissions WHERE id = ?",
         (submission_id,),
     ).fetchone()
@@ -635,14 +651,14 @@ def list_submissions(connection, *, limit, after=None):
 
     if after_key is None:
         rows = connection.execute(
-            "SELECT id, playground_id, playground_commit_id, student,"
+            "SELECT id, source_kind, source_id, version_id, student,"
             " files_json, created_at FROM submissions"
             " ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit + 1,),
         ).fetchall()
     else:
         rows = connection.execute(
-            "SELECT id, playground_id, playground_commit_id, student,"
+            "SELECT id, source_kind, source_id, version_id, student,"
             " files_json, created_at FROM submissions"
             " WHERE (created_at, id) < (?, ?)"
             " ORDER BY created_at DESC, id DESC LIMIT ?",
@@ -664,8 +680,9 @@ def submission_to_mapping(submission, files=None):
 
     mapping = {
         "id": submission.id,
-        "playgroundId": submission.playground_id,
-        "commitId": submission.playground_commit_id,
+        "sourceKind": submission.source_kind,
+        "sourceId": submission.source_id,
+        "versionId": submission.version_id,
         "student": submission.student,
         "createdAt": submission.created_at,
     }

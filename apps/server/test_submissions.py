@@ -62,7 +62,8 @@ class SubmissionTestBase(unittest.TestCase):
 
         payload = {
             "submission_id": submission_id(),
-            "playground_id": self.playground_id,
+            "source_kind": "playground",
+            "source_id": self.playground_id,
             "version_id": self.commit_id,
             "files": {"work/main.py": "# 姓名：2026-001\nprint(1)\n"},
         }
@@ -76,7 +77,8 @@ class SubmissionTestBase(unittest.TestCase):
         delivery = submissions.decode_delivery(
             {
                 "submission_id": submission_id or globals()["submission_id"](),
-                "playground_id": self.playground_id,
+                "source_kind": "playground",
+                "source_id": self.playground_id,
                 "version_id": self.commit_id,
                 "files": files,
             }
@@ -86,8 +88,9 @@ class SubmissionTestBase(unittest.TestCase):
         self.assertNotEqual(write.status, "conflict")
         return {
             "id": delivery.submission_id,
-            "playground_id": delivery.playground_id,
-            "version_id": delivery.playground_commit_id,
+            "source_kind": delivery.source_kind,
+            "source_id": delivery.source_id,
+            "version_id": delivery.version_id,
             "student": delivery.student,
             "created_at": write.created_at,
             "status": write.status,
@@ -145,8 +148,9 @@ class DecodeSubmissionTest(SubmissionTestBase):
         self.assertIsInstance(request, submissions.SubmissionDelivery)
 
         self.assertIsInstance(request, submissions.SubmissionDelivery)
-        self.assertEqual(request.playground_id, self.playground_id)
-        self.assertEqual(request.playground_commit_id, self.commit_id)
+        self.assertEqual(request.source_kind, "playground")
+        self.assertEqual(request.source_id, self.playground_id)
+        self.assertEqual(request.version_id, self.commit_id)
         self.assertEqual(request.submission_id, body["submission_id"])
         self.assertEqual(request.student, "2026-001")
         self.assertEqual(
@@ -202,7 +206,7 @@ class DecodeSubmissionTest(SubmissionTestBase):
             submissions.decode_delivery(self.payload(files={"work/a.py": "x" * (1024 * 1024 + 1)}))
 
     def test_shape_errors_are_rejected(self):
-        for payload in (None, [], "text", {}, {"playground_id": "pg-one"}):
+        for payload in (None, [], "text", {}, {"source_id": "pg-one"}):
             with self.subTest(payload=payload):
                 with self.assertRaises(submissions.InvalidSubmissionRequestError):
                     submissions.decode_delivery(payload)
@@ -228,7 +232,8 @@ class FileSetValidationTest(unittest.TestCase):
             submissions.decode_delivery(
                 {
                     "submission_id": submission_id(),
-                    "playground_id": "pg-one",
+                    "source_kind": "playground",
+                    "source_id": "pg-one",
                     "version_id": "0" * 40,
                     "files": files,
                 }
@@ -273,7 +278,8 @@ class FileSetValidationTest(unittest.TestCase):
         request = submissions.decode_delivery(
             {
                 "submission_id": submission_id(),
-                "playground_id": "pg-one",
+                "source_kind": "playground",
+                "source_id": "pg-one",
                 "version_id": "0" * 40,
                 "files": {
                     "work/main.py": "# 姓名：2026-001\n",
@@ -330,7 +336,8 @@ class FileSetValidationTest(unittest.TestCase):
         request = submissions.decode_delivery(
             {
                 "submission_id": submission_id(),
-                "playground_id": "pg-one",
+                "source_kind": "playground",
+                "source_id": "pg-one",
                 "version_id": "0" * 40,
                 "files": {"work/b.py": "2", "work/a.py": "1", "work/main.py": "# 姓名：2026-001\n"},
             }
@@ -356,10 +363,10 @@ class ReadSubmissionTest(SubmissionTestBase):
         # handing a caller a value the API could never have produced.
         with self.connection:
             self.connection.execute(
-                "INSERT INTO submissions (id, playground_id,"
-                " playground_commit_id, student, files_json, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                ("sub-1", self.playground_id, "HEAD", "a", "{}", "2026-01-01T00:00:00Z"),
+                "INSERT INTO submissions (id, source_kind, source_id,"
+                " version_id, student, files_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("sub-1", "playground", self.playground_id, "HEAD", "a", "{}", "2026-01-01T00:00:00Z"),
             )
         with self.assertRaises(submissions.StoredSubmissionError):
             submissions.get_submission(self.connection, "sub-1")
@@ -367,10 +374,10 @@ class ReadSubmissionTest(SubmissionTestBase):
     def test_a_malformed_files_column_fails_closed(self):
         with self.connection:
             self.connection.execute(
-                "INSERT INTO submissions (id, playground_id,"
-                " playground_commit_id, student, files_json, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                ("sub-2", self.playground_id, self.commit_id, "a", "[]", "x"),
+                "INSERT INTO submissions (id, source_kind, source_id,"
+                " version_id, student, files_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("sub-2", "playground", self.playground_id, self.commit_id, "a", "[]", "x"),
             )
         with self.assertRaises(submissions.StoredSubmissionError):
             submissions.get_submission(self.connection, "sub-2")
@@ -434,8 +441,8 @@ class BackfillSubmissionFilesTest(unittest.TestCase):
     def store(self, submission_id, student, text="print(1)\n", created_at="2026-09-18T10:11:12Z"):
         with self.connection:
             self.connection.execute(
-                "INSERT INTO submissions (id, playground_id, playground_commit_id, student,"
-                " files_json, created_at) VALUES (?, 'pg-one', ?, ?, ?, ?)",
+                "INSERT INTO submissions (id, source_kind, source_id, version_id, student,"
+                " files_json, created_at) VALUES (?, 'playground', 'pg-one', ?, ?, ?, ?)",
                 (submission_id, "c1" + "0" * 38, student, json.dumps({"work/main.py": text}), created_at),
             )
 
@@ -496,8 +503,8 @@ class SubmissionFileLayoutTest(unittest.TestCase):
             root=self.root,
             submission_id="abcdef1234567890",
             student=student,
-            playground_id="pg-one",
-            playground_commit_id="c1" + "0" * 38,
+            source_id="pg-one",
+            version_id="c1" + "0" * 38,
             created_at="2026-09-18T10:11:12Z",
             files=files if files is not None else {"work/main.py": "print(1)\n"},
             ordinal=ordinal,
@@ -528,12 +535,12 @@ class SubmissionFileLayoutTest(unittest.TestCase):
         self.assertEqual(
             manifest,
             {
-                "commitId": "c1" + "0" * 38,
+                "versionId": "c1" + "0" * 38,
                 "createdAt": "2026-09-18T10:11:12Z",
                 "files": ["work/main.py"],
                 "id": "abcdef1234567890",
                 "ordinal": 1,
-                "playgroundId": "pg-one",
+                "sourceId": "pg-one",
                 "student": "张三（1 班）",
             },
         )

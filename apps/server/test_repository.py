@@ -128,7 +128,10 @@ class RefNamespaceTest(unittest.TestCase):
         public = {
             name for name in dir(self.repository) if not name.startswith("_")
         }
-        self.assertEqual(public, {"path", "history_ref", "pending_ref", "legacy_ref"})
+        self.assertEqual(
+            public,
+            {"path", "history_ref", "assignment_ref", "pending_ref", "legacy_ref"},
+        )
 
     def test_a_pending_ref_rejects_an_id_that_is_not_one_segment(self):
         for hostile in ("", "a/b", "a\\b", ".hidden", None, 7):

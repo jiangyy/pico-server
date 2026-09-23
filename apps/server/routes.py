@@ -18,6 +18,7 @@ PLAYGROUND_VERSIONS_SUFFIX = "/versions"
 PLAYGROUND_RESTORE_SUFFIX = "/restore"
 CATALOG_PATH = "/api/v1/catalog"
 SUBMISSIONS_PATH = "/api/v1/submissions"
+ASSIGNMENTS_PATH = "/api/v1/assignments"
 
 #: The literal segments a read route is built from.
 VERSIONS_SEGMENT = "versions"
@@ -79,6 +80,36 @@ def match_playground(path):
     if not playground_id or "/" in playground_id:
         return None
     return playground_id
+
+
+def match_assignment_versions(path):
+    """Return the assignment id in ``/api/v1/assignments/<id>/versions``."""
+
+    prefix = ASSIGNMENTS_PATH + "/"
+    if not path.startswith(prefix) or not path.endswith(PLAYGROUND_VERSIONS_SUFFIX):
+        return None
+    assignment_id = path[len(prefix): -len(PLAYGROUND_VERSIONS_SUFFIX)]
+    if not assignment_id or "/" in assignment_id:
+        return None
+    return assignment_id
+
+
+def match_assignment(path):
+    """Return the assignment id in ``/api/v1/assignments/<id>``, else ``None``."""
+
+    prefix = ASSIGNMENTS_PATH + "/"
+    if not path.startswith(prefix):
+        return None
+    assignment_id = path[len(prefix):]
+    if not assignment_id or "/" in assignment_id:
+        return None
+    return assignment_id
+
+
+def assignment_versions_endpoint(assignment_id):
+    """The idempotency endpoint of an Assignment upload."""
+
+    return f"POST {ASSIGNMENTS_PATH}/{assignment_id}{PLAYGROUND_VERSIONS_SUFFIX}"
 
 
 def playground_versions_endpoint(playground_id):
@@ -169,6 +200,12 @@ def allowed_methods(path):
 
     if path in ("/healthz", CATALOG_PATH):
         return ALLOWED_METHODS
+    if path == ASSIGNMENTS_PATH:
+        return ("POST",)
+    if match_assignment(path) is not None:
+        return ("DELETE",)
+    if match_assignment_versions(path) is not None:
+        return ("POST",)
     if path == SUBMISSIONS_PATH:
         # The one anonymous write in the service (hand in work) shares its path
         # with the operator's read of what was handed in.

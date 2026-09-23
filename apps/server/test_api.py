@@ -78,7 +78,7 @@ class ServerTestCase(unittest.TestCase):
         content_type="application/json",
         extra_headers=None,
     ):
-        # implementation.md §10: every API request states its protocol version, so
+        # Every API request states its protocol version, so
         # the shared helper sends it unless a test deliberately omits it.
         headers = {"X-Protocol-Version": str(PROTOCOL_VERSION)}
         body = raw_body
@@ -230,7 +230,8 @@ class ServerTestCase(unittest.TestCase):
             "/api/v1/submissions",
             payload={
                 "submission_id": delivery_id,
-                "playground_id": playground_id,
+                "source_kind": "playground",
+                "source_id": playground_id,
                 "version_id": commit_id,
                 "files": files if files is not None else {"work/main.py": f"{header}\nprint(1)\n"},
             },
@@ -251,7 +252,7 @@ class ServerTestCase(unittest.TestCase):
         return [
             entry
             for entry in body["submissions"]
-            if entry["playgroundId"] == playground_id
+            if entry["sourceId"] == playground_id
         ]
 
 
@@ -271,6 +272,7 @@ class DistributionTest(ServerTestCase):
         self.assertEqual(
             sorted(body),
             [
+                "assignments",
                 "minimum_client_protocol_version",
                 "playgrounds",
                 "protocol_version",
@@ -495,7 +497,7 @@ class PublishAfterLostFinalizeTest(ServerTestCase):
 
     def test_no_op_answers_about_the_current_version(self):
         # 同一个坑的另一面：no_op 返回的 version_id 必须是**当前**那个 Version
-        # （implementation.md §11），不能是 ref 上落后的那个。
+        # （implementation.md §2），不能是 ref 上落后的那个。
         name = "chain-noop"
         _, second = self.publish_after_lost_finalize(name)
 
@@ -515,7 +517,7 @@ class PublishAfterLostFinalizeTest(ServerTestCase):
 
 
 class VersionReadPathTest(ServerTestCase):
-    """implementation.md §11 Read Version：读 Version 只认 version_id，不认 ref。
+    """implementation.md §2 Read Version：读 Version 只认 version_id，不认 ref。
 
     所以中间版本、被覆盖的版本、以及已经下线的 Playground 的历史都仍然可读 ——
     可达性由 ref 保证，但寻址与它无关。
@@ -1071,7 +1073,7 @@ class RetiringTest(ServerTestCase):
             "GET", f"/api/v1/submissions/{submission_id}", token=OPERATOR_TOKEN
         )
         self.assertEqual(status, 200)
-        self.assertEqual(body["submission"]["playgroundId"], playground_id)
+        self.assertEqual(body["submission"]["sourceId"], playground_id)
 
         # A new submission against a retired course is refused.
         result = self.hand_in(playground_id, commit_id)
@@ -1116,7 +1118,9 @@ class SubmissionTest(ServerTestCase):
         self.hand_in(playground_id, commit_id)
 
         (stored,) = self.stored_submissions(playground_id)
-        self.assertEqual(stored["commitId"], commit_id)
+        self.assertEqual(stored["versionId"], commit_id)
+        self.assertEqual(stored["sourceKind"], "playground")
+        self.assertEqual(stored["sourceId"], playground_id)
         self.assertEqual(stored["student"], "2026-001")
 
     def test_the_same_delivery_name_twice_is_one_submission(self):
@@ -1160,7 +1164,7 @@ class SubmissionTest(ServerTestCase):
 
 
 class ProtocolVersionTest(ServerTestCase):
-    """Requests must say which protocol they speak (implementation.md §10)."""
+    """Requests must say which protocol they speak."""
 
     def test_a_request_without_the_header_is_refused(self):
         for path in ("/api/v1/catalog", "/api/v1/submissions"):
@@ -1208,6 +1212,141 @@ class ProtocolVersionTest(ServerTestCase):
         self.assertEqual(status, 200)
 
 
+class AssignmentTest(ServerTestCase):
+    """作业：上传一份 Markdown、取消发布、以及目录里那一条标题。
+
+    这个 fixture 是类级共享的（一个服务端、一份库），所以每个用例都用自己的
+    assignment id：不然前一个用例建好的作业会让后一个用例的"第一次发布"变成
+    "已有作业没给 base"。
+    """
+
+    def new_id(self, prefix="hw"):
+        return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    def publish(self, assignment_id, markdown="# 标题\n", base=None, key=None):
+        headers = {"Idempotency-Key": key or uuid.uuid4().hex}
+        if base is not None:
+            headers["X-Base-Version-Id"] = base
+        return self.request(
+            "POST",
+            f"/api/v1/assignments/{assignment_id}/versions",
+            raw_body=markdown.encode("utf-8"),
+            token=OPERATOR_TOKEN,
+            content_type="text/markdown",
+            extra_headers=headers,
+        )
+
+    def listed(self):
+        status, _, body = self.request("GET", "/api/v1/catalog")
+        self.assertEqual(status, 200)
+        return body["assignments"]
+
+    def listed_ids(self):
+        return [entry["assignment_id"] for entry in self.listed()]
+
+    def test_publishing_a_title_puts_it_in_the_catalog(self):
+        first, second = self.new_id(), self.new_id()
+        for assignment_id, title in ((first, "题目一"), (second, "题目二")):
+            status, _, body = self.publish(assignment_id, f"# {title}\n")
+            self.assertEqual(status, 201, body)
+            self.assertEqual(body["status"], "accepted")
+            self.assertTrue(body["version_id"])
+
+        entries = {entry["assignment_id"]: entry for entry in self.listed()}
+        self.assertEqual(entries[first]["title"], "题目一")
+        self.assertEqual(entries[second]["title"], "题目二")
+        self.assertNotEqual(
+            entries[first]["current_version_id"], entries[second]["current_version_id"]
+        )
+
+    def test_the_same_content_again_is_a_no_op(self):
+        assignment_id = self.new_id()
+        _, _, first = self.publish(assignment_id, "# one\n")
+        status, _, second = self.publish(assignment_id, "# one\n", base=first["version_id"])
+
+        self.assertEqual(status, 201)
+        self.assertEqual(second["status"], "no_op")
+        self.assertEqual(second["version_id"], first["version_id"])
+        self.assertEqual(self.listed_ids().count(assignment_id), 1)
+
+    def test_a_stale_base_is_a_conflict(self):
+        assignment_id = self.new_id()
+        _, _, first = self.publish(assignment_id, "# one\n")
+        self.publish(assignment_id, "# two\n", base=first["version_id"])
+
+        status, _, body = self.publish(assignment_id, "# three\n", base=first["version_id"])
+        self.assertEqual((status, body), (409, {"status": "conflict"}))
+
+    def test_the_first_publish_must_not_name_a_base(self):
+        assignment_id = self.new_id()
+        status, _, body = self.publish(assignment_id, "# one\n", base="a" * 40)
+        self.assertEqual((status, body), (409, {"status": "conflict"}))
+
+    def test_a_body_that_is_not_a_title_is_refused(self):
+        assignment_id = self.new_id()
+        status, _, body = self.publish(assignment_id, "no title here\n")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "invalid_assignment")
+        self.assertNotIn(assignment_id, self.listed_ids())
+
+    def test_an_oversized_body_is_refused_before_it_is_parsed(self):
+        status, _, _ = self.publish(self.new_id(), "# t\n" + "x" * (64 * 1024))
+        self.assertEqual(status, 413)
+
+    def test_publishing_needs_the_operator_token(self):
+        status, _, _ = self.request(
+            "POST",
+            f"/api/v1/assignments/{self.new_id()}/versions",
+            raw_body=b"# t\n",
+            content_type="text/markdown",
+            extra_headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+        self.assertEqual(status, 401)
+
+    def test_a_replayed_key_answers_the_same(self):
+        assignment_id, key = self.new_id(), uuid.uuid4().hex
+        _, _, first = self.publish(assignment_id, "# one\n", key=key)
+        status, _, second = self.publish(assignment_id, "# one\n", key=key)
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_unpublishing_hides_it_and_publishing_again_brings_it_back(self):
+        assignment_id = self.new_id()
+        _, _, first = self.publish(assignment_id, "# one\n")
+
+        status, _, body = self.request(
+            "DELETE", f"/api/v1/assignments/{assignment_id}", token=OPERATOR_TOKEN
+        )
+        self.assertEqual((status, body), (200, {"status": "accepted"}))
+        self.assertNotIn(assignment_id, self.listed_ids(), "取消发布之后学生端看不到")
+
+        status, _, body = self.request(
+            "DELETE", f"/api/v1/assignments/{assignment_id}", token=OPERATOR_TOKEN
+        )
+        self.assertEqual((status, body), (200, {"status": "no_op"}))
+
+        status, _, again = self.publish(assignment_id, "# two\n", base=first["version_id"])
+        self.assertEqual(status, 201)
+        self.assertEqual(again["status"], "accepted")
+        entry = next(e for e in self.listed() if e["assignment_id"] == assignment_id)
+        self.assertEqual(entry["title"], "two", "发布就是重新上线，标题也跟着换")
+
+    def test_unpublishing_an_unknown_assignment_is_not_found(self):
+        status, _, _ = self.request(
+            "DELETE", f"/api/v1/assignments/{self.new_id('nope')}", token=OPERATOR_TOKEN
+        )
+        self.assertEqual(status, 404)
+
+    def test_a_stopped_assignment_stays_out_of_the_catalog(self):
+        stopped, kept = self.new_id(), self.new_id()
+        self.publish(stopped, "# one\n")
+        self.publish(kept, "# two\n")
+        self.request("DELETE", f"/api/v1/assignments/{stopped}", token=OPERATOR_TOKEN)
+
+        ids = self.listed_ids()
+        self.assertNotIn(stopped, ids)
+        self.assertIn(kept, ids)
+
 class SubmittedWorkOnDiskTest(ServerTestCase):
     """交上来的作业在磁盘上是一份人能直接打开的东西。
 
@@ -1233,7 +1372,8 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
             "/api/v1/submissions",
             payload={
                 "submission_id": submission_id or uuid.uuid4().hex,
-                "playground_id": playground_id,
+                "source_kind": "playground",
+                "source_id": playground_id,
                 "version_id": version_id,
                 "files": files,
             },
@@ -1256,8 +1396,8 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
         # 文件夹里还有一张条，说明这份是谁的、基于哪个版本
         manifest = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["student"], "张三（1 班）")
-        self.assertEqual(manifest["commitId"], version_id)
-        self.assertEqual(manifest["playgroundId"], playground_id)
+        self.assertEqual(manifest["versionId"], version_id)
+        self.assertEqual(manifest["sourceId"], playground_id)
         self.assertEqual(manifest["files"], ["work/main.py"])
 
     def test_a_second_hand_in_of_the_same_course_is_numbered(self):

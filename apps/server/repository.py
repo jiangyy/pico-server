@@ -31,12 +31,17 @@ _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 # prefix, or an option from being resolved as if it were an object id.
 _OBJECT_ID_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
 
-#: implementation.md §3: the stable, per-Playground reachability root. It converges to
+#: implementation.md §2: the stable, per-Playground reachability root. It converges to
 #: the database's `current_version_id`; it never leads it.
 HISTORY_REF_PREFIX = "refs/picopg/history/"
-#: implementation.md §3: the temporary root for a Version that is prepared but not yet
+#: implementation.md §2: the temporary root for a Version that is prepared but not yet
 #: accepted. One per publish attempt, removed once the attempt is settled.
 PENDING_REF_PREFIX = "refs/picopg/pending/"
+
+#: An Assignment's history. Its own namespace on purpose: assignment ids and
+#: playground ids are independent, so one shared prefix would let either kind's
+#: history overwrite the other's.
+ASSIGNMENT_REF_PREFIX = "refs/picopg/assignment/"
 
 
 def _require_publish_id(publish_id):
@@ -68,7 +73,7 @@ class Repository:
 
         Everything a Playground has accepted stays reachable from here. It is
         *not* the addressing scheme for a Version — a Version is read by its own
-        id (implementation.md §11) — it is the reachability root that keeps the Git GC
+        id (implementation.md §2) — it is the reachability root that keeps the Git GC
         away and the thing `commit_in_playground_history` consults.
         """
         validate_playground_id(opaque_id)
@@ -85,6 +90,17 @@ class Repository:
         """
         _require_publish_id(publish_id)
         ref = f"{PENDING_REF_PREFIX}{publish_id}"
+        _check_ref_format(ref)
+        return ref
+
+    def assignment_ref(self, opaque_id):
+        """Return the stable history ref for an Assignment.
+
+        The same job as `history_ref`, in its own namespace. A Version is still
+        read by its own id; this ref is only the reachability root.
+        """
+        validate_playground_id(opaque_id)
+        ref = f"{ASSIGNMENT_REF_PREFIX}{opaque_id}"
         _check_ref_format(ref)
         return ref
 
@@ -532,6 +548,78 @@ class PreparedVersion:
     no_op: bool
 
 
+@dataclass(frozen=True)
+class PreparedAssignment:
+    """An Assignment Version built and protected, not yet accepted.
+
+    ``publish_id`` is ``None`` exactly when ``no_op`` is true.
+    """
+
+    assignment_id: str
+    commit_id: str
+    publish_id: str | None
+    no_op: bool
+
+
+def prepare_assignment_version(
+    repository, assignment_id, markdown, metadata, publish_id, observed_version_id=None
+):
+    """Prepare an Assignment Version: one ``assignment.md``, one commit, one pending ref.
+
+    An Assignment is not a Playground bundle — there is nothing to validate
+    beyond the Markdown itself, which the application层 already parsed — so this
+    reuses the tree/commit/ref machinery and nothing else. ``no_op`` is decided
+    the same way: the new tree equals the observed Version's tree.
+    """
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    if type(markdown) is not bytes or len(markdown) == 0:
+        raise RepositoryError("assignment markdown must be non-empty bytes")
+    _validate_commit_metadata(metadata)
+    _require_publish_id(publish_id)
+
+    ref = repository.assignment_ref(assignment_id)
+
+    if observed_version_id is not None:
+        head = resolve_commit(repository, observed_version_id)
+        if head is None:
+            raise RepositoryError("observed version is not a commit")
+    else:
+        head = _resolve_head(repository, ref)
+    head_tree = _commit_tree_id(repository, head) if head is not None else None
+
+    new_tree_id = _write_bundle_tree(repository, {"assignment.md": markdown})
+    if head is not None and new_tree_id == head_tree:
+        return PreparedAssignment(
+            assignment_id=assignment_id, commit_id=head, publish_id=None, no_op=True
+        )
+
+    commit_id = _create_commit(repository, new_tree_id, head, metadata)
+    create_pending_ref(repository, publish_id, commit_id)
+    return PreparedAssignment(
+        assignment_id=assignment_id,
+        commit_id=commit_id,
+        publish_id=publish_id,
+        no_op=False,
+    )
+
+
+def commit_in_assignment_history(repository, assignment_id, commit_id):
+    """Return whether ``commit_id`` belongs to the named Assignment history."""
+
+    try:
+        ref = repository.assignment_ref(assignment_id)
+    except RepositoryError:
+        return False
+    if _resolve_head(repository, ref) is None:
+        return False
+    completed = _run_git(
+        ("merge-base", "--is-ancestor", commit_id, ref), cwd=repository.path
+    )
+    return completed.returncode == 0
+
+
 def publish_playground_prepare(
     repository, playground_id, bundle, metadata, publish_id, observed_version_id=None
 ):
@@ -681,6 +769,18 @@ def converge_history_ref(repository, playground_id, version_id):
     )
     if completed.returncode != 0:
         raise RepositoryError("could not converge history reference")
+
+
+def converge_assignment_ref(repository, assignment_id, version_id):
+    """Move an Assignment's history ref to the Version the database says is current."""
+
+    if not isinstance(repository, Repository):
+        raise RepositoryError("repository handle required")
+    _require_object_id(version_id)
+    ref = repository.assignment_ref(assignment_id)
+    completed = _run_git(("update-ref", ref, version_id), cwd=repository.path)
+    if completed.returncode != 0:
+        raise RepositoryError("could not converge assignment reference")
 
 
 def list_pending_refs(repository):
