@@ -40,16 +40,22 @@ HERE = Path(__file__).resolve().parent
 DRIVER = HERE / "e2e_client.mjs"
 OPERATOR_TOKEN = "e2e-operator-token-000"
 
-# Where the client repository usually sits next to this one. The environment
-# variable wins, so a checkout anywhere else still works.
-DEFAULT_CLIENT_DIR = HERE.parents[2] / "learn-python" / "apps" / "client"
+# Where the client usually sits: either this server stands on its own with a
+# `learn-python` checkout beside it, or it is vendored into that checkout as
+# `learn-python/picopg/`. Both are tried, and an environment variable wins so a
+# clone anywhere else still works.
+DEFAULT_CLIENT_DIRS = (
+    HERE.parents[2] / "learn-python" / "apps" / "client",
+    HERE.parents[2] / "apps" / "client",
+)
 
 
 def client_dir():
     configured = os.environ.get("PICOPG_CLIENT_DIR")
-    candidate = Path(configured) if configured else DEFAULT_CLIENT_DIR
-    if (candidate / "transport.ts").exists():
-        return candidate
+    candidates = (Path(configured),) if configured else DEFAULT_CLIENT_DIRS
+    for candidate in candidates:
+        if (candidate / "transport.ts").exists():
+            return candidate
     return None
 
 
@@ -167,15 +173,14 @@ class ClientContractTest(unittest.TestCase):
     def test_the_client_can_bootstrap_install_submit_and_retire(self):
         version_id = self.publish("pg-e2e")
 
-        # 1. First launch: read the catalog, install its content, adopt the
-        #    cursor.
+        # 1. First launch: read the catalog and install its content.
         boot = self.client("bootstrap")
-        self.assertEqual(boot["upto_seq"], 1)
         self.assertEqual(
             boot["installed"],
             [{"playgroundId": "pg-e2e", "versionId": version_id}],
         )
-        self.assertEqual(boot["cursor"], 1)
+        self.assertEqual(boot["active"], ["pg-e2e"])
+        self.assertEqual(boot["problems"], [])
 
         # 2. The content really is on disk, readable through the client's own
         #    store, and the bytes are the ones the server published.
@@ -186,19 +191,20 @@ class ClientContractTest(unittest.TestCase):
         )
         self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>hello</html>")
 
-        # 3. A hand-in travels as a submit_code event and comes back accepted.
+        # 3. A hand-in travels as one named delivery and comes back stored.
         hand_in = self.client("submit", "pg-e2e", version_id, "张三")
-        self.assertEqual(hand_in["rejected"], [])
-        self.assertEqual(len(hand_in["accepted"]), 1)
+        self.assertEqual(hand_in["outcome"], "stored")
         self.assertEqual(hand_in["pending"], 0)
+        # 一次投递一次请求：客户端不是把队列攒成一批发出去的。
+        self.assertEqual(hand_in["http"]["submissions"], 1)
 
         # 4. The server stored it under the name the file carries.
         (stored,) = self.stored_submissions("pg-e2e")
         self.assertEqual(stored["student"], "张三")
         self.assertEqual(stored["commitId"], version_id)
 
-        # 5. Archiving reaches the client as a content log entry, and the next
-        #    sync round retires it from the active set without deleting bytes.
+        # 5. Archiving reaches the client as the course disappearing from the
+        #    catalog, and the next round retires it without deleting bytes.
         status, _ = self.operator("DELETE", "/api/v1/playgrounds/pg-e2e")
         self.assertEqual(status, 200)
         after = self.client("sync")
@@ -210,9 +216,9 @@ class ClientContractTest(unittest.TestCase):
 
         A brand-new client has no local set to disagree with the snapshot, but a
         *repaired* install does: `stateAfterStartup` re-runs bootstrap when the
-        local content is damaged, and adopting the snapshot's cursor skips past
-        the archive entry that would have retired anything the server dropped in
-        the meantime — permanently, because a cursor never moves backwards.
+        local content is damaged, and the rebuilt set has to be exactly what the
+        snapshot names — anything the server dropped in the meantime is out, and
+        nothing else may survive.
         """
         self.publish("pg-e2e")
         self.publish("pg-other")
@@ -227,7 +233,6 @@ class ClientContractTest(unittest.TestCase):
         boot = self.client("bootstrap")
         self.assertEqual(boot["active"], ["pg-e2e"])
         self.assertEqual(boot["problems"], [])
-        self.assertEqual(boot["cursor"], boot["upto_seq"])
 
         # And the retired course really is gone from the local set, not merely
         # absent from this response.
@@ -256,11 +261,12 @@ class ClientContractTest(unittest.TestCase):
         after = self.client("sync")
         self.assertEqual(after["installed"], ["pg-e2e"], "恢复必须真的把它装回来")
         self.assertEqual(after["active"], ["pg-e2e"])
+        self.assertEqual(after["stored"], [], "恢复不产生交付结果")
         # 内容就是原来那个 Version，不是新造的
         manifest = self.read_local_manifest("pg-e2e", version_id)
         self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>hello</html>")
 
-        # 幂等：再来一次是 no_op，客户端也不会看到第二个事件
+        # 幂等：再来一次是 no_op，客户端也不需要再装一次
         self.assertEqual(
             self.operator("POST", "/api/v1/playgrounds/pg-e2e/restore")[1],
             {"status": "no_op"},
@@ -270,7 +276,7 @@ class ClientContractTest(unittest.TestCase):
     def test_a_hand_in_written_offline_is_still_accepted_after_the_course_moves_on(self):
         """断网时写好的作业，等联网时课程已经发了新版本 —— 这份作业仍然收。
 
-        protocol.md §2 SubmitCode 只要求 ``version_id`` 属于该 Playground，
+        picopg-implementation.md §9 只要求 ``version_id`` 属于该 Playground，
         实现里就是「在该课程已发布的 history 里」。而 history 不会被删（Archive
         只改 state），所以一份钉在旧版本上、隔了一段时间才送到的作业仍然有效，
         并且被记在它真正依据的那个版本上 —— 这一点很重要：学生是按那个版本做的。
@@ -296,11 +302,11 @@ class ClientContractTest(unittest.TestCase):
 
         # 联网后一次常规同步：先把作业送上去，再把新版本拉下来
         after = self.client("sync")
-        self.assertEqual(after["accepted"].__len__(), 1, after)
-        self.assertEqual(after["rejected"], [])
+        self.assertEqual(len(after["stored"]), 1, after)
+        self.assertEqual(after["refused"], [])
+        self.assertEqual(after["undelivered"], [])
         self.assertEqual(after["pending"], 0)
         self.assertEqual(after["installed"], ["pg-offline"], "新版本要自动拉下来")
-        self.assertEqual(after["cursor"], after["upto_seq"])
         self.assertEqual(after["retired"], [])
 
         (stored,) = self.stored_submissions("pg-offline")
@@ -311,33 +317,39 @@ class ClientContractTest(unittest.TestCase):
         manifest = self.read_local_manifest("pg-offline", second)
         self.assertEqual(self.read_local_file(manifest, "course/index.html"), "<html>second</html>")
 
-    def test_the_client_sends_no_more_events_than_the_server_accepts(self):
-        """两侧的批次上限必须一致。
+    def test_each_queued_hand_in_is_one_request_and_one_answer(self):
+        """A queue of hand-ins drains one delivery at a time.
 
-        The client sends a prefix of its pending queue; the server refuses a
-        *whole round* that is longer than its own cap. If the server's cap were
-        lower, every round would be a 400 — including retries of the same
-        events — and the queue could never drain: there is no per-event answer
-        to learn from, so recovering would mean surgery on `pending.json`.
+        There is no batch and no round cap any more: each hand-in is its own
+        request, named by the client, and the server answers each one on its
+        own. What this pins is that a queue of several hand-ins produces one
+        request each — the client never catches a refusal it cannot attribute to
+        a delivery, which is what the old whole-round cap made impossible.
         """
-        result = subprocess.run(
-            [
-                NODE,
-                "--input-type=module",
-                "-e",
-                f'const m = await import("{CLIENT_DIR}/sync.ts");'
-                " console.log(m.MAX_EVENTS_PER_SYNC);",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
+        version_id = self.publish("pg-queue")
+        self.client("bootstrap")
+
+        self.write_hand_in("# 姓名：甲\nprint(1)\n")
+        queued_offline = self.client_on(
+            self.dead_port(), "submit", "pg-queue", version_id, "甲"
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        client_cap = int(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(queued_offline["pending"], 1)
+        self.write_hand_in("# 姓名：乙\nprint(2)\n")
+        self.client_on(self.dead_port(), "submit", "pg-queue", version_id, "乙")
+        self.write_hand_in("# 姓名：丙\nprint(3)\n")
+        self.client_on(self.dead_port(), "submit", "pg-queue", version_id, "丙")
+        self.assertEqual(self.pending_count(), 3)
+
+        after = self.client("sync")
+        self.assertEqual(len(after["stored"]), 3, after)
+        self.assertEqual(after["refused"], [])
+        self.assertEqual(after["undelivered"], [])
+        self.assertEqual(after["pending"], 0)
+        self.assertEqual(after["http"]["submissions"], 3, "三条待送 = 三次请求")
+        self.assertEqual(after["http"]["catalog"], 1, "目录一轮读一次")
         self.assertEqual(
-            client_cap,
-            server_module.MAX_PENDING_EVENTS,
-            "客户端一轮送多少条，必须等于服务端一轮最多收多少条",
+            sorted(entry["student"] for entry in self.stored_submissions("pg-queue")),
+            ["丙", "乙", "甲"],
         )
 
     def test_two_machines_that_wrote_offline_do_not_fork(self):
@@ -346,17 +358,17 @@ class ClientContractTest(unittest.TestCase):
         The timeline is the server's, and that is what makes this work:
 
           * A hand-in is a *fact*, not a slot to claim. Each machine invents its
-            own `event_id` before it ever has a network, so two machines writing
-            at the same time produce two submissions, both accepted. There is no
-            "last write wins" and nothing is overwritten.
+            own `submission_id` before it ever has a network, so two machines
+            writing at the same time produce two submissions, both stored. There
+            is no "last write wins" and nothing is overwritten.
           * Content cannot fork at all: only the operator publishes, and a
             publish is a compare-and-swap on `base_version_id`.
-          * Neither machine's *view* diverges either. Both were pinned to the
-            same Version and both follow the same log, so they converge on the
-            same cursor and the same current Version without any reconciliation.
+          * Neither machine's *view* diverges either: both read the same catalog
+            and end up with the same installed set and the same current Version,
+            without any reconciliation.
 
         A hand-in written offline is accepted even though the course moved on in
-        the meantime: protocol.md §2 only asks that the Version belong to that
+        the meantime: picopg-implementation.md §3 only asks that the Version belong to that
         Playground's published history.
         """
         first = self.publish("pg-two")
@@ -386,8 +398,8 @@ class ClientContractTest(unittest.TestCase):
         # 各自联网：各送各的作业，各拉同一版
         for machine, who in ((mine, "甲"), (theirs, "乙")):
             after = self.client("sync", data=machine)
-            self.assertEqual(len(after["accepted"]), 1, f"{who}: {after}")
-            self.assertEqual(after["rejected"], [], who)
+            self.assertEqual(len(after["stored"]), 1, f"{who}: {after}")
+            self.assertEqual(after["refused"], [], who)
             self.assertEqual(after["pending"], 0, who)
             self.assertEqual(after["installed"], ["pg-two"], f"{who} 要把新版拉下来")
 
@@ -400,30 +412,38 @@ class ClientContractTest(unittest.TestCase):
             "两份都是按断网时那一版写的，不是当前版本",
         )
 
-        # 两台最后站在同一个位置上（同一游标、同一当前版本）
+        # 两台最后站在同一个位置上（同一份已装集合、同一个当前版本）
         positions = [self.client("sync", data=machine) for machine in (mine, theirs)]
-        self.assertEqual({position["cursor"] for position in positions}, {positions[0]["cursor"]})
         self.assertEqual(
             {tuple(sorted(position["active"])) for position in positions},
             {tuple(sorted(positions[0]["active"]))},
         )
+        self.assertEqual(
+            [entry["installed"] for entry in positions],
+            [positions[0]["installed"]] * len(positions),
+            "两台都对着同一份目录，装出来的东西一样",
+        )
         self.assertEqual(self.pending_count(data=mine), 0)
         self.assertEqual(self.pending_count(data=theirs), 0)
 
-    def test_a_second_launch_only_pulls_what_it_missed(self):
+    def test_a_later_round_installs_only_what_changed(self):
         self.publish("pg-e2e")
         first = self.client("bootstrap")
-        self.assertEqual(first["upto_seq"], 1)
+        self.assertEqual(first["active"], ["pg-e2e"])
+        self.assertEqual(first["http"]["manifests"], 1)
 
         second = self.publish("pg-other")
-        # The same machine: no re-install of everything, just the new entry.
+        # The same machine: the catalog is read again, but only the new course
+        # costs a manifest and a file — the installed one is compared by version
+        # id and left alone.
         after = self.client("sync")
         self.assertEqual(after["installed"], ["pg-other"])
-        self.assertEqual(
-            sorted(after["active"]), ["pg-e2e", "pg-other"]
-        )
-        self.assertNotEqual(after["upto_seq"], first["upto_seq"])
-        self.assertEqual(after["cursor"], after["upto_seq"])
+        self.assertEqual(sorted(after["active"]), ["pg-e2e", "pg-other"])
+        self.assertEqual(after["http"]["catalog"], 1)
+        self.assertEqual(after["http"]["manifests"], 1, "已经装好的版本不该再拉一遍")
+        # 新课的页面内容和旧课逐字节相同，而内容是按 sha256 存的：这一份已经在
+        # 磁盘上，所以连文件都不用下载。
+        self.assertEqual(after["http"]["files"], 0, "同样的内容只下过一次")
         self.assertTrue(second)
 
     def test_an_offline_hand_in_survives_a_restart_and_is_sent_once(self):
@@ -431,7 +451,7 @@ class ClientContractTest(unittest.TestCase):
         self.client("bootstrap")
 
         # Queue a hand-in while the server is unreachable, then restart the
-        # process: the pending event must still be there.
+        # process: the queued delivery must still be there.
         self.server.shutdown()
         self.server.server_close()
         self.write_hand_in("# 姓名：李四\nprint(2)\n")
@@ -439,11 +459,11 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(queued["pending"], 1)
 
         # A fresh server on the same data directory: the client retries the
-        # queued event with its original id, so the round produces exactly one
-        # submission — and the name is the one the file already carried.
+        # queued delivery with its original id, so the round produces exactly
+        # one submission — and the name is the one the file already carried.
         self.restart_server()
         retry = self.client("sync")
-        self.assertEqual(len(retry["accepted"]), 1)
+        self.assertEqual(len(retry["stored"]), 1)
         self.assertEqual(retry["pending"], 0)
         (stored,) = self.stored_submissions("pg-e2e")
         self.assertEqual(stored["student"], "李四")
@@ -486,7 +506,7 @@ class ClientContractTest(unittest.TestCase):
 
     def pending_count(self, data=None):
         raw = json.loads(((data or self.client_data) / "pending.json").read_text(encoding="utf-8"))
-        return len(raw["events"])
+        return len(raw["submissions"])
 
     def restart_server(self):
         base = Path(self.temporary_directory.name)

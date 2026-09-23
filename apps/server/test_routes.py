@@ -117,9 +117,10 @@ class MethodTableTest(unittest.TestCase):
         table = {
             "/healthz": ("GET", "HEAD"),
             "/api/v1/catalog": ("GET", "HEAD"),
-            "/api/v1/submissions": ("GET", "HEAD"),
+            # One path, two audiences: the client hands work in here, the
+            # operator reads what was handed in.
+            "/api/v1/submissions": ("GET", "HEAD", "POST"),
             "/api/v1/submissions/abc": ("GET", "HEAD"),
-            "/api/v1/sync": ("POST",),
             "/api/v1/playgrounds": ("POST",),
             "/api/v1/playgrounds/pg": ("DELETE",),
             "/api/v1/playgrounds/pg/versions": ("POST",),
@@ -137,7 +138,7 @@ class MethodTableTest(unittest.TestCase):
         # The table's whole job: a caller learns the path exists but not like
         # this, instead of being told the path does not exist.
         self.assertIsNotNone(routes.allowed_methods("/api/v1/catalog"))
-        self.assertIsNotNone(routes.allowed_methods("/api/v1/sync"))
+        self.assertIsNotNone(routes.allowed_methods("/api/v1/submissions"))
 
 
 if __name__ == "__main__":

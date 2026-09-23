@@ -26,7 +26,7 @@ from pathlib import Path
 # Allow ``import server`` no matter where the test is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from events_types import PROTOCOL_VERSION  # noqa: E402
+from api_handler import PROTOCOL_VERSION  # noqa: E402
 from unittest import mock  # noqa: E402
 
 import bundles  # noqa: E402
@@ -78,7 +78,7 @@ class ServerTestCase(unittest.TestCase):
         content_type="application/json",
         extra_headers=None,
     ):
-        # protocol.md §4: every API request states its protocol version, so
+        # picopg-implementation.md §10: every API request states its protocol version, so
         # the shared helper sends it unless a test deliberately omits it.
         headers = {"X-Protocol-Version": str(PROTOCOL_VERSION)}
         body = raw_body
@@ -167,17 +167,6 @@ class ServerTestCase(unittest.TestCase):
     def catalog_ids(self):
         return [entry["playground_id"] for entry in self.catalog_entries()]
 
-    def sync(self, pending_events, after_seq=0):
-        """One sync round; the status is asserted here so callers read bodies."""
-
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/sync",
-            payload={"pending_events": pending_events, "after_seq": after_seq},
-        )
-        self.assertEqual(status, 200, body)
-        return body
-
     def retire(self, playground_id, token=OPERATOR_TOKEN):
         """Take a Playground out of the catalog."""
 
@@ -188,7 +177,7 @@ class ServerTestCase(unittest.TestCase):
     def publish(self, playground_id, archive=None, key="key-1", base=None):
         """Publish one bundle, naming the current Version as its base.
 
-        protocol.md §2: every publish of an existing Playground says which
+        picopg-implementation.md §3: every publish of an existing Playground says which
         Version it built on. `base=None` asks the server what that is, exactly
         as `upload.mjs` does; `base=False` sends nothing, which is how the
         refusal is tested.
@@ -219,27 +208,40 @@ class ServerTestCase(unittest.TestCase):
         assert status == 201, (status, body)
         return playground_id, body["version_id"]
 
-    def hand_in(self, playground_id, commit_id, header="# 姓名：2026-001", files=None):
+    def hand_in(
+        self,
+        playground_id,
+        commit_id,
+        header="# 姓名：2026-001",
+        files=None,
+        submission_id=None,
+    ):
         """Hand one piece of work in through the client's one write path.
 
-        Returns the single ``EventResult`` the server answered with, so a
-        caller can assert on ``status``/``reason`` the same way the client
-        does.
+        Returns ``{"status", "reason", "submission_id"}`` — the same shape a
+        caller asserts on whatever the outcome was: the endpoint answers a
+        stored hand-in with 2xx and a refusal with a stable code, and this
+        helper reads both into one vocabulary.
         """
-        event = {
-            "event_id": uuid.uuid4().hex,
-            "kind": "submit_code",
-            "payload": {
+
+        delivery_id = submission_id or uuid.uuid4().hex
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/submissions",
+            payload={
+                "submission_id": delivery_id,
                 "playground_id": playground_id,
                 "version_id": commit_id,
                 "files": files if files is not None else {"work/main.py": f"{header}\nprint(1)\n"},
             },
-        }
-        status, _, body = self.request(
-            "POST", "/api/v1/sync", payload={"pending_events": [event], "after_seq": 0}
         )
-        self.assertEqual(status, 200, body)
-        return body["event_results"][0]
+        if status in (200, 201):
+            return {"status": body["status"], "reason": "", "submission_id": delivery_id}
+        return {
+            "status": "rejected",
+            "reason": body.get("code", ""),
+            "submission_id": delivery_id,
+        }
 
     def stored_submissions(self, playground_id):
         status, _, body = self.request(
@@ -272,7 +274,6 @@ class DistributionTest(ServerTestCase):
                 "minimum_client_protocol_version",
                 "playgrounds",
                 "protocol_version",
-                "upto_seq",
             ],
         )
         self.assertIn(
@@ -494,7 +495,7 @@ class PublishAfterLostFinalizeTest(ServerTestCase):
 
     def test_no_op_answers_about_the_current_version(self):
         # 同一个坑的另一面：no_op 返回的 version_id 必须是**当前**那个 Version
-        # （protocol.md §3），不能是 ref 上落后的那个。
+        # （picopg-implementation.md §11），不能是 ref 上落后的那个。
         name = "chain-noop"
         _, second = self.publish_after_lost_finalize(name)
 
@@ -514,7 +515,7 @@ class PublishAfterLostFinalizeTest(ServerTestCase):
 
 
 class VersionReadPathTest(ServerTestCase):
-    """protocol.md §3 Read Version：读 Version 只认 version_id，不认 ref。
+    """picopg-implementation.md §11 Read Version：读 Version 只认 version_id，不认 ref。
 
     所以中间版本、被覆盖的版本、以及已经下线的 Playground 的历史都仍然可读 ——
     可达性由 ref 保证，但寻址与它无关。
@@ -603,7 +604,7 @@ class VersionReadPathTest(ServerTestCase):
 
 
 class PublishCreatesPlaygroundTest(ServerTestCase):
-    """protocol.md §2 step 0：不存在的 Playground 由第一次发布带出来。"""
+    """picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）：不存在的 Playground 由第一次发布带出来。"""
 
     def test_publishing_to_an_unknown_playground_creates_it(self):
         # 不需要先登记：协议里 PublishRequest 的「Playground 不存在」分支就是创建。
@@ -643,16 +644,11 @@ class PublishCreatesPlaygroundTest(ServerTestCase):
         self.assertNotIn("never-existed", self.catalog_ids())
 
     def test_creating_announces_the_version_to_clients(self):
-        # 创建和发布一样要进内容日志，否则客户端永远不知道该装它。
+        # 客户端靠读目录知道要装什么：创建和发布一样，只是让某个 id 带着一个
+        # Version 出现在快照里。
         _, _, body = self.publish("announced", archive=self.build_zip(), key="create-announced")
-        entries = self.sync([], after_seq=0)["entries"]
-        published = [
-            entry for entry in entries
-            if entry["event"]["kind"] == "publish_playground"
-            and entry["event"]["payload"]["playground_id"] == "announced"
-        ]
-        self.assertEqual(len(published), 1)
-        self.assertEqual(published[0]["event"]["payload"]["version_id"], body["version_id"])
+        entries = {entry["playground_id"]: entry for entry in self.catalog_entries()}
+        self.assertEqual(entries["announced"]["current_version_id"], body["version_id"])
 
     def test_a_publish_is_still_not_how_an_archived_playground_comes_back(self):
         self.publish("revived", archive=self.build_zip(), key="revive-1")
@@ -804,26 +800,22 @@ class RestoreTest(ServerTestCase):
         self.assertEqual(self.restore(playground_id, token=None)[0], 401)
         self.assertEqual(self.restore(playground_id, token="wrong-token-000000")[0], 401)
 
-    def test_a_restore_reaches_clients_as_a_publish(self):
-        # The content log has no "restored" kind, so the client learns about it
-        # the same way it learns about anything else: a publish it can install.
+    def test_a_restore_puts_the_same_version_back_in_the_catalog(self):
+        # 一个 Playground 对学生是否可见，只看目录里有没有它；恢复不产生新
+        # Version，回到目录里的还是原来那一个。
         playground_id, version_id = self.seed("pg-restore-event")
-        before = self.sync([], after_seq=0)["upto_seq"]
+        self.assertEqual(
+            {entry["playground_id"]: entry["current_version_id"] for entry in self.catalog_entries()}[
+                playground_id
+            ],
+            version_id,
+        )
         self.retire(playground_id)
+        self.assertNotIn(playground_id, self.catalog_ids())
         self.restore(playground_id)
 
-        body = self.sync([], after_seq=before)
-        kinds = [(entry["event"]["kind"], entry["event"]["payload"]) for entry in body["entries"]]
-        self.assertEqual(
-            kinds,
-            [
-                ("archive_playground", {"playground_id": playground_id}),
-                (
-                    "publish_playground",
-                    {"playground_id": playground_id, "version_id": version_id},
-                ),
-            ],
-        )
+        entries = {entry["playground_id"]: entry for entry in self.catalog_entries()}
+        self.assertEqual(entries[playground_id]["current_version_id"], version_id)
 
     def test_a_playground_that_was_never_published_can_be_restored(self):
         playground_id = "pg-restore-empty"
@@ -999,7 +991,7 @@ class PublishTest(ServerTestCase):
     def test_uploading_to_an_unknown_playground_creates_it(self):
         """This used to be 404.
 
-        protocol.md §2 step 0 is explicit that the first publish of an id is what
+        picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来） is explicit that the first publish of an id is what
         brings the Playground into existence, so a publisher that never
         registered the id is not doing something malformed. Registration is
         still there and still how an id is reserved before anything is published;
@@ -1127,6 +1119,36 @@ class SubmissionTest(ServerTestCase):
         self.assertEqual(stored["commitId"], commit_id)
         self.assertEqual(stored["student"], "2026-001")
 
+    def test_the_same_delivery_name_twice_is_one_submission(self):
+        # 重发同一个名字（响应丢了、客户端重试）必须落回同一行：客户端拿到的是
+        # 同一个结果，服务端不会多出一份作业。
+        playground_id, commit_id = self.seed()
+        first = self.hand_in(playground_id, commit_id, submission_id="same-name")
+        second = self.hand_in(playground_id, commit_id, submission_id="same-name")
+
+        self.assertEqual(
+            [first["status"], second["status"]], ["accepted", "existing_same"]
+        )
+        self.assertEqual(len(self.stored_submissions(playground_id)), 1)
+
+    def test_one_delivery_name_with_different_content_is_refused(self):
+        # 同一个名字配不同内容：这是两份不同的作业抢一个名字，不是重试。什么都不写，
+        # 而且重发也没用（所以是稳定的拒绝码，不是"再试一次"）。
+        playground_id, commit_id = self.seed()
+        self.hand_in(playground_id, commit_id, submission_id="collision")
+        again = self.hand_in(
+            playground_id,
+            commit_id,
+            header="# 姓名：另一个学生",
+            files={"work/main.py": "# 姓名：另一个学生\nprint(2)\n"},
+            submission_id="collision",
+        )
+
+        self.assertEqual(again["status"], "rejected")
+        self.assertEqual(again["reason"], "submission_conflict")
+        (stored,) = self.stored_submissions(playground_id)
+        self.assertEqual(stored["student"], "2026-001", "先到的那份没被改写")
+
     def test_a_hand_in_without_an_attribution_is_refused(self):
         # The name lives in the hand-in's own header, so an empty file set
         # carries none and cannot be filed under anyone.
@@ -1138,10 +1160,10 @@ class SubmissionTest(ServerTestCase):
 
 
 class ProtocolVersionTest(ServerTestCase):
-    """Requests must say which protocol they speak (protocol.md §4)."""
+    """Requests must say which protocol they speak (picopg-implementation.md §10)."""
 
     def test_a_request_without_the_header_is_refused(self):
-        for path in ("/api/v1/catalog", "/api/v1/sync", "/api/v1/submissions"):
+        for path in ("/api/v1/catalog", "/api/v1/submissions"):
             with self.subTest(path=path):
                 status, _, body = self.request(
                     "GET", path, extra_headers={"X-Protocol-Version": ""}
@@ -1203,15 +1225,22 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
         result = self.hand_in_event(playground_id, version_id, text)
         return playground_id, version_id, result
 
-    def hand_in_event(self, playground_id, version_id, files):
-        event = {
-            "event_id": uuid.uuid4().hex,
-            "kind": "submit_code",
-            "payload": {"playground_id": playground_id, "version_id": version_id, "files": files},
-        }
-        status, _, body = self.request("POST", "/api/v1/sync", payload={"pending_events": [event], "after_seq": 0})
-        self.assertEqual(status, 200, body)
-        return body["event_results"][0]
+    def hand_in_event(self, playground_id, version_id, files, submission_id=None):
+        """One hand-in, exactly as the endpoint receives it."""
+
+        status, _, body = self.request(
+            "POST",
+            "/api/v1/submissions",
+            payload={
+                "submission_id": submission_id or uuid.uuid4().hex,
+                "playground_id": playground_id,
+                "version_id": version_id,
+                "files": files,
+            },
+        )
+        if status in (200, 201):
+            return {"status": body["status"], "reason": "", "submission_id": body["submission"]["id"]}
+        return {"status": "rejected", "reason": body.get("code", ""), "submission_id": submission_id}
 
     def test_an_accepted_hand_in_lands_in_a_folder(self):
         playground_id, version_id, result = self.hand_in("张三（1 班）")
@@ -1245,21 +1274,16 @@ class SubmittedWorkOnDiskTest(ServerTestCase):
         )
 
     def test_a_replay_repaints_the_same_folder(self):
-        # 响应丢了、客户端原样重试：不能多出一个编号文件夹。
+        # 响应丢了、客户端原样重试：同一个 delivery 名字，落回同一行、同一个文件夹，
+        # 不会多出一个编号目录。
         playground_id, version_id = self.seed("hello-replay")
-        event = {
-            "event_id": "disk-replay-1",
-            "kind": "submit_code",
-            "payload": {
-                "playground_id": playground_id,
-                "version_id": version_id,
-                "files": {"work/main.py": "# 姓名：王五\nprint(1)\n"},
-            },
-        }
-        for _ in range(2):
-            status, _, body = self.request("POST", "/api/v1/sync", payload={"pending_events": [event], "after_seq": 0})
-            self.assertEqual(status, 200)
-            self.assertEqual(body["event_results"][0]["status"], "accepted")
+        files = {"work/main.py": "# 姓名：王五\nprint(1)\n"}
+
+        first = self.hand_in_event(playground_id, version_id, files, submission_id="disk-replay-1")
+        second = self.hand_in_event(playground_id, version_id, files, submission_id="disk-replay-1")
+        self.assertEqual(
+            [first["status"], second["status"]], ["accepted", "existing_same"]
+        )
 
         base = self.root() / "王五"
         self.assertEqual([p.name for p in base.iterdir()], [playground_id])

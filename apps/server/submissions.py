@@ -23,6 +23,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -41,6 +42,10 @@ MAX_STUDENT_LENGTH = 128
 # short enough that a path built from client-supplied text stays inside what a
 # filesystem accepts.
 MAX_SEGMENT_LENGTH = 64
+
+# One delivery attempt may be named this long. The client generates the id, so
+# this is a bound on what a caller can make the Server store, not a format.
+MAX_SUBMISSION_ID_LENGTH = 64
 
 # Git object IDs are lowercase hexadecimal.  Requiring the exact full-width
 # form before any lookup stops a symbolic name such as ``HEAD`` from being
@@ -69,14 +74,41 @@ class StoredSubmissionError(SubmissionError):
 
 
 @dataclass(frozen=True)
-class SubmissionRequest:
-    """One validated, bounded submission body."""
+class SubmissionDelivery:
+    """One validated hand-in, as a client sends it.
 
+    The client names the delivery (``submission_id``): that name is what makes a
+    lost response retryable without producing a second Submission, so it travels
+    with the request instead of being minted here. ``student`` is not sent at
+    all — it is read out of the handed-in file's own header.
+
+    Mutually consistent by construction: the field shapes, the file set and the
+    derived student were all checked before this value existed.
+    """
+
+    submission_id: str
     playground_id: str
     playground_commit_id: str
     student: str
     """Canonical ``work/**`` path to text, sorted; the files handed in."""
     files: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class SubmissionWrite:
+    """What one delivery attempt did to the store.
+
+    ``accepted``       — a new Submission was written.
+    ``existing_same``  — this ``submission_id`` was already stored with exactly
+                         this content; the original result is the answer.
+    ``conflict``       — this ``submission_id`` is stored with *different*
+                         content, which means two different hand-ins share one
+                         name. Nothing is written, and the caller must not retry.
+    """
+
+    status: str
+    submission_id: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -100,13 +132,25 @@ class StoredSubmission:
 
 def _require_playground_id(value):
     if not repository_module.valid_playground_id(value):
-        raise InvalidSubmissionRequestError("playgroundId is not valid")
+        raise InvalidSubmissionRequestError("playground_id is not valid")
     return value
 
 
-def _require_commit_id(value):
+def _require_version_id(value):
     if type(value) is not str or _COMMIT_ID_PATTERN.match(value) is None:
-        raise InvalidSubmissionRequestError("commitId is not a commit id")
+        raise InvalidSubmissionRequestError("version_id is not a version id")
+    return value
+
+
+def _require_submission_id(value):
+    if type(value) is not str:
+        raise InvalidSubmissionRequestError("submission_id must be a string")
+    if not value or len(value) > MAX_SUBMISSION_ID_LENGTH:
+        raise InvalidSubmissionRequestError(
+            f"submission_id must be 1..{MAX_SUBMISSION_ID_LENGTH} characters"
+        )
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise InvalidSubmissionRequestError("submission_id must not carry control characters")
     return value
 
 
@@ -183,22 +227,29 @@ def _require_files(value):
     return MappingProxyType(dict(sorted(normalized.items())))
 
 
-def decode_submission_request(payload):
-    """Validate a submission body and return a normalized request.
+def decode_delivery(payload):
+    """Validate a hand-in and return the value the store will write.
 
-    The playground id, the commit id and the student name are checked for the
-    exact shape the API promises; the file set is checked by
-    :func:`_require_files`.  Nothing is returned unless the whole body passes.
+    Every field is checked here before anything else looks at the request: the
+    ids for their shape, the file set for its paths and bounds, and the student
+    for being present and valid *in the files themselves* — a hand-in without a
+    usable name is refused rather than filed under a guess.
     """
 
     if type(payload) is not dict:
         raise InvalidSubmissionRequestError("body must be an object")
 
-    return SubmissionRequest(
-        playground_id=_require_playground_id(payload.get("playgroundId")),
-        playground_commit_id=_require_commit_id(payload.get("commitId")),
-        student=_require_student(payload.get("student")),
-        files=_require_files(payload.get("files")),
+    files = _require_files(payload.get("files"))
+    student = student_from_files(files)
+    if student is None:
+        raise InvalidSubmissionRequestError("files carry no usable student header")
+
+    return SubmissionDelivery(
+        submission_id=_require_submission_id(payload.get("submission_id")),
+        playground_id=_require_playground_id(payload.get("playground_id")),
+        playground_commit_id=_require_version_id(payload.get("version_id")),
+        student=_require_student(student),
+        files=files,
     )
 
 
@@ -225,7 +276,9 @@ def student_from_files(files):
     is present but the name it produces is not a valid student string.
     """
 
-    if type(files) is not dict:
+    # Any mapping: the validator hands back a read-only view of the same set,
+    # and reading one path out of it is all this does.
+    if not isinstance(files, Mapping):
         return None
     text = files.get(ATTRIBUTION_PATH)
     if type(text) is not str:
@@ -441,6 +494,61 @@ def backfill_submission_files(connection, root):
         )
         written += 1
     return written
+
+
+def create_if_absent(connection, delivery):
+    """Store one Submission, or report what its ``submission_id`` already holds.
+
+    The identity of a hand-in is the id the client sent, so "already here" is
+    answered by that column alone: an id that exists with exactly this content is
+    the same hand-in arriving twice (a retry after a lost response), and one that
+    exists with different content is two hand-ins fighting over one name.
+
+    The caller runs this inside one immediate transaction: the read and the write
+    below must not interleave with another delivery of the same id, or both
+    would find nothing and one would lose to the UNIQUE constraint.
+    """
+
+    files_json = json.dumps(dict(delivery.files), separators=(",", ":"), sort_keys=True)
+    row = connection.execute(
+        "SELECT id, playground_id, playground_commit_id, student, files_json,"
+        " created_at FROM submissions WHERE id = ?",
+        (delivery.submission_id,),
+    ).fetchone()
+
+    if row is not None:
+        same = (
+            row["playground_id"] == delivery.playground_id
+            and row["playground_commit_id"] == delivery.playground_commit_id
+            and row["student"] == delivery.student
+            and row["files_json"] == files_json
+        )
+        return SubmissionWrite(
+            status="existing_same" if same else "conflict",
+            submission_id=delivery.submission_id,
+            created_at=row["created_at"],
+        )
+
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    connection.execute(
+        """
+        INSERT INTO submissions (
+            id, playground_id, playground_commit_id, student,
+            files_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            delivery.submission_id,
+            delivery.playground_id,
+            delivery.playground_commit_id,
+            delivery.student,
+            files_json,
+            created_at,
+        ),
+    )
+    return SubmissionWrite(
+        status="accepted", submission_id=delivery.submission_id, created_at=created_at
+    )
 
 
 def _submission_from_row(row):

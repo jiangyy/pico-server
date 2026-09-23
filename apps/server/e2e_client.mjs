@@ -12,8 +12,9 @@
  *   node e2e_client.mjs <port> <clientDir> <dataDir> submit <playgroundId> <versionId> <name>
  *
  * The data directory is reused between invocations, so the local store (the
- * installed blobs, the content cursor and the pending queue) survives from one
- * step to the next exactly as it does between two launches of the app.
+ * installed blobs and the queue of hand-ins the server has not answered)
+ * survives from one step to the next exactly as it does between two launches of
+ * the app.
  *
  * Every step prints one `RESULT <json>` line; a failure prints `FAILED <code>
  * <message>` and exits non-zero.
@@ -29,12 +30,24 @@ const store = await import(join(clientDir, "store.ts"));
 const syncModule = await import(join(clientDir, "sync.ts"));
 const submitModule = await import(join(clientDir, "submit.ts"));
 
-// The client only ever builds an https origin; the test server speaks plain
-// HTTP on loopback, so the one injected primitive rewrites the scheme here
-// rather than the client being taught to accept http.
+// How many requests each step makes, and of which kind. The Python half uses
+// this to assert what a round *did* — "it installed the new course and did not
+// re-fetch the old one" is a statement about requests, not about the answer.
+const http = { requests: 0, catalog: 0, manifests: 0, files: 0, submissions: 0 };
+
+// The test server is the local development server: plain http on loopback,
+// which is exactly the origin rule the client applies (`origin.ts`).
 const deps = {
-  baseUrl: "https://127.0.0.1",
-  fetch: (url, init) => fetch(url.replace("https://127.0.0.1", `http://127.0.0.1:${port}`), init),
+  baseUrl: `http://127.0.0.1:${port}`,
+  fetch: (url, init) => {
+    http.requests += 1;
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/v1/catalog") http.catalog += 1;
+    else if (pathname.endsWith("/manifest")) http.manifests += 1;
+    else if (pathname.includes("/files/")) http.files += 1;
+    else if (pathname === "/api/v1/submissions") http.submissions += 1;
+    return globalThis.fetch(url, init);
+  },
 };
 
 try {
@@ -58,37 +71,48 @@ async function run(step, args) {
   }
 }
 
-/** Install the whole catalog and adopt the cursor, as a first launch does. */
-async function bootstrap() {
-  const result = await syncModule.bootstrap(deps, dataDir);
-  const installed = await store.readLocalCatalog(dataDir);
-  const snapshot = await syncModule.snapshot(dataDir);
+/** The delivery outcomes of one round, in a shape the Python half can assert on. */
+function deliveries(result) {
   return {
-    upto_seq: result.upto_seq,
+    stored: result.deliveries
+      .filter((delivery) => delivery.kind === "stored")
+      .map((delivery) => delivery.submission_id),
+    refused: result.deliveries
+      .filter((delivery) => delivery.kind === "refused")
+      .map((delivery) => ({ submission_id: delivery.submission_id, reason: delivery.reason })),
+    undelivered: result.deliveries
+      .filter((delivery) => delivery.kind === "undelivered")
+      .map((delivery) => delivery.submission_id),
+  };
+}
+
+/** Install the whole catalog and make it the local set, as a first launch does. */
+async function bootstrap() {
+  await syncModule.bootstrap(deps, dataDir);
+  const installed = await store.readLocalCatalog(dataDir);
+  return {
     installed: installed.items.map((item) => ({
       playgroundId: item.playgroundId,
       versionId: item.versionId,
     })),
     active: installed.items.map((item) => item.playgroundId),
     problems: installed.problems.map((problem) => problem.code),
-    cursor: snapshot.lastContentSeq,
+    http: { ...http },
   };
 }
 
-/** One regular sync round after bootstrap. */
+/** One regular round after bootstrap: read the catalog, then hand in what waits. */
 async function syncOnce() {
   const result = await syncModule.sync(deps, dataDir);
   const installed = await store.readLocalCatalog(dataDir);
   const snapshot = await syncModule.snapshot(dataDir);
   return {
-    accepted: result.accepted,
-    rejected: result.rejected,
+    ...deliveries(result),
     installed: result.installed.map((entry) => entry.playground_id),
     retired: result.retired,
-    upto_seq: result.upto_seq,
-    cursor: snapshot.lastContentSeq,
     pending: snapshot.pendingCount,
     active: installed.items.map((item) => item.playgroundId),
+    http: { ...http },
   };
 }
 
@@ -103,10 +127,14 @@ async function submit([playgroundId, versionId, name]) {
   });
   const result = await syncModule.sync(deps, dataDir);
   const snapshot = await syncModule.snapshot(dataDir);
+  const outcome = result.deliveries.find(
+    (delivery) => delivery.submission_id === queued.submission_id,
+  );
   return {
-    event_id: queued.event_id,
-    accepted: result.accepted,
-    rejected: result.rejected,
+    submission_id: queued.submission_id,
+    outcome: outcome?.kind ?? "none",
+    reason: outcome?.reason ?? "",
     pending: snapshot.pendingCount,
+    http: { ...http },
   };
 }

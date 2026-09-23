@@ -310,7 +310,7 @@ def read_commit_file(repository, playground_id, commit_id, path):
 def manifest_to_mapping(manifest):
     """Return the canonical mapping for a manifest.
 
-    The shape is exactly protocol.md's ``Manifest``: the Playground, the
+    The shape is exactly the manifest: the Playground, the
     version and one entry per file with ``path``, ``size`` and ``sha256``. The
     Git blob id each entry was read from stays a storage detail and is not
     exposed.

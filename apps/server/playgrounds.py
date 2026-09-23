@@ -12,8 +12,6 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import database
-import events
-import events_types
 import repository as _repository
 
 #: The storage layer's publish result; re-exported shape, unchanged by the
@@ -40,7 +38,7 @@ class PlaygroundStoppedError(Exception):
 class PlaygroundBaseChangedError(Exception):
     """The publisher's ``base_version_id`` is not the current Version.
 
-    protocol.md's ``conflict``: the publisher built its bundle on a Version
+    ``conflict``: the publisher built its bundle on a Version
     that has since been replaced, so publishing it would silently drop the
     other change. It is a refusal the publisher resolves by reading the current
     Version and deciding again, not by retrying the same request.
@@ -129,7 +127,7 @@ def require_publishable(connection, playground_id, base_version_id):
     base is refused without creating a commit. That is worth doing up front — a
     refusal must not leave a prepared Version to clean up.
 
-    A Playground that does not exist yet is *not* a refusal: protocol.md §2 step 0
+    A Playground that does not exist yet is *not* a refusal: picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）
     makes the first publish of an id create it, so this returns ``None`` and the
     commit phase creates the row. What such a request must not carry is a base —
     `_require_base` reads a base with no observed version as a claim about a
@@ -159,9 +157,9 @@ def commit_prepared_version(
     """Accept a prepared Version, or refuse it because the base moved.
 
     The second phase, and the only one that writes: the compare-and-swap on
-    ``current_version_id``, the Event and the Content Log entry all land in the
-    caller's transaction or none of them do. Until this commits, the Version is
-    only a pending ref and the database has never heard of it.
+    ``current_version_id`` lands in the caller's transaction or not at all.
+    Until this commits, the Version is only a pending ref and the database has
+    never heard of it.
 
     Refusing here is not an error the caller can retry into success: the
     database says the base it was given is not current, and the publisher has to
@@ -181,12 +179,7 @@ def commit_prepared_version(
             playground_id=playground_id, commit_id=prepared.commit_id, no_op=True
         )
 
-    record_publish_event(
-        connection,
-        playground_id,
-        prepared.commit_id,
-        event_id=prepared.event_id,
-    )
+    set_current_version(connection, playground_id, prepared.commit_id)
     return PublishResult(
         playground_id=playground_id, commit_id=prepared.commit_id, no_op=False
     )
@@ -195,7 +188,7 @@ def commit_prepared_version(
 def observed_version(row):
     """The Version the database says is current for this Playground, if any.
 
-    What protocol.md §2 calls ``observed_version_id``: the Version a publish has
+    What picopg-implementation.md §3 calls ``observed_version_id``: the Version a publish has
     to be built on, as opposed to whatever the history ref happens to point at.
     ``None`` means there is nothing to build on — the first publish of an id.
     """
@@ -208,7 +201,7 @@ def observed_version(row):
 def _create_from_prepared(connection, playground_id, prepared, base_version_id):
     """Create the Playground row for the first Version ever published to it.
 
-    protocol.md §2 step 0: an unknown id is not an error, it is a Playground that
+    picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）: an unknown id is not an error, it is a Playground that
     does not exist until this moment. The row and the Version are accepted in one
     transaction, so there is no window in which a Playground exists without the
     Version that brought it into being.
@@ -229,12 +222,7 @@ def _create_from_prepared(connection, playground_id, prepared, base_version_id):
         (playground_id, _now(), prepared.commit_id),
     )
     if not prepared.no_op:
-        record_publish_event(
-            connection,
-            playground_id,
-            prepared.commit_id,
-            event_id=prepared.event_id,
-        )
+        set_current_version(connection, playground_id, prepared.commit_id)
     return PublishResult(
         playground_id=playground_id,
         commit_id=prepared.commit_id,
@@ -251,17 +239,17 @@ def publish_playground(
     work sits outside the database transaction (a Git subprocess inside
     ``BEGIN IMMEDIATE`` holds the write lock for its whole duration). This
     exists for tests and for anything that wants the whole operation, and it
-    keeps the phases in the order protocol.md §2 requires.
+    keeps the phases in the order the design requires.
     """
 
     row = require_publishable(connection, playground_id, base_version_id)
-    event_id = uuid4().hex
+    publish_id = uuid4().hex
     prepared = _repository.publish_playground_prepare(
         repository,
         playground_id,
         bundle,
         metadata,
-        event_id,
+        publish_id,
         observed_version_id=observed_version(row),
     )
 
@@ -272,51 +260,53 @@ def publish_playground(
             )
     except BaseException:
         if not prepared.no_op:
-            _repository.delete_pending_ref(repository, event_id)
+            _repository.delete_pending_ref(repository, publish_id)
         raise
 
     if not prepared.no_op:
         _repository.converge_history_ref(repository, playground_id, result.commit_id)
-        _repository.delete_pending_ref(repository, event_id)
+        _repository.delete_pending_ref(repository, publish_id)
     return result
 
 
 def recover_pending_refs(connection, repository):
     """Bring every pending ref to a settled state, at start-up.
 
-    protocol.md §2's crash recovery. A pending ref means a publish was
-    interrupted somewhere between "the commit exists" and "the database knows":
-    either the transaction never committed, in which case the Version was never
-    accepted and the ref is dropped, or it did commit, in which case the history
-    ref is made to point at what the database says is current and the pending ref
-    is dropped.
+    A pending ref means a publish was interrupted somewhere between "the commit
+    exists" and "the database knows": either the transaction never committed, in
+    which case the Version was never accepted and the ref is dropped, or it did
+    commit, in which case the history ref is made to point at what the database
+    says is current and the pending ref is dropped.
 
     The database is the only thing consulted for what is accepted — this never
     replays a publish. Idempotent by construction: it only ever removes refs and
     converges one ref to a commit, all of which are no-ops the second time.
 
+    A pending ref is matched to a Playground by the Version it protects: the
+    database is asked which Playground, if any, has that Version as current.
+    That question needs no record of the publish itself — a Version the
+    database never accepted is current nowhere, so its ref is simply dropped.
+
     Returns ``(dropped, converged)``: how many pending refs were discarded and
-    how many were settled against an accepted Event.
+    how many were settled against an accepted Version.
     """
 
     dropped = 0
     converged = 0
-    for event_id, _commit_id in _repository.list_pending_refs(repository):
-        payload = events.find_accepted_event(
-            connection, event_id, events_types.EVENT_KIND_PUBLISH_PLAYGROUND
-        )
-        playground_id = (payload or {}).get("playground_id")
-        if type(playground_id) is str and playground_id:
-            row = _playground_row(connection, playground_id)
+    for publish_id, commit_id in _repository.list_pending_refs(repository):
+        row = connection.execute(
+            "SELECT id, current_version_id FROM playgrounds WHERE current_version_id = ?",
+            (commit_id,),
+        ).fetchone()
+        if row is not None:
             # Converge to what the *database* says is current, never to the
             # commit the pending ref points at: a later publish may already
             # have moved on, and the ref must not be pulled backwards.
-            if row is not None and row["current_version_id"]:
-                _repository.converge_history_ref(
-                    repository, row["id"], row["current_version_id"]
-                )
-                converged += 1
-        _repository.delete_pending_ref(repository, event_id)
+            _repository.converge_history_ref(
+                repository, row["id"], row["current_version_id"]
+            )
+            converged += 1
+        _repository.delete_pending_ref(repository, publish_id)
         dropped += 1
     return dropped, converged
 
@@ -352,17 +342,15 @@ def restore_playground(connection, playground_id):
 
     The counterpart to Archive. ``state`` is a distribution flag, and something
     has to be able to clear it: publishing is refused while a Playground is
-    stopped (protocol.md §2), so without this the flag only moves one way and a
+    stopped (picopg-implementation.md §3), so without this the flag only moves one way and a
     retired course can never come back — which is what `retire.mjs` used to
     promise and could not deliver.
 
     Returns whether it changed anything: ``False`` for a Playground that is
     already active or was cancelled by a concurrent archive.
 
-    Emits a ``publish_playground`` event for the Version it returns to. That is
-    what tells a client the course is available again — the content log has no
-    separate "restored" kind, and a client already knows what to do with a
-    publish: install that Version and put it back in the active set.
+    Nothing else to do: the Playground keeps the Version it already had, and a
+    client finds it again by reading the catalog.
     """
 
     playground_id = _require_opaque_id(playground_id)
@@ -378,10 +366,6 @@ def restore_playground(connection, playground_id):
             "UPDATE playgrounds SET state = 'active' WHERE id = ?",
             (playground_id,),
         )
-        # A Playground that was never published has no Version to announce; it
-        # becomes active and stays out of the catalog until something is.
-        if row["current_version_id"]:
-            record_publish_event(connection, playground_id, row["current_version_id"])
         return True
 
 
@@ -434,60 +418,17 @@ def backfill_current_versions(connection, resolve_version):
     return filled
 
 
-def record_publish_event(connection, playground_id, version_id, event_id=None):
-    """Record a server-generated ``publish_playground`` event.
+def set_current_version(connection, playground_id, version_id):
+    """Point the Playground at an accepted Version.
 
-    Writes the event row, appends to the content log and updates the
-    playground's ``current_version_id``. Runs in the caller's transaction
-    and never commits, so the event lands only if the publish that produced
-    it does too.
-
-    ``event_id`` is supplied by a publish, because the pending ref that protects
-    the prepared Version is named after it and recovery is what matches the two
-    up. Without one a fresh id is generated (archive and restore have no pending
-    ref to name).
+    The whole of what accepting a publish does to the database. Runs in the
+    caller's transaction and never commits, so the Version becomes current only
+    if the compare-and-swap that allowed it does too.
     """
-    envelope = events_types.EventEnvelope(
-        event_id=event_id or uuid4().hex,
-        kind=events_types.EVENT_KIND_PUBLISH_PLAYGROUND,
-        payload={"playground_id": playground_id, "version_id": version_id},
-    )
-    events.accept_event(
-        connection,
-        envelope,
-        response_status="accepted",
-        response_payload={"version_id": version_id},
-    )
-    events.append_content_log(connection, envelope)
+
     connection.execute(
         "UPDATE playgrounds SET current_version_id = ? WHERE id = ?",
         (version_id, playground_id),
     )
-    return envelope.event_id
 
 
-def record_archive_event(connection, playground_id):
-    """Record a server-generated ``archive_playground`` event.
-
-    Writes the event row, appends to the content log and flips the playground
-    to ``state = stopped``. The Git ref is left intact: archive means "stop
-    using it", not "delete the bytes". Runs in the caller's transaction and
-    never commits.
-    """
-    envelope = events_types.EventEnvelope(
-        event_id=uuid4().hex,
-        kind=events_types.EVENT_KIND_ARCHIVE_PLAYGROUND,
-        payload={"playground_id": playground_id},
-    )
-    events.accept_event(
-        connection,
-        envelope,
-        response_status="accepted",
-        response_payload={"playground_id": playground_id},
-    )
-    events.append_content_log(connection, envelope)
-    connection.execute(
-        "UPDATE playgrounds SET state = 'stopped' WHERE id = ?",
-        (playground_id,),
-    )
-    return envelope.event_id

@@ -22,9 +22,8 @@ from unittest import mock  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
 import submissions  # noqa: E402
-import sync  # noqa: E402
-import sync_handlers  # noqa: E402
-from database import open_database  # noqa: E402
+import uuid  # noqa: E402
+from database import immediate_transaction, open_database  # noqa: E402
 
 MANIFEST_BYTES = b'{"schemaVersion":1,"runtime":"python"}'
 
@@ -59,43 +58,54 @@ class SubmissionTestBase(unittest.TestCase):
         ).commit_id
 
     def payload(self, **overrides):
+        """One hand-in body, in the shape a client sends it."""
+
         payload = {
-            "playgroundId": self.playground_id,
-            "commitId": self.commit_id,
-            "student": "2026-001",
-            "files": {"work/main.py": "print(1)\n"},
+            "submission_id": submission_id(),
+            "playground_id": self.playground_id,
+            "version_id": self.commit_id,
+            "files": {"work/main.py": "# 姓名：2026-001\nprint(1)\n"},
         }
         payload.update(overrides)
         return payload
 
-    def store(self, student="2026-001", files=None, event_id=None):
-        """Record one hand-in through the sync handler, as the server does."""
-        import events_types
-        import uuid
+    def store(self, student="2026-001", files=None, submission_id=None):
+        """Store one hand-in the way the endpoint does, and return the record."""
 
         files = files if files is not None else {"work/main.py": f"# 姓名：{student}\nprint(1)\n"}
-        envelope = events_types.EventEnvelope(
-            event_id=event_id or uuid.uuid4().hex,
-            kind=events_types.EVENT_KIND_SUBMIT_CODE,
-            payload={
+        delivery = submissions.decode_delivery(
+            {
+                "submission_id": submission_id or globals()["submission_id"](),
                 "playground_id": self.playground_id,
                 "version_id": self.commit_id,
                 "files": files,
-            },
+            }
         )
-        with self.connection:
-            body = sync_handlers.submit_handler(
-                self.connection, envelope, repository=self.repository
-            )
-        return body["submission"]
+        with immediate_transaction(self.connection):
+            write = submissions.create_if_absent(self.connection, delivery)
+        self.assertNotEqual(write.status, "conflict")
+        return {
+            "id": delivery.submission_id,
+            "playground_id": delivery.playground_id,
+            "version_id": delivery.playground_commit_id,
+            "student": delivery.student,
+            "created_at": write.created_at,
+            "status": write.status,
+        }
+
+
+def submission_id():
+    """A fresh delivery name. Each hand-in the tests store is its own delivery."""
+
+    return uuid.uuid4().hex
 
 
 class StudentFromFilesTest(unittest.TestCase):
     """The attributed header a hand-in carries in ``work/main.py``.
 
-    This is the only place a student name exists on the sync path: the
-    protocol's ``submit_code`` payload has no ``student`` field, so the
-    server reads the attribution out of the bytes the student wrote.
+    This is the only place a student name exists: the request has no ``student``
+    field, so the server reads the attribution out of the bytes the student
+    wrote and files the work under that.
     """
 
     def student(self, line):
@@ -130,65 +140,80 @@ class DecodeSubmissionTest(SubmissionTestBase):
     """What a request body must look like before anything is stored."""
 
     def test_a_valid_body_decodes_into_a_normalized_request(self):
-        request = submissions.decode_submission_request(self.payload())
+        body = self.payload()
+        request = submissions.decode_delivery(body)
+        self.assertIsInstance(request, submissions.SubmissionDelivery)
 
-        self.assertIsInstance(request, submissions.SubmissionRequest)
+        self.assertIsInstance(request, submissions.SubmissionDelivery)
         self.assertEqual(request.playground_id, self.playground_id)
         self.assertEqual(request.playground_commit_id, self.commit_id)
+        self.assertEqual(request.submission_id, body["submission_id"])
         self.assertEqual(request.student, "2026-001")
-        self.assertEqual(dict(request.files), {"work/main.py": "print(1)\n"})
-
-    def test_the_student_name_is_trimmed_and_bounded(self):
         self.assertEqual(
-            submissions.decode_submission_request(
-                self.payload(student="  2026-001  ")
-            ).student,
-            "2026-001",
+            dict(request.files), {"work/main.py": "# 姓名：2026-001\nprint(1)\n"}
         )
 
-        for student in ("", "   ", "a" * 129, "line\nbreak", None, 7):
-            with self.subTest(student=student):
-                with self.assertRaises(submissions.InvalidSubmissionRequestError):
-                    submissions.decode_submission_request(self.payload(student=student))
+    def test_the_student_is_read_out_of_the_files_not_the_body(self):
+        # 请求里根本没有 student 字段：名字只存在于交上来的那份文件里。
+        body = self.payload()
+        self.assertNotIn("student", body)
+        self.assertEqual(submissions.decode_delivery(body).student, "2026-001")
 
-    def test_the_commit_must_be_a_full_object_id(self):
-        for commit_id in ("HEAD", "abc", "0" * 39, "A" * 40, None):
-            with self.subTest(commit_id=commit_id):
+        with self.assertRaises(submissions.InvalidSubmissionRequestError):
+            submissions.decode_delivery(
+                self.payload(files={"work/main.py": "print(1)\n"})
+            )
+
+    def test_the_version_must_be_a_full_object_id(self):
+        for version_id in ("HEAD", "abc", "0" * 39, "A" * 40, None):
+            with self.subTest(version_id=version_id):
                 with self.assertRaises(submissions.InvalidSubmissionRequestError):
-                    submissions.decode_submission_request(
-                        self.payload(commitId=commit_id)
+                    submissions.decode_delivery(
+                        self.payload(version_id=version_id)
+                    )
+
+    def test_the_delivery_name_is_bounded(self):
+        for name in ("", None, 7, "a" * 65, "line\nbreak"):
+            with self.subTest(name=name):
+                with self.assertRaises(submissions.InvalidSubmissionRequestError):
+                    submissions.decode_delivery(
+                        self.payload(submission_id=name)
                     )
 
     def test_only_work_paths_may_be_handed_in(self):
         for path in ("course/index.html", "picopg.json", "work/../../x.py", "Work/a.py"):
             with self.subTest(path=path):
                 with self.assertRaises(submissions.InvalidSubmissionRequestError):
-                    submissions.decode_submission_request(
+                    submissions.decode_delivery(
                         self.payload(files={path: "x"})
                     )
 
     def test_a_case_colliding_file_set_is_rejected(self):
         with self.assertRaises(submissions.InvalidSubmissionRequestError):
-            submissions.decode_submission_request(
+            submissions.decode_delivery(
                 self.payload(files={"work/A.py": "1", "work/a.py": "2"})
             )
 
     def test_files_must_be_text_and_bounded(self):
         with self.assertRaises(submissions.InvalidSubmissionRequestError):
-            submissions.decode_submission_request(self.payload(files={"work/a.py": 7}))
+            submissions.decode_delivery(self.payload(files={"work/a.py": 7}))
 
         with self.assertRaises(submissions.InvalidSubmissionRequestError):
-            submissions.decode_submission_request(self.payload(files={"work/a.py": "x" * (1024 * 1024 + 1)}))
+            submissions.decode_delivery(self.payload(files={"work/a.py": "x" * (1024 * 1024 + 1)}))
 
     def test_shape_errors_are_rejected(self):
-        for payload in (None, [], "text", {}, {"playgroundId": "pg-one"}):
+        for payload in (None, [], "text", {}, {"playground_id": "pg-one"}):
             with self.subTest(payload=payload):
                 with self.assertRaises(submissions.InvalidSubmissionRequestError):
-                    submissions.decode_submission_request(payload)
+                    submissions.decode_delivery(payload)
 
-    def test_a_file_set_without_files_is_allowed(self):
-        request = submissions.decode_submission_request(self.payload(files={}))
-        self.assertEqual(dict(request.files), {})
+    def test_a_file_set_with_no_attribution_is_refused(self):
+        # 名字只存在于交上来的文件里：没有文件（或文件里没有表头）就没有这份作业
+        # 该记在谁名下，那不是"无名"，是"不能收"。
+        for files in ({}, {"work/other.py": "# 姓名：2026-001"}):
+            with self.subTest(files=files):
+                with self.assertRaises(submissions.InvalidSubmissionRequestError):
+                    submissions.decode_delivery(self.payload(files=files))
 
 
 class FileSetValidationTest(unittest.TestCase):
@@ -200,11 +225,11 @@ class FileSetValidationTest(unittest.TestCase):
 
     def reason(self, files):
         with self.assertRaises(submissions.InvalidSubmissionRequestError) as caught:
-            submissions.decode_submission_request(
+            submissions.decode_delivery(
                 {
-                    "playgroundId": "pg-one",
-                    "commitId": "0" * 40,
-                    "student": "2026-001",
+                    "submission_id": submission_id(),
+                    "playground_id": "pg-one",
+                    "version_id": "0" * 40,
                     "files": files,
                 }
             )
@@ -245,12 +270,13 @@ class FileSetValidationTest(unittest.TestCase):
                 self.assertEqual(self.reason({path: "x"}), reason)
 
     def test_portable_near_misses_are_accepted(self):
-        request = submissions.decode_submission_request(
+        request = submissions.decode_delivery(
             {
-                "playgroundId": "pg-one",
-                "commitId": "0" * 40,
-                "student": "2026-001",
+                "submission_id": submission_id(),
+                "playground_id": "pg-one",
+                "version_id": "0" * 40,
                 "files": {
+                    "work/main.py": "# 姓名：2026-001\n",
                     "work/console.py": "1",
                     "work/com10.txt": "2",
                     "work/a b.txt": "3",
@@ -260,7 +286,13 @@ class FileSetValidationTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(request.files),
-            ["work/a b.txt", "work/café.py", "work/com10.txt", "work/console.py"],
+            [
+                "work/a b.txt",
+                "work/café.py",
+                "work/com10.txt",
+                "work/console.py",
+                "work/main.py",
+            ],
         )
 
     def test_a_case_colliding_set_is_refused(self):
@@ -295,15 +327,18 @@ class FileSetValidationTest(unittest.TestCase):
             )
 
     def test_the_file_set_is_returned_canonically(self):
-        request = submissions.decode_submission_request(
+        request = submissions.decode_delivery(
             {
-                "playgroundId": "pg-one",
-                "commitId": "0" * 40,
-                "student": "2026-001",
-                "files": {"work/b.py": "2", "work/a.py": "1"},
+                "submission_id": submission_id(),
+                "playground_id": "pg-one",
+                "version_id": "0" * 40,
+                "files": {"work/b.py": "2", "work/a.py": "1", "work/main.py": "# 姓名：2026-001\n"},
             }
         )
-        self.assertEqual(list(request.files.items()), [("work/a.py", "1"), ("work/b.py", "2")])
+        self.assertEqual(
+            list(request.files.items()),
+            [("work/a.py", "1"), ("work/b.py", "2"), ("work/main.py", "# 姓名：2026-001\n")],
+        )
 
 
 class ReadSubmissionTest(SubmissionTestBase):

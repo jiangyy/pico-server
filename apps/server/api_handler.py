@@ -17,7 +17,6 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlsplit
 
-import events_types
 import pagination
 from database import open_database
 from idempotency import MAX_REQUEST_KEY_LENGTH
@@ -26,16 +25,22 @@ from idempotency import MAX_REQUEST_KEY_LENGTH
 #: larger in `server.py`); anything bigger is refused before it is read.
 MAX_JSON_BODY_BYTES = 16 * 1024
 
-# protocol.md's `PublishRequest` is `{playground_id, base_version_id?, bundle}`:
+# the publish request is `{playground_id, base_version_id?, bundle}`:
 # the id is in the URL and the bundle is the body, so the base travels here. It
 # is a header for the same reason the protocol version is — nothing else about
 # the request could carry it without inventing a second bundle format.
 BASE_VERSION_HEADER = "X-Base-Version-Id"
 
-# protocol.md §4: every request states which protocol the client speaks. It
+# picopg-implementation.md §10: every request states which protocol the client speaks. It
 # cannot travel in a payload — a catalog request has no parameters and a file
 # read is a bare GET — so it is a header, checked once before routing.
 PROTOCOL_VERSION_HEADER = "X-Protocol-Version"
+
+#: The protocol this build speaks, and the oldest one it can still serve. Both
+#: are published in the catalog so a client can tell "the server is newer, that
+#: is fine" from "the server needs a newer me".
+PROTOCOL_VERSION = 1
+MINIMUM_CLIENT_PROTOCOL_VERSION = 1
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -75,7 +80,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not version.isascii() or not version.isdigit():
             self._api_error(400, "invalid_request", head_only=head_only)
             return False
-        if int(version) < events_types.MINIMUM_CLIENT_PROTOCOL_VERSION:
+        if int(version) < MINIMUM_CLIENT_PROTOCOL_VERSION:
             self._api_error(426, "client_too_old", head_only=head_only)
             return False
         return True

@@ -18,7 +18,6 @@ PLAYGROUND_VERSIONS_SUFFIX = "/versions"
 PLAYGROUND_RESTORE_SUFFIX = "/restore"
 CATALOG_PATH = "/api/v1/catalog"
 SUBMISSIONS_PATH = "/api/v1/submissions"
-SYNC_PATH = "/api/v1/sync"
 
 #: The literal segments a read route is built from.
 VERSIONS_SEGMENT = "versions"
@@ -171,9 +170,9 @@ def allowed_methods(path):
     if path in ("/healthz", CATALOG_PATH):
         return ALLOWED_METHODS
     if path == SUBMISSIONS_PATH:
-        return ALLOWED_METHODS
-    if path == SYNC_PATH:
-        return ("POST",)
+        # The one anonymous write in the service (hand in work) shares its path
+        # with the operator's read of what was handed in.
+        return ("GET", "HEAD", "POST")
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
     if match_playground(path) is not None:

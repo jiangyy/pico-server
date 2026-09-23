@@ -17,16 +17,18 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-import events
-import events_types
 import manifests
 import playgrounds as playgrounds_module
 import pagination
 import routes
-import sync
-import sync_handlers
 import uuid
-from api_handler import ApiHandler, BASE_VERSION_HEADER, MAX_JSON_BODY_BYTES
+from api_handler import (
+    MAX_JSON_BODY_BYTES,
+    MINIMUM_CLIENT_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+    ApiHandler,
+    BASE_VERSION_HEADER,
+)
 from bundles import (
     MAX_ARCHIVE_BYTES,
     BundleValidationError,
@@ -50,7 +52,6 @@ from playgrounds import (
     create_playground,
     get_playground,
     observed_version,
-    record_archive_event,
     recover_pending_refs,
     require_publishable,
     restore_playground,
@@ -59,6 +60,7 @@ from repository import (
     DEFAULT_REPOSITORY_PATH,
     CommitMetadata,
     RepositoryError,
+    commit_in_playground_history,
     converge_history_ref,
     delete_pending_ref,
     open_repository,
@@ -67,6 +69,8 @@ from repository import (
 )
 from submissions import (
     backfill_submission_files as submissions_backfill,
+    create_if_absent as create_submission,
+    decode_delivery as decode_submission_delivery,
     InvalidSubmissionRequestError,
     MissingSubmissionError,
     StoredSubmissionError,
@@ -88,12 +92,6 @@ COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 SUBMISSIONS_DIRECTORY_NAME = "submissions"
 
 
-# One sync round may carry at most this many pending events. The body is
-# already bounded, so this only keeps a single request's per-event work (and
-# its response) proportional to what a client can legitimately have queued
-# offline.
-MAX_PENDING_EVENTS = 100
-
 # The idempotency scope of the single operator that publishes bundles, so the
 # recorded result of a publish can never collide with anything else.
 OPERATOR_SCOPE = "operator"
@@ -104,36 +102,6 @@ OPERATOR_SCOPE = "operator"
 # no session, and no password.
 OPERATOR_ENVIRONMENT_VARIABLE = "PICOPG_OPERATOR_TOKEN"
 MIN_OPERATOR_TOKEN_BYTES = 16
-
-
-def _decode_sync_request(payload):
-    """Parse and validate a ``SyncRequest`` body.
-
-    Returns the request, or ``None`` when the body is malformed. Unknown
-    *fields* are ignored, as protocol.md requires; an unknown event *kind* is
-    not malformed, so it is left for the engine to reject per event.
-    """
-
-    if type(payload) is not dict:
-        return None
-    pending = payload.get("pending_events")
-    after_seq = payload.get("after_seq")
-    if type(pending) is not list:
-        return None
-    if type(after_seq) is not int or after_seq < 0:
-        return None
-    if len(pending) > MAX_PENDING_EVENTS:
-        return None
-
-    envelopes = []
-    for entry in pending:
-        try:
-            envelopes.append(events_types.EventEnvelope.from_mapping(entry))
-        except ValueError:
-            return None
-    return events_types.SyncRequest(
-        pending_events=tuple(envelopes), after_seq=after_seq
-    )
 
 
 def _bundle_request(playground_id, bundle, base_version_id):
@@ -249,103 +217,105 @@ class Handler(ApiHandler):
             self._post_playground_versions(routes.match_playground_versions(path))
         elif routes.match_playground_restore(path) is not None:
             self._post_restore(routes.match_playground_restore(path))
-        elif path == routes.SYNC_PATH:
-            self._post_sync()
+        elif path == routes.SUBMISSIONS_PATH:
+            self._post_submission()
         elif routes.allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
 
-    def _post_sync(self):
-        """Process one ``SyncRequest`` and return a ``SyncResponse``.
+    def _post_submission(self):
+        """Accept one hand-in: ``CreateSubmission``.
 
-        Pending events are matched against the events table by ``event_id``
-        (a replay returns the stored result) and handed to the per-kind
-        handler otherwise. The response carries those results, every content
-        log entry the client has not yet seen, the new cursor and the two
-        protocol-negotiation fields.
+        The client names the delivery, so a lost response is retried with the
+        same ``submission_id`` and lands on the same row instead of a second
+        one. The row is the record; the readable folder beside the database is a
+        copy written after the transaction, so it can never make a stored
+        hand-in fail.
+
+        Refusals are stable codes rather than sentences: the caller turns them
+        into words for whoever handed the work in.
         """
+
         payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
         if payload is None:
             return
 
-        request = _decode_sync_request(payload)
-        if request is None:
-            self._api_error(400, "invalid_request")
+        try:
+            delivery = decode_submission_delivery(payload)
+        except InvalidSubmissionRequestError:
+            self._api_error(400, "invalid_submission")
             return
 
         repository = self.server.repository
         try:
             with self._database() as connection:
-                response = sync.process_sync(
-                    connection,
-                    request,
-                    submit_handler=lambda connection, envelope: sync_handlers.submit_handler(
-                        connection, envelope, repository=repository
-                    ),
-                    publish_handler=sync_handlers.publish_handler,
-                    archive_handler=sync_handlers.archive_handler,
-                )
-        except ValueError:
-            self._api_error(400, "invalid_request")
+                playground = get_playground(connection, delivery.playground_id)
+                if playground is None:
+                    self._api_error(404, "invalid_version")
+                    return
+                if playground.state == "stopped":
+                    self._api_error(409, "playground_stopped")
+                    return
+                if not commit_in_playground_history(
+                    repository,
+                    delivery.playground_id,
+                    delivery.playground_commit_id,
+                ):
+                    self._api_error(404, "invalid_version")
+                    return
+
+                with immediate_transaction(connection):
+                    write = create_submission(connection, delivery)
+        except RepositoryError:
+            self._api_error(500, "internal_error")
             return
 
-        # Only once the round has committed: the folder is a projection of a
-        # stored record, never a second thing to keep consistent. A failure here
-        # answers 500, and the client's retry of the same event repaints it.
-        self._write_submitted_work(request, response)
-        self._respond_json(200, json.loads(response.to_json()))
+        if write.status == "conflict":
+            self._api_error(409, "submission_conflict")
+            return
 
-    def _write_submitted_work(self, request, response):
-        """Write a folder per accepted hand-in, for a human to open.
+        self._write_submitted_work(delivery, write.created_at)
+        self._respond_json(
+            200 if write.status == "existing_same" else 201,
+            {
+                "status": write.status,
+                "submission": {
+                    "id": delivery.submission_id,
+                    "playground_id": delivery.playground_id,
+                    "version_id": delivery.playground_commit_id,
+                    "student": delivery.student,
+                    "created_at": write.created_at,
+                },
+            },
+        )
 
-        The row is the record and the folder is a copy of it, so this never
-        runs inside the sync transaction: an aborted round must not leave a
-        folder behind, and a folder must not be able to fail a stored hand-in.
-        It runs on replays too, which is what makes a lost folder self-healing.
+    def _write_submitted_work(self, delivery, created_at):
+        """Write a folder per hand-in, for a human to open.
+
+        The row is the record and the folder is a copy of it, so this never runs
+        inside the transaction: an aborted delivery must not leave a folder
+        behind, and a folder must not be able to fail a stored hand-in. It runs
+        on a retry too, which is what makes a lost folder self-healing.
         """
-        accepted = {
-            result.event_id
-            for result in response.event_results
-            if result.status == "accepted"
-        }
-        pending = [
-            envelope
-            for envelope in request.pending_events
-            if envelope.kind == events_types.EVENT_KIND_SUBMIT_CODE
-            and envelope.event_id in accepted
-        ]
-        if not pending:
-            return
 
         with self._database() as connection:
-            for envelope in pending:
-                stored = events.read_event(connection, envelope.event_id)
-                if stored is None:
-                    continue
-                try:
-                    body = json.loads(stored[3])
-                    submission = body["submission"]
-                except (TypeError, ValueError, KeyError):
-                    # A stored response this build cannot read is not a reason to
-                    # fail a round that already committed; the folder is a copy.
-                    continue
-                ordinal = submission_ordinal(
-                    connection,
-                    submission["student"],
-                    submission["id"],
-                    submission["created_at"],
-                )
-                write_submission_files(
-                    self.server.submissions_path,
-                    submission["id"],
-                    submission["student"],
-                    submission["playground_id"],
-                    submission["version_id"],
-                    submission["created_at"],
-                    envelope.payload["files"],
-                    ordinal,
-                )
+            ordinal = submission_ordinal(
+                connection,
+                delivery.student,
+                delivery.submission_id,
+                created_at,
+            )
+            write_submission_files(
+                self.server.submissions_path,
+                delivery.submission_id,
+                delivery.student,
+                delivery.playground_id,
+                delivery.playground_commit_id,
+                created_at,
+                dict(delivery.files),
+                ordinal,
+            )
 
     def _route_delete(self):
         path = urlsplit(self.path).path
@@ -361,9 +331,9 @@ class Handler(ApiHandler):
     def _post_restore(self, playground_id):
         """Put an archived Playground back into the catalog.
 
-        The counterpart of the `DELETE` on the same path. Clients learn about it
-        the same way they learn about anything: the next sync carries a
-        `publish_playground` entry for the Version it returns to.
+        The counterpart of the `DELETE` on the same path. The Version it comes
+        back on is the one it already had; a client finds it again on its next
+        catalog read.
         """
         if not self._require_operator():
             return
@@ -388,13 +358,11 @@ class Handler(ApiHandler):
         Students stop seeing it on their next refresh; nothing else changes.
         The database row stays (submissions keep a valid parent) and the
         commits stay in the repository, so publishing the same id again
-        restores it. The playground is marked ``state = stopped`` and an
-        ``archive_playground`` event is emitted so clients learn about the
-        change through their next sync; the Git ref is left intact so
-        history remains reachable.
+        restores it. The playground is marked ``state = stopped``, and the Git
+        ref is left intact so history remains reachable — a client pinned to a
+        Version can still read it.
 
-        Re-archiving a stopped playground is a no-op: the existing event
-        is replayed by the events table, the database row keeps the same
+        Re-archiving a stopped playground is a no-op: the row keeps the same
         state and the response carries the same status.
         """
 
@@ -409,13 +377,10 @@ class Handler(ApiHandler):
                     return
                 already_stopped = stored.state == "stopped"
                 if not already_stopped:
-                    # One transaction: the archive event, its content log row
-                    # and the state flip all land together, or none of them do.
                     with immediate_transaction(connection):
                         # Drop the recorded publishes so an exact replay of an
                         # old idempotency key cannot report a 201 for a course
-                        # nobody can read. The events table keeps the archive
-                        # record, so a sync round still sees what happened.
+                        # nobody can read.
                         connection.execute(
                             "DELETE FROM idempotency_results "
                             "WHERE scope = ? AND endpoint = ?",
@@ -424,30 +389,32 @@ class Handler(ApiHandler):
                                 routes.playground_versions_endpoint(playground_id),
                             ),
                         )
-                        record_archive_event(connection, playground_id)
+                        connection.execute(
+                            "UPDATE playgrounds SET state = 'stopped' WHERE id = ?",
+                            (playground_id,),
+                        )
         except InvalidRequestError:
             self._api_error(400, "invalid_request")
             return
 
-        # protocol.md's ArchiveResult: the status alone says whether this call
+        # the archive result: the status alone says whether this call
         # changed anything.
         self._respond_json(
             200, {"status": "no_op" if already_stopped else "accepted"}
         )
 
     def _get_catalog(self, head_only=False):
-        """Return the current snapshot: the cursor plus every active version.
+        """Return the current snapshot: every active Playground and its Version.
 
-        protocol.md's ``Catalog`` is a whole snapshot, not a paged list: a new
-        client installs exactly this set and adopts ``upto_seq`` as its
-        cursor, then follows the content log through sync. The Playgrounds
-        are ordered by the order they were first published, so a client that
-        re-reads the catalog sees a stable list.
+        A whole snapshot, not a paged list and not a delta: a client compares it
+        with what it has installed, downloads what is missing or different, and
+        treats a Playground the catalog no longer names as one it may not use.
+        The Playgrounds are ordered by when they were first published, so a
+        client that re-reads the catalog sees a stable list.
         """
         try:
             with self._database() as connection:
                 playgrounds = self._active_playgrounds(connection)
-                upto_seq = events.current_upto_seq(connection)
         except RepositoryError:
             self._api_error(500, "internal_error", head_only=head_only)
             return
@@ -455,11 +422,8 @@ class Handler(ApiHandler):
         self._respond_json(
             200,
             {
-                "upto_seq": upto_seq,
-                "protocol_version": events_types.PROTOCOL_VERSION,
-                "minimum_client_protocol_version": (
-                    events_types.MINIMUM_CLIENT_PROTOCOL_VERSION
-                ),
+                "protocol_version": PROTOCOL_VERSION,
+                "minimum_client_protocol_version": MINIMUM_CLIENT_PROTOCOL_VERSION,
                 "playgrounds": playgrounds,
             },
             head_only=head_only,
@@ -591,9 +555,11 @@ class Handler(ApiHandler):
         # means "the first one", and the database decides whether that is true.
         # A header that is present but blank is the same as absent.
         base_version_id = self.headers.get(BASE_VERSION_HEADER, "").strip() or None
-        # The event id names the pending ref that protects the prepared Version,
-        # so it has to exist before the Git work does. Recovery matches the two.
-        event_id = uuid.uuid4().hex
+        # The publish id names the pending ref that protects the prepared
+        # Version, so it has to exist before the Git work does. It is an
+        # identifier for one attempt, not a domain event: recovery finds the
+        # Version's Playground by asking the database.
+        publish_id = uuid.uuid4().hex
 
         try:
             content_length = int(self.headers.get("Content-Length", ""))
@@ -643,15 +609,15 @@ class Handler(ApiHandler):
             self._respond_json(*stored)
             return
 
-        # Three phases (protocol.md §2), and the order is the point: the Git
+        # Three phases (picopg-implementation.md §3), and the order is the point: the Git
         # work must not sit inside the database transaction, and the database
         # must decide before the history ref moves.
         #
         #   1. refuse anything the database alone can refuse, without building
         #      a commit at all (an unknown Playground is not one of them: the
-        #      first publish of an id creates it, protocol.md §2 step 0)
+        #      first publish of an id creates it, picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）)
         #   2. prepare the Version in Git, protected by a pending ref
-        #   3. one short transaction: compare-and-swap, Event, Content Log
+        #   3. one short transaction: the compare-and-swap on the current Version
         #   4. converge the history ref onto what the database now says
         handle = self.server.repository
         prepared = None
@@ -664,7 +630,7 @@ class Handler(ApiHandler):
                 playground_id,
                 bundle,
                 _commit_metadata(),
-                event_id,
+                publish_id,
                 observed_version_id,
             )
         except InvalidRequestError:
@@ -708,12 +674,12 @@ class Handler(ApiHandler):
                 self._api_error(400, "invalid_request")
                 return
             except PlaygroundStoppedError:
-                # protocol.md's PublishResult: the Playground is not writable,
+                # the publish result: the Playground is not writable,
                 # and retrying the same request will not change that.
                 self._respond_json(409, {"status": "playground_stopped"})
                 return
             except PlaygroundBaseChangedError:
-                # protocol.md's `conflict`: the base is stale. Nothing was
+                # `conflict`: the base is stale. Nothing was
                 # written, and the publisher resolves it by reading the current
                 # Version.
                 self._respond_json(409, {"status": "conflict"})
@@ -727,27 +693,27 @@ class Handler(ApiHandler):
             # does not fail the request — the accept has happened and the next
             # start-up recovery converges the ref — but it is logged.
             if prepared is not None and not prepared.no_op:
-                self._finish_publish(playground_id, prepared.event_id)
+                self._finish_publish(playground_id, prepared.publish_id)
             settled = True
             self._respond_json(status, body)
         finally:
             if not settled and prepared is not None and not prepared.no_op:
-                self._abandon_prepared(prepared.event_id)
+                self._abandon_prepared(prepared.publish_id)
 
-    def _abandon_prepared(self, event_id):
+    def _abandon_prepared(self, publish_id):
         """Drop the pending ref of a Version the database did not accept.
 
         The commit itself is left to the Git GC: nothing references it once this
         returns, which is exactly the point of the pending ref existing.
         """
         try:
-            delete_pending_ref(self.server.repository, event_id)
+            delete_pending_ref(self.server.repository, publish_id)
         except RepositoryError as error:
             # Start-up recovery sweeps anything left behind, so this is loud but
             # not fatal.
             print(f"[picopg] pending ref not removed: {error}", flush=True)
 
-    def _finish_publish(self, playground_id, event_id):
+    def _finish_publish(self, playground_id, publish_id):
         """Converge the history ref and drop the pending ref, best effort."""
 
         handle = self.server.repository
@@ -759,14 +725,14 @@ class Handler(ApiHandler):
         except (RepositoryError, InvalidRequestError) as error:
             print(f"[picopg] history ref not converged: {error}", flush=True)
         try:
-            delete_pending_ref(handle, event_id)
+            delete_pending_ref(handle, publish_id)
         except RepositoryError as error:
             print(f"[picopg] pending ref not removed: {error}", flush=True)
 
     def _accept_prepared(self, connection, playground_id, prepared, base_version_id):
         """The database half of a publish, inside the idempotency transaction.
 
-        The result is protocol.md's ``PublishResult``: the protocol's own field
+        The result is the publish result: the protocol's own field
         names carry the outcome, so the publisher never has to read an HTTP
         status to know what happened.
         """

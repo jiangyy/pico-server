@@ -8,7 +8,7 @@ from pathlib import Path
 import permissions
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @contextmanager
@@ -86,21 +86,6 @@ _TABLE_COLUMNS = {
         "response_json": (0, 1),
         "created_at": (0, 1),
     },
-    "events": {
-        "event_id": (1, 1),
-        "kind": (0, 1),
-        "payload": (0, 1),
-        "status": (0, 1),
-        "reason": (0, 1),
-        "response_json": (0, 1),
-        "created_at": (0, 1),
-    },
-    "content_log": {
-        "seq": (1, 1),
-        "event_id": (0, 1),
-        "kind": (0, 1),
-        "payload": (0, 1),
-    },
     "submissions": {
         "id": (1, 1),
         "playground_id": (0, 1),
@@ -123,8 +108,6 @@ _REQUIRED_INDEXES = {
         "idempotency_results",
         ("created_at",),
     ),
-    "events_kind_created_at_idx": ("events", ("kind", "created_at")),
-    "content_log_kind_idx": ("content_log", ("kind",)),
     "submissions_playground_idx": (
         "submissions",
         ("playground_id", "created_at"),
@@ -162,10 +145,11 @@ def open_database(path):
 def _initialize_schema(connection):
     """Create the current schema in one step.
 
-    The model is small enough that one version describes it exactly, so there is
-    no migration chain to walk.  A database from any other model carries a
-    different version number and is rejected here instead of being silently
-    half-migrated.
+    The chain is walked once, in order, from whatever version the file is at.
+    v3 dropped the retired event tables, so an existing file passes through them
+    and ends up with the current contract; ``validate_schema`` then proves the
+    result matches it exactly, so a half-migrated file is refused rather than
+    served.
     """
 
     with connection:
@@ -295,6 +279,15 @@ def _initialize_schema(connection):
                 "ON content_log(kind)"
             )
             _record_migration(connection, 2)
+
+        if version < 3:
+            # v3 retires the generic event channel: a publish and an archive are
+            # recorded by the Playground row they change, and a hand-in is a row
+            # of its own. Nothing reads these two tables, and keeping them would
+            # be keeping a second, stale description of the same facts.
+            connection.execute("DROP TABLE IF EXISTS content_log")
+            connection.execute("DROP TABLE IF EXISTS events")
+            _record_migration(connection, 3)
 
         validate_schema(connection)
 

@@ -18,8 +18,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bundles  # noqa: E402
 import database  # noqa: E402
-import events  # noqa: E402
-import events_types  # noqa: E402
 import playgrounds  # noqa: E402
 import repository  # noqa: E402
 import manifests  # noqa: E402
@@ -91,7 +89,7 @@ class PlaygroundTest(unittest.TestCase):
     # ----- publishing ----------------------------------------------------
 
     def test_publishing_an_unknown_playground_creates_it(self):
-        # protocol.md §2 step 0：第一次发布就是它的诞生，没有可以作 base 的东西。
+        # picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）：第一次发布就是它的诞生，没有可以作 base 的东西。
         result = playgrounds.publish_playground(
             self.connection,
             "pg-none",
@@ -248,7 +246,7 @@ class PublishPhasesTest(PlaygroundTest):
     """
 
     def pending(self):
-        return [event_id for event_id, _ in repository.list_pending_refs(self.repository)]
+        return [publish_id for publish_id, _ in repository.list_pending_refs(self.repository)]
 
     def history_head(self, playground_id="pg"):
         ref = self.repository.history_ref(playground_id)
@@ -264,7 +262,7 @@ class PublishPhasesTest(PlaygroundTest):
             self.repository, "pg", self.bundle(), self.metadata(), "evt-1"
         )
         self.assertFalse(prepared.no_op)
-        self.assertEqual(prepared.event_id, "evt-1")
+        self.assertEqual(prepared.publish_id, "evt-1")
         self.assertEqual(self.pending(), ["evt-1"], "prepared Version 靠它防 GC")
         self.assertIsNone(self.history_head(), "还没被接受，history ref 不该动")
 
@@ -280,24 +278,22 @@ class PublishPhasesTest(PlaygroundTest):
             self.repository, "pg", self.bundle(), self.metadata(), "evt-2"
         )
         self.assertTrue(again.no_op)
-        self.assertIsNone(again.event_id, "no_op 没有任何东西需要保护")
+        self.assertIsNone(again.publish_id, "no_op 没有任何东西需要保护")
         self.assertEqual(again.commit_id, first.commit_id)
         self.assertEqual(self.pending(), [], "no_op 不产生 pending ref")
 
-    def test_committing_records_the_event_under_the_prepared_id(self):
+    def test_committing_makes_the_prepared_version_current(self):
+        # Accepting a publish is exactly this one write: the Version the Git
+        # phase prepared becomes the Playground's current Version, in the same
+        # transaction that decided it may.
         playgrounds.create_playground(self.connection, "pg")
         prepared = repository.publish_playground_prepare(
-            self.repository, "pg", self.bundle(), self.metadata(), "evt-shared"
+            self.repository, "pg", self.bundle(), self.metadata(), "publish-1"
         )
         with database.immediate_transaction(self.connection):
             result = playgrounds.commit_prepared_version(self.connection, "pg", prepared, None)
         self.assertEqual(result.commit_id, prepared.commit_id)
 
-        # Event 与 pending ref 同名 —— recovery 就是靠这个把两者对上
-        payload = events.find_accepted_event(
-            self.connection, "evt-shared", events_types.EVENT_KIND_PUBLISH_PLAYGROUND
-        )
-        self.assertEqual(payload["version_id"], prepared.commit_id)
         row = self.connection.execute(
             "SELECT current_version_id FROM playgrounds WHERE id = 'pg'"
         ).fetchone()
@@ -323,7 +319,7 @@ class PublishCrashRecoveryTest(PlaygroundTest):
     """启动时的恢复：pending ref 是唯一会被中断留下的痕迹。"""
 
     def pending(self):
-        return [event_id for event_id, _ in repository.list_pending_refs(self.repository)]
+        return [publish_id for publish_id, _ in repository.list_pending_refs(self.repository)]
 
     def history_head(self, playground_id="pg"):
         ref = self.repository.history_ref(playground_id)
@@ -387,26 +383,33 @@ class PublishCrashRecoveryTest(PlaygroundTest):
         self.assertEqual(second, (0, 0), "第二次没有东西可做")
         self.assertEqual(self.history_head(), head_after_first)
 
-    def test_recovery_ignores_a_pending_ref_that_names_another_event_kind(self):
-        # 只认 publish 事件。一个 submit_code 的 event_id 恰好被当成 pending ref
-        # 时，不能被拿去收敛 history。
+    def test_recovery_drops_a_pending_ref_the_database_never_accepted(self):
+        # 判据只有一条：数据库里有没有哪个 Playground 把这个 Version 当成当前版本。
+        # 一个没有被接受的 commit（这里它来自另一次发布，数据库把别的 commit 记成了
+        # 当前版本）只能丢掉，而且不能碰 history。
         playgrounds.create_playground(self.connection, "pg")
-        envelope = events_types.EventEnvelope(
-            event_id="evt-submit",
-            kind=events_types.EVENT_KIND_SUBMIT_CODE,
-            payload={"playground_id": "pg", "version_id": "v", "files": {}},
+        with database.immediate_transaction(self.connection):
+            playgrounds.commit_prepared_version(
+                self.connection,
+                "pg",
+                repository.publish_playground_prepare(
+                    self.repository, "pg", self.bundle(b"accepted"), self.metadata(), "publish-1"
+                ),
+                None,
+            )
+        head = self.history_head()
+        # Prepare 自己就留下了 pending ref：那次发布没有被提交。
+        repository.publish_playground_prepare(
+            self.repository, "pg", self.bundle(b"never"), self.metadata(), "publish-2"
         )
-        with self.connection:
-            events.accept_event(self.connection, envelope, "accepted", {})
-        commit_id = repository.publish_playground(
-            self.repository, "pg", self.bundle(), self.metadata()
-        ).commit_id
-        repository.create_pending_ref(self.repository, "evt-submit", commit_id)
 
         dropped, converged = playgrounds.recover_pending_refs(self.connection, self.repository)
 
-        self.assertEqual((dropped, converged), (1, 0), "只丢 ref，不收敛")
+        # 两个 pending ref：已接受那次（Finalize 还没删）收敛，没接受那次丢掉；
+        # history 收敛到的仍然是数据库说的当前版本，也就是已接受的那一个。
+        self.assertEqual((dropped, converged), (2, 1))
         self.assertEqual(self.pending(), [])
+        self.assertNotEqual(self.history_head(), head, "history 收敛到数据库的当前版本")
 
     def test_recovery_converges_to_current_not_to_the_pending_commit(self):
         # 关键：pending ref 指向那次尝试的 commit，但数据库可能已经被后续发布推得

@@ -56,7 +56,9 @@ class OpenDatabaseTest(unittest.TestCase):
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        self.assertEqual(versions, [1, SCHEMA_VERSION])
+        # The chain is walked in order, one record per step: re-opening an
+        # already-current file must not add a second record for any step.
+        self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
 
     def test_foreign_keys_are_enforced(self):
         connection = open_database(self.path)

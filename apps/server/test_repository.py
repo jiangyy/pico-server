@@ -580,7 +580,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         # 调用方的字符串永远不直接成为 ref 名。
         history = self.repository.history_ref("pg-argv")
         pending = {
-            f"refs/picopg/pending/{event_id}" for event_id in seen_event_ids(seen)
+            f"refs/picopg/pending/{publish_id}" for publish_id in seen_publish_ids(seen)
         }
         allowed = {history, *pending}
         for arguments in seen:
@@ -781,7 +781,7 @@ class PlaygroundPublishingTest(unittest.TestCase):
         )
 
 
-def seen_event_ids(seen):
+def seen_publish_ids(seen):
     """从 git argv 里取出所有 pending ref 用的 event id。"""
 
     ids = set()
