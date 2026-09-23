@@ -31,7 +31,7 @@ MAX_JSON_BODY_BYTES = 16 * 1024
 # the request could carry it without inventing a second bundle format.
 BASE_VERSION_HEADER = "X-Base-Version-Id"
 
-# picopg-implementation.md §10: every request states which protocol the client speaks. It
+# implementation.md §10: every request states which protocol the client speaks. It
 # cannot travel in a payload — a catalog request has no parameters and a file
 # read is a bare GET — so it is a header, checked once before routing.
 PROTOCOL_VERSION_HEADER = "X-Protocol-Version"

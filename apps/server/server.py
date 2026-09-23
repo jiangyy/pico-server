@@ -609,13 +609,13 @@ class Handler(ApiHandler):
             self._respond_json(*stored)
             return
 
-        # Three phases (picopg-implementation.md §3), and the order is the point: the Git
+        # Three phases (implementation.md §3), and the order is the point: the Git
         # work must not sit inside the database transaction, and the database
         # must decide before the history ref moves.
         #
         #   1. refuse anything the database alone can refuse, without building
         #      a commit at all (an unknown Playground is not one of them: the
-        #      first publish of an id creates it, picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）)
+        #      first publish of an id creates it, implementation.md §3（不存在的 Playground 由第一次发布带出来）)
         #   2. prepare the Version in Git, protected by a pending ref
         #   3. one short transaction: the compare-and-swap on the current Version
         #   4. converge the history ref onto what the database now says

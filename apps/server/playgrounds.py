@@ -127,7 +127,7 @@ def require_publishable(connection, playground_id, base_version_id):
     base is refused without creating a commit. That is worth doing up front — a
     refusal must not leave a prepared Version to clean up.
 
-    A Playground that does not exist yet is *not* a refusal: picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）
+    A Playground that does not exist yet is *not* a refusal: implementation.md §3（不存在的 Playground 由第一次发布带出来）
     makes the first publish of an id create it, so this returns ``None`` and the
     commit phase creates the row. What such a request must not carry is a base —
     `_require_base` reads a base with no observed version as a claim about a
@@ -188,7 +188,7 @@ def commit_prepared_version(
 def observed_version(row):
     """The Version the database says is current for this Playground, if any.
 
-    What picopg-implementation.md §3 calls ``observed_version_id``: the Version a publish has
+    What implementation.md §3 calls ``observed_version_id``: the Version a publish has
     to be built on, as opposed to whatever the history ref happens to point at.
     ``None`` means there is nothing to build on — the first publish of an id.
     """
@@ -201,7 +201,7 @@ def observed_version(row):
 def _create_from_prepared(connection, playground_id, prepared, base_version_id):
     """Create the Playground row for the first Version ever published to it.
 
-    picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）: an unknown id is not an error, it is a Playground that
+    implementation.md §3（不存在的 Playground 由第一次发布带出来）: an unknown id is not an error, it is a Playground that
     does not exist until this moment. The row and the Version are accepted in one
     transaction, so there is no window in which a Playground exists without the
     Version that brought it into being.
@@ -342,7 +342,7 @@ def restore_playground(connection, playground_id):
 
     The counterpart to Archive. ``state`` is a distribution flag, and something
     has to be able to clear it: publishing is refused while a Playground is
-    stopped (picopg-implementation.md §3), so without this the flag only moves one way and a
+    stopped (implementation.md §3), so without this the flag only moves one way and a
     retired course can never come back — which is what `retire.mjs` used to
     promise and could not deliver.
 

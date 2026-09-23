@@ -276,7 +276,7 @@ class ClientContractTest(unittest.TestCase):
     def test_a_hand_in_written_offline_is_still_accepted_after_the_course_moves_on(self):
         """断网时写好的作业，等联网时课程已经发了新版本 —— 这份作业仍然收。
 
-        picopg-implementation.md §9 只要求 ``version_id`` 属于该 Playground，
+        implementation.md §9 只要求 ``version_id`` 属于该 Playground，
         实现里就是「在该课程已发布的 history 里」。而 history 不会被删（Archive
         只改 state），所以一份钉在旧版本上、隔了一段时间才送到的作业仍然有效，
         并且被记在它真正依据的那个版本上 —— 这一点很重要：学生是按那个版本做的。
@@ -368,7 +368,7 @@ class ClientContractTest(unittest.TestCase):
             without any reconciliation.
 
         A hand-in written offline is accepted even though the course moved on in
-        the meantime: picopg-implementation.md §3 only asks that the Version belong to that
+        the meantime: implementation.md §3 only asks that the Version belong to that
         Playground's published history.
         """
         first = self.publish("pg-two")

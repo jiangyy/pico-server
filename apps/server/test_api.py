@@ -78,7 +78,7 @@ class ServerTestCase(unittest.TestCase):
         content_type="application/json",
         extra_headers=None,
     ):
-        # picopg-implementation.md §10: every API request states its protocol version, so
+        # implementation.md §10: every API request states its protocol version, so
         # the shared helper sends it unless a test deliberately omits it.
         headers = {"X-Protocol-Version": str(PROTOCOL_VERSION)}
         body = raw_body
@@ -177,7 +177,7 @@ class ServerTestCase(unittest.TestCase):
     def publish(self, playground_id, archive=None, key="key-1", base=None):
         """Publish one bundle, naming the current Version as its base.
 
-        picopg-implementation.md §3: every publish of an existing Playground says which
+        implementation.md §3: every publish of an existing Playground says which
         Version it built on. `base=None` asks the server what that is, exactly
         as `upload.mjs` does; `base=False` sends nothing, which is how the
         refusal is tested.
@@ -495,7 +495,7 @@ class PublishAfterLostFinalizeTest(ServerTestCase):
 
     def test_no_op_answers_about_the_current_version(self):
         # 同一个坑的另一面：no_op 返回的 version_id 必须是**当前**那个 Version
-        # （picopg-implementation.md §11），不能是 ref 上落后的那个。
+        # （implementation.md §11），不能是 ref 上落后的那个。
         name = "chain-noop"
         _, second = self.publish_after_lost_finalize(name)
 
@@ -515,7 +515,7 @@ class PublishAfterLostFinalizeTest(ServerTestCase):
 
 
 class VersionReadPathTest(ServerTestCase):
-    """picopg-implementation.md §11 Read Version：读 Version 只认 version_id，不认 ref。
+    """implementation.md §11 Read Version：读 Version 只认 version_id，不认 ref。
 
     所以中间版本、被覆盖的版本、以及已经下线的 Playground 的历史都仍然可读 ——
     可达性由 ref 保证，但寻址与它无关。
@@ -604,7 +604,7 @@ class VersionReadPathTest(ServerTestCase):
 
 
 class PublishCreatesPlaygroundTest(ServerTestCase):
-    """picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）：不存在的 Playground 由第一次发布带出来。"""
+    """implementation.md §3（不存在的 Playground 由第一次发布带出来）：不存在的 Playground 由第一次发布带出来。"""
 
     def test_publishing_to_an_unknown_playground_creates_it(self):
         # 不需要先登记：协议里 PublishRequest 的「Playground 不存在」分支就是创建。
@@ -991,7 +991,7 @@ class PublishTest(ServerTestCase):
     def test_uploading_to_an_unknown_playground_creates_it(self):
         """This used to be 404.
 
-        picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来） is explicit that the first publish of an id is what
+        implementation.md §3（不存在的 Playground 由第一次发布带出来） is explicit that the first publish of an id is what
         brings the Playground into existence, so a publisher that never
         registered the id is not doing something malformed. Registration is
         still there and still how an id is reserved before anything is published;
@@ -1160,7 +1160,7 @@ class SubmissionTest(ServerTestCase):
 
 
 class ProtocolVersionTest(ServerTestCase):
-    """Requests must say which protocol they speak (picopg-implementation.md §10)."""
+    """Requests must say which protocol they speak (implementation.md §10)."""
 
     def test_a_request_without_the_header_is_refused(self):
         for path in ("/api/v1/catalog", "/api/v1/submissions"):

@@ -89,7 +89,7 @@ class PlaygroundTest(unittest.TestCase):
     # ----- publishing ----------------------------------------------------
 
     def test_publishing_an_unknown_playground_creates_it(self):
-        # picopg-implementation.md §3（不存在的 Playground 由第一次发布带出来）：第一次发布就是它的诞生，没有可以作 base 的东西。
+        # implementation.md §3（不存在的 Playground 由第一次发布带出来）：第一次发布就是它的诞生，没有可以作 base 的东西。
         result = playgrounds.publish_playground(
             self.connection,
             "pg-none",

@@ -31,10 +31,10 @@ _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 # prefix, or an option from being resolved as if it were an object id.
 _OBJECT_ID_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
 
-#: picopg-implementation.md §3: the stable, per-Playground reachability root. It converges to
+#: implementation.md §3: the stable, per-Playground reachability root. It converges to
 #: the database's `current_version_id`; it never leads it.
 HISTORY_REF_PREFIX = "refs/picopg/history/"
-#: picopg-implementation.md §3: the temporary root for a Version that is prepared but not yet
+#: implementation.md §3: the temporary root for a Version that is prepared but not yet
 #: accepted. One per publish attempt, removed once the attempt is settled.
 PENDING_REF_PREFIX = "refs/picopg/pending/"
 
@@ -68,7 +68,7 @@ class Repository:
 
         Everything a Playground has accepted stays reachable from here. It is
         *not* the addressing scheme for a Version — a Version is read by its own
-        id (picopg-implementation.md §11) — it is the reachability root that keeps the Git GC
+        id (implementation.md §11) — it is the reachability root that keeps the Git GC
         away and the thing `commit_in_playground_history` consults.
         """
         validate_playground_id(opaque_id)
