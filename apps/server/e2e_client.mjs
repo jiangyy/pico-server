@@ -121,7 +121,8 @@ async function submit([playgroundId, versionId, name]) {
   const text = await readFile(join(dataDir, "hand-in.py"), "utf8").catch(() => null);
   const body = text ?? `# 姓名：${name}\nprint(1)\n`;
   const queued = await submitModule.enqueueSubmission(dataDir, {
-    playgroundId,
+    sourceKind: "playground",
+    sourceId: playgroundId,
     versionId,
     files: { "work/main.py": body },
   });
