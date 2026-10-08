@@ -11,11 +11,13 @@ It knows nothing about Playgrounds, bundles, Git or submissions — those live i
 its shape alone, and an endpoint cannot reach storage through it by accident.
 """
 
+import gzip
 import hmac
 import json
+import mimetypes
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import pagination
 from database import open_database
@@ -226,6 +228,101 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._api_error(404, "not_found", head_only=head_only)
         else:
             self._respond(404, "not found\n", head_only=head_only)
+
+    def _get_static(self, path, head_only=False):
+        """Serve one file of the built site, or answer 404.
+
+        The site is what `npm run build` writes into `site/`: one directory per
+        course page, plus the shared runtime a page takes with `../`. It is
+        served from this process because the reverse proxy in front sends every
+        path here — splitting the site from `/api/` is the tidier place for it,
+        and this is the shortcut until that proxy is touched.
+        """
+
+        root = self.server.static_path
+        relative = unquote(path).lstrip("/")
+        if "\0" in relative:
+            self._not_found(head_only=head_only)
+            return
+
+        # `resolve` follows symlinks, so this also refuses a link that points
+        # out of the site — the one way a URL could leave it.
+        target = (root / relative).resolve()
+        if not target.is_relative_to(root):
+            self._not_found(head_only=head_only)
+            return
+        if target.is_dir():
+            target = target / "index.html"
+
+        try:
+            data = target.read_bytes()
+            modified = int(target.stat().st_mtime)
+        except OSError:
+            self._not_found(head_only=head_only)
+            return
+
+        content_type = (
+            mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        )
+        body, extra_headers = self._maybe_compress(data, content_type)
+
+        # Names here are stable (`libs/react.js` carries no version), so the
+        # copy is kept but revalidated: a page served twice sends the 13 MB
+        # pyodide once, and a 304 the second time. That also bounds the cost of
+        # compressing: it happens once per cold load, never on a 304.
+        self._respond_bytes(
+            200,
+            body,
+            content_type=content_type,
+            etag=f"{modified}-{len(data)}",
+            extra_headers=extra_headers,
+            cache_control="no-cache",
+            head_only=head_only,
+        )
+
+    #: Types worth compressing. Everything on this site that is not in here is
+    #: already compressed (`python_stdlib.zip`) or already small (images): the
+    #: runtime is text and wasm, and wasm alone is half the bytes a browser
+    #: downloads.
+    COMPRESSIBLE_TYPES = (
+        "application/javascript",
+        "application/json",
+        "application/wasm",
+        "image/svg+xml",
+    )
+
+    def _maybe_compress(self, data, content_type):
+        """Return the body to send and any headers that go with it.
+
+        gzip here rather than in the proxy: the proxy's own `gzip_types` covers
+        neither `text/javascript` nor `application/wasm`, and those are the two
+        biggest files on the site. Compressing costs ~0.3 s on the 9.6 MB wasm
+        and nothing on a revalidation, which is the trade this takes: a smaller
+        cold load for a browser whose cache holds nothing.
+        """
+
+        compressible = content_type.startswith("text/") or (
+            content_type in self.COMPRESSIBLE_TYPES
+        )
+        if not compressible or len(data) <= 1024:
+            return data, ()
+        if not self._accepts_gzip():
+            return data, ()
+        return gzip.compress(data, 6), (
+            ("Content-Encoding", "gzip"),
+            # One file, two possible bodies: anything between here and the
+            # browser has to key its copy on this header.
+            ("Vary", "Accept-Encoding"),
+        )
+
+    def _accepts_gzip(self):
+        """Whether the client asked for gzip, refusing an explicit `q=0`."""
+
+        for part in self.headers.get("Accept-Encoding", "").split(","):
+            token, _, parameters = part.partition(";")
+            if token.strip().lower() == "gzip":
+                return "q=0" not in parameters.replace(" ", "")
+        return False
 
     def _api_error(
         self, status, code, head_only=False, extra_headers=(), details=None

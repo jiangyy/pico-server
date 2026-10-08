@@ -89,6 +89,10 @@ HOST = "127.0.0.1"
 PORT = 8001
 DATABASE_PATH = Path("data/app.db")
 
+#: The site `npm run build` produces (`dist/`), copied here as-is. Every
+#: path that is not `/api/` is served from it.
+STATIC_ROOT = Path("site")
+
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 #: The readable copy of each handed-in work lives here, beside the database.
@@ -223,7 +227,7 @@ class Handler(ApiHandler):
         elif routes.allowed_methods(path) is not None:
             self._method_not_allowed(head_only=head_only)
         else:
-            self._not_found(head_only=head_only)
+            self._get_static(path, head_only=head_only)
 
     def _route_post(self):
         path = urlsplit(self.path).path
@@ -1068,9 +1072,12 @@ def make_server(
     database_path=DATABASE_PATH,
     repository_path=DEFAULT_REPOSITORY_PATH,
     submissions_path=None,
+    static_path=STATIC_ROOT,
     operator_token=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
+
+    ``static_path`` is the root the built site is served from.
 
     ``submissions_path`` is where the readable copy of each handed-in work goes.
     It defaults to a sibling of the database, so every deployment path stays
@@ -1119,6 +1126,8 @@ def make_server(
     server.repository_path = repository_path
     server.repository = repository
     server.submissions_path = submissions_path
+    # Resolved once: every static request checks its path against this root.
+    server.static_path = Path(static_path).resolve()
     server.operator_token = operator_token
     return server
 
