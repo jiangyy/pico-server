@@ -5,10 +5,9 @@ The managed layout is::
     data/                    0700
     data/app.db              0600
     data/picopg.git/         0700
-    data/submissions/        0700
 
-The enclosing ``0700`` directory is the principal protection for Git internals
-and submission subtrees, so this module narrows a managed root and the files the
+The enclosing ``0700`` directory is the principal protection for Git
+internals, so this module narrows a managed root and the files the
 Server itself creates; it never recursively rewrites an administrator-provided
 subtree and never changes an owner.  An existing path is only narrowed when it
 is a real (non-symlink) path of the expected type owned by the effective user,

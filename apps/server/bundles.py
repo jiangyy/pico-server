@@ -75,7 +75,6 @@ __all__ = [
     "REASON_MANIFEST_INVALID_SCHEMA_VERSION",
     "REASON_MANIFEST_MISSING_RUNTIME",
     "REASON_MANIFEST_INVALID_RUNTIME",
-    "REASON_MANIFEST_INVALID_REQUIRES_SUBMISSION",
     # archive decoding reason codes
     "REASON_ARCHIVE_INVALID",
     "REASON_ARCHIVE_TOO_LARGE",
@@ -152,9 +151,6 @@ REASON_MANIFEST_MISSING_SCHEMA_VERSION = "manifest_missing_schema_version"
 REASON_MANIFEST_INVALID_SCHEMA_VERSION = "manifest_invalid_schema_version"
 REASON_MANIFEST_MISSING_RUNTIME = "manifest_missing_runtime"
 REASON_MANIFEST_INVALID_RUNTIME = "manifest_invalid_runtime"
-REASON_MANIFEST_INVALID_REQUIRES_SUBMISSION = (
-    "manifest_invalid_requires_submission"
-)
 
 # --- Archive decoding reason codes ----------------------------------------
 #
@@ -205,7 +201,6 @@ REASON_CODES: frozenset[str] = frozenset(
         REASON_MANIFEST_INVALID_SCHEMA_VERSION,
         REASON_MANIFEST_MISSING_RUNTIME,
         REASON_MANIFEST_INVALID_RUNTIME,
-        REASON_MANIFEST_INVALID_REQUIRES_SUBMISSION,
         REASON_ARCHIVE_INVALID,
         REASON_ARCHIVE_TOO_LARGE,
         REASON_ARCHIVE_ENCRYPTED,
@@ -445,14 +440,6 @@ def _validate_manifest(data: bytes) -> None:
         raise BundleValidationError(REASON_MANIFEST_INVALID_RUNTIME)
     if runtime not in SUPPORTED_RUNTIMES:
         raise BundleValidationError(REASON_MANIFEST_INVALID_RUNTIME)
-
-    if (
-        "requiresSubmission" in manifest
-        and type(manifest["requiresSubmission"]) is not bool
-    ):
-        raise BundleValidationError(
-            REASON_MANIFEST_INVALID_REQUIRES_SUBMISSION
-        )
 
 
 def validate_bundle(bundle: Iterable[BundleEntry]) -> Mapping[str, bytes]:

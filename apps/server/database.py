@@ -8,7 +8,7 @@ from pathlib import Path
 import permissions
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 1
 
 
 @contextmanager
@@ -93,20 +93,11 @@ _TABLE_COLUMNS = {
         "current_version_id": (0, 1),
         "title": (0, 1),
     },
-    "submissions": {
-        "id": (1, 1),
-        "assignment_id": (0, 1),
-        "version_id": (0, 1),
-        "student": (0, 1),
-        "files_json": (0, 1),
-        "created_at": (0, 1),
-    },
 }
 
 # ``(table, column, referenced table, referenced column, on-delete action)``
-#
-# A submission names an Assignment, so there is nothing here to point at: the
-# same-named Playground column is gone, and with it the foreign key v1 needed.
+# Nothing references another table: a Playground and an Assignment are each
+# named by a client and own their own history, and no row here points at one.
 _FOREIGN_KEYS = ()
 
 # Exact ordered column names for every index a production query relies on.
@@ -117,10 +108,6 @@ _REQUIRED_INDEXES = {
         ("created_at",),
     ),
     "assignments_created_at_idx": ("assignments", ("created_at",)),
-    "submissions_assignment_idx": (
-        "submissions",
-        ("assignment_id", "created_at"),
-    ),
 }
 
 _SQLITE_IDENTIFIER = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -152,13 +139,12 @@ def open_database(path):
 
 
 def _initialize_schema(connection):
-    """Create the current schema in one step.
+    """Create the current schema, or prove an existing file already has it.
 
-    The chain is walked once, in order, from whatever version the file is at.
-    v3 dropped the retired event tables, so an existing file passes through them
-    and ends up with the current contract; ``validate_schema`` then proves the
-    result matches it exactly, so a half-migrated file is refused rather than
-    served.
+    One version, created in one step: there is no migration chain, because
+    nothing has ever been deployed from an older one. ``validate_schema`` then
+    proves the result matches the contract exactly, so a half-written or
+    hand-edited file is refused rather than served.
     """
 
     with connection:
@@ -184,7 +170,10 @@ def _initialize_schema(connection):
                 """
                 CREATE TABLE playgrounds (
                     id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'active'
+                        CHECK (state IN ('active', 'stopped')),
+                    current_version_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -217,92 +206,6 @@ def _initialize_schema(connection):
             )
             connection.execute(
                 """
-                CREATE TABLE submissions (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    playground_id TEXT NOT NULL
-                        REFERENCES playgrounds(id) ON DELETE RESTRICT,
-                    playground_commit_id TEXT NOT NULL
-                        CHECK (playground_commit_id <> ''),
-                    student TEXT NOT NULL
-                        CHECK (student <> '' AND length(student) <= 128),
-                    files_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX submissions_playground_idx "
-                "ON submissions(playground_id, created_at)"
-            )
-            _record_migration(connection, 1)
-
-        if version < 2:
-            # `state` was not tracked in v1; a playground's active/stopped
-            # state was implied by the existence of its Git ref. The default
-            # 'active' matches the v1 behaviour for every existing row.
-            connection.execute(
-                "ALTER TABLE playgrounds ADD COLUMN state TEXT NOT NULL "
-                "DEFAULT 'active' CHECK (state IN ('active', 'stopped'))"
-            )
-            # `current_version_id` was derived from Git in v1. Leave the
-            # column empty for legacy rows; callers fall back to the ref
-            # when the column is empty, then back-fill it on the next publish.
-            connection.execute(
-                "ALTER TABLE playgrounds ADD COLUMN current_version_id TEXT "
-                "NOT NULL DEFAULT ''"
-            )
-            connection.execute(
-                """
-                CREATE TABLE events (
-                    event_id TEXT PRIMARY KEY NOT NULL
-                        CHECK (event_id <> '' AND length(event_id) <= 64),
-                    kind TEXT NOT NULL
-                        CHECK (kind IN ('submit_code', 'publish_playground', 'archive_playground')),
-                    payload TEXT NOT NULL CHECK (payload <> ''),
-                    status TEXT NOT NULL
-                        CHECK (status IN ('accepted', 'rejected')),
-                    reason TEXT NOT NULL DEFAULT '',
-                    response_json TEXT NOT NULL CHECK (response_json <> ''),
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX events_kind_created_at_idx "
-                "ON events(kind, created_at)"
-            )
-            connection.execute(
-                """
-                CREATE TABLE content_log (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE
-                        REFERENCES events(event_id) ON DELETE RESTRICT,
-                    kind TEXT NOT NULL
-                        CHECK (kind IN ('publish_playground', 'archive_playground')),
-                    payload TEXT NOT NULL CHECK (payload <> '')
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX content_log_kind_idx "
-                "ON content_log(kind)"
-            )
-            _record_migration(connection, 2)
-
-        if version < 3:
-            # v3 retires the generic event channel: a publish and an archive are
-            # recorded by the Playground row they change, and a hand-in is a row
-            # of its own. Nothing reads these two tables, and keeping them would
-            # be keeping a second, stale description of the same facts.
-            connection.execute("DROP TABLE IF EXISTS content_log")
-            connection.execute("DROP TABLE IF EXISTS events")
-            _record_migration(connection, 3)
-
-        if version < 4:
-            # v4 加了 Assignment：和 Playground 同样的当前状态，另加一个从内容派生的
-            # title（免得目录每次去读 Git）。内容本身仍然只在 Git 里。
-            connection.execute(
-                """
                 CREATE TABLE assignments (
                     id TEXT PRIMARY KEY NOT NULL,
                     created_at TEXT NOT NULL,
@@ -317,72 +220,7 @@ def _initialize_schema(connection):
                 "CREATE INDEX assignments_created_at_idx "
                 "ON assignments(created_at)"
             )
-            _record_migration(connection, 4)
-
-        if version < 5:
-            # v5：一次提交对准的对象不再只是 Playground。列名换成中性的三件套
-            # （source_kind / source_id / version_id），并去掉指向 playgrounds 的外键——
-            # 作业的提交住在同一张表里，那条外键已经不成立。SQLite 改不了外键，重建表。
-            connection.execute("ALTER TABLE submissions RENAME TO submissions_v4")
-            connection.execute(
-                """
-                CREATE TABLE submissions (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    source_kind TEXT NOT NULL
-                        CHECK (source_kind IN ('playground', 'assignment')),
-                    source_id TEXT NOT NULL CHECK (source_id <> ''),
-                    version_id TEXT NOT NULL CHECK (version_id <> ''),
-                    student TEXT NOT NULL
-                        CHECK (student <> '' AND length(student) <= 128),
-                    files_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "INSERT INTO submissions (id, source_kind, source_id, version_id,"
-                " student, files_json, created_at)"
-                " SELECT id, 'playground', playground_id, playground_commit_id,"
-                " student, files_json, created_at FROM submissions_v4"
-            )
-            connection.execute("DROP TABLE submissions_v4")
-            connection.execute(
-                "CREATE INDEX submissions_source_idx"
-                " ON submissions(source_id, created_at)"
-            )
-            _record_migration(connection, 5)
-
-        if version < 6:
-            # v6：一次提交对准的只有 Assignment。v5 的中性三件套是给"两类对象"
-            # 准备的，而课程不再收作业，所以列名收成 assignment_id。v5 之前指向课程
-            # 的提交（历史上都是验收记录）不在这里迁移：它们在新模型里没有一个诚实
-            # 的写法——把它们改写成 assignment_id 会凭空造出"交到一门作业上"的记录。
-            connection.execute("ALTER TABLE submissions RENAME TO submissions_v5")
-            connection.execute(
-                """
-                CREATE TABLE submissions (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    assignment_id TEXT NOT NULL CHECK (assignment_id <> ''),
-                    version_id TEXT NOT NULL CHECK (version_id <> ''),
-                    student TEXT NOT NULL
-                        CHECK (student <> '' AND length(student) <= 128),
-                    files_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "INSERT INTO submissions (id, assignment_id, version_id,"
-                " student, files_json, created_at)"
-                " SELECT id, source_id, version_id, student, files_json, created_at"
-                " FROM submissions_v5 WHERE source_kind = 'assignment'"
-            )
-            connection.execute("DROP TABLE submissions_v5")
-            connection.execute(
-                "CREATE INDEX submissions_assignment_idx"
-                " ON submissions(assignment_id, created_at)"
-            )
-            _record_migration(connection, 6)
+            _record_migration(connection, 1)
 
         validate_schema(connection)
 

@@ -17,7 +17,6 @@ PLAYGROUNDS_PATH = "/api/v1/playgrounds"
 PLAYGROUND_VERSIONS_SUFFIX = "/versions"
 PLAYGROUND_RESTORE_SUFFIX = "/restore"
 CATALOG_PATH = "/api/v1/catalog"
-SUBMISSIONS_PATH = "/api/v1/submissions"
 ASSIGNMENTS_PATH = "/api/v1/assignments"
 
 #: The literal segments a read route is built from.
@@ -178,19 +177,6 @@ def match_version_files(path):
     return playground_id, version_id, encoded_path
 
 
-def match_submission(path):
-    """Return the opaque submission id in a submission path, else ``None``."""
-
-    prefix = SUBMISSIONS_PATH + "/"
-    if not path.startswith(prefix):
-        return None
-
-    submission_id = path[len(prefix):]
-    if not submission_id or "/" in submission_id:
-        return None
-    return submission_id
-
-
 def allowed_methods(path):
     """Return the methods a known path accepts, or ``None`` when unknown.
 
@@ -206,10 +192,6 @@ def allowed_methods(path):
         return ("DELETE",)
     if match_assignment_versions(path) is not None:
         return ("POST",)
-    if path == SUBMISSIONS_PATH:
-        # The one anonymous write in the service (hand in work) shares its path
-        # with the operator's read of what was handed in.
-        return ("GET", "HEAD", "POST")
     if path == PLAYGROUNDS_PATH:
         return ("POST",)
     if match_playground(path) is not None:
@@ -221,8 +203,6 @@ def allowed_methods(path):
     if match_manifest(path) is not None:
         return ALLOWED_METHODS
     if match_version_files(path) is not None:
-        return ALLOWED_METHODS
-    if match_submission(path) is not None:
         return ALLOWED_METHODS
     return None
 

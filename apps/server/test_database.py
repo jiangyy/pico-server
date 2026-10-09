@@ -1,7 +1,7 @@
 """Tests for the SQLite bootstrap and schema validation.
 
 The schema is one version describing three tables: the published Playgrounds,
-the idempotency results, and the submissions.  Validation is exact, because a
+the idempotency results, and the Assignments.  Validation is exact, because a
 database that is one column off would fail much later and much less clearly.
 """
 
@@ -41,7 +41,7 @@ class OpenDatabaseTest(unittest.TestCase):
             )
         }
         self.assertLessEqual(
-            {"playgrounds", "idempotency_results", "submissions"}, tables
+            {"playgrounds", "idempotency_results", "assignments"}, tables
         )
 
     def test_opening_is_repeatable(self):
@@ -59,61 +59,6 @@ class OpenDatabaseTest(unittest.TestCase):
         # The chain is walked in order, one record per step: re-opening an
         # already-current file must not add a second record for any step.
         self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
-
-    def test_a_submission_names_an_assignment_and_a_version(self):
-        # 提交对准的对象只有一种（Assignment）。"这道作业存在"由应用层检查——数据库
-        # 这一层守形状：两个 id 都不能是空串。
-        connection = open_database(self.path)
-        self.addCleanup(connection.close)
-
-        for column in ("assignment_id", "version_id"):
-            with self.subTest(column=column):
-                values = {"assignment_id": "hw", "version_id": "0" * 40}
-                values[column] = ""
-                with self.assertRaises(sqlite3.IntegrityError):
-                    with connection:
-                        connection.execute(
-                            "INSERT INTO submissions (id, assignment_id,"
-                            " version_id, student, files_json, created_at)"
-                            " VALUES ('s', ?, ?, 'a', '{}', 'now')",
-                            (values["assignment_id"], values["version_id"]),
-                        )
-
-    def test_a_submission_may_not_be_named_twice(self):
-        connection = open_database(self.path)
-        self.addCleanup(connection.close)
-        with connection:
-            connection.execute(
-                "INSERT INTO submissions (id, assignment_id,"
-                " version_id, student, files_json, created_at)"
-                " VALUES ('s', 'hw', ?, 'a', '{}', 'now')",
-                ("0" * 40,),
-            )
-
-        with self.assertRaises(sqlite3.IntegrityError):
-            with connection:
-                connection.execute(
-                    "INSERT INTO submissions (id, assignment_id,"
-                    " version_id, student, files_json, created_at)"
-                    " VALUES ('s', 'hw', ?, 'b', '{}', 'now')",
-                    ("0" * 40,),
-                )
-
-    def test_the_database_enforces_the_student_length(self):
-        connection = open_database(self.path)
-        self.addCleanup(connection.close)
-
-        for student in ("", "a" * 129):
-            with self.subTest(student=student):
-                with self.assertRaises(sqlite3.IntegrityError):
-                    with connection:
-                        connection.execute(
-                            "INSERT INTO submissions (id, assignment_id,"
-                            " version_id, student, files_json,"
-                            " created_at)"
-                            " VALUES (?, 'hw', ?, ?, '{}', 'now')",
-                            ("s", "0" * 40, student),
-                        )
 
 
 class ValidateSchemaTest(unittest.TestCase):
@@ -133,7 +78,7 @@ class ValidateSchemaTest(unittest.TestCase):
 
     def test_a_missing_table_is_reported(self):
         with self.connection:
-            self.connection.execute("DROP TABLE submissions")
+            self.connection.execute("DROP TABLE assignments")
         with self.assertRaises(SchemaValidationError):
             validate_schema(self.connection)
 
@@ -164,25 +109,24 @@ class ValidateSchemaTest(unittest.TestCase):
 
     def test_a_missing_index_is_reported(self):
         with self.connection:
-            self.connection.execute("DROP INDEX submissions_assignment_idx")
+            self.connection.execute("DROP INDEX assignments_created_at_idx")
         with self.assertRaises(SchemaValidationError):
             validate_schema(self.connection)
 
     def test_a_table_with_the_wrong_columns_is_reported(self):
         with self.connection:
-            self.connection.execute("DROP TABLE submissions")
+            self.connection.execute("DROP TABLE assignments")
             self.connection.execute(
-                "CREATE TABLE submissions ("
+                "CREATE TABLE assignments ("
                 " id TEXT PRIMARY KEY NOT NULL,"
-                " playground_id TEXT NOT NULL,"
-                " version_id TEXT NOT NULL,"
-                " student TEXT NOT NULL,"
-                " files_json TEXT NOT NULL,"
-                " created_at TEXT NOT NULL)"
+                " created_at TEXT NOT NULL,"
+                " state TEXT NOT NULL,"
+                " current_version_id TEXT NOT NULL,"
+                " title TEXT)"
             )
             self.connection.execute(
-                "CREATE INDEX submissions_assignment_idx"
-                " ON submissions(playground_id, created_at)"
+                "CREATE INDEX assignments_created_at_idx"
+                " ON assignments(created_at)"
             )
         with self.assertRaises(SchemaValidationError):
             validate_schema(self.connection)

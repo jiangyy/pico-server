@@ -4,8 +4,11 @@
 
 1. 分发已发布的课程内容（设计见 `learn-python/apps/client/core.md` 与
    `implementation.md`）。
-2. 接收并保存学生交上来的作业。
-3. 接收运维发布、下线的课程包。
+2. 接收运维发布、下线的课程包。
+
+学生交作业的通道已经删掉：一次提交在这套设计里是「确认一次日志同步」，服务端只据此造
+一个不可变 checkpoint，不需要自己解释文件内容，也不需要第二份姓名/班级目录。新的写入
+协议定下来之前，这里只有发布和读取。
 
 ## 对外接口
 
@@ -20,17 +23,6 @@
 | GET | `/api/v1/playgrounds/{id}/versions/{vid}/manifest` | `{playground_id, version_id, files:[{path,size,sha256}]}` |
 | GET | `/api/v1/playgrounds/{id}/versions/{vid}/files/{path}` | 原始字节 + `X-Content-SHA256` |
 
-客户端唯一的写入口，匿名：
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| POST | `/api/v1/submissions` | `{submission_id, assignment_id, version_id, files}` → `201 {status:"accepted", submission}` / `200 {status:"existing_same", submission}`；拒绝是 `400 invalid_submission`、`404 invalid_version`、`409 assignment_stopped`、`409 submission_conflict` |
-
-一份提交对准一道作业：`version_id` 必须属于该 Assignment 的已发布历史，作业已下线就是
-`409 assignment_stopped`。`submission_id` 由客户端生成：同名重发得到同一个结果，同名不同
-内容被拒绝。学生名不在请求里，服务器从 `work/main.py` 首行（`# 姓名：… 班级：…`）读出来，
-作为老师那份可读副本的署名。
-
 需要 operator token（`Authorization: Bearer …`）：
 
 | 方法 | 路径 | 说明 |
@@ -39,16 +31,14 @@
 | POST | `/api/v1/playgrounds/{id}/versions` | ZIP + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}` |
 | POST | `/api/v1/assignments/{id}/versions` | Markdown + `Idempotency-Key` + `X-Base-Version-Id`，返回 `{status, version_id}`；第一行必须是 `# 标题` |
 | DELETE | `/api/v1/assignments/{id}` | 取消发布，返回 `{status}` |
+| DELETE | `/api/v1/playgrounds/{id}` | 下线，返回 `{status}` |
+| POST | `/api/v1/playgrounds/{id}/restore` | 重新上线，返回 `{status}` |
 
 发布的 `status`：`accepted` / `no_op` / `conflict` / `playground_stopped`。对一个还不存在的
 id 发布就是创建它（`base` 必须为空，否则 `conflict`）；已有 Version 时必须带 `base`，
 缺了是 `400`，过时是 `409 conflict`。`conflict` 表示
 `X-Base-Version-Id` 已经过时，这次什么都没有写；`playground_stopped` 表示这门课已下线，
-所以不能靠重新发布让它回来——用下面的 `restore`。
-| DELETE | `/api/v1/playgrounds/{id}` | 下线，返回 `{status}` |
-| POST | `/api/v1/playgrounds/{id}/restore` | 重新上线，返回 `{status}` |
-| GET | `/api/v1/submissions` | 分页列出交上来的作业 |
-| GET | `/api/v1/submissions/{id}` | 取回一份作业的文件 |
+所以不能靠重新发布让它回来——用上面的 `restore`。
 
 ## 存储
 
@@ -56,10 +46,7 @@ id 发布就是创建它（`base` 必须为空，否则 `conflict`）；已有 V
 
 - `playgrounds` —— 每门课一行：`state`（active/stopped）与 `current_version_id`。
 - `assignments` —— 每道作业一行：`state`、`current_version_id`，外加从内容派生的 `title`。
-- `submissions` —— 交上来的作业，只追加，文件正文在 `files_json`；`id` 就是客户端给的
-  `submission_id`，唯一约束就是幂等；`assignment_id` + `version_id` 说明它交的是哪一版。
-- `idempotency_results` —— operator 发布端点的 `Idempotency-Key` 重放结果（它只服务那
-  一个端点，不是通用事件表）。
+- `idempotency_results` —— operator 发布端点的 `Idempotency-Key` 重放结果。
 
 `data/picopg.git` —— 一个 bare 仓库，一个 Version 就是一个 commit，内容不可变、天然去重。
 课程的历史在 `refs/picopg/history/<playground_id>`，作业的历史在 `refs/picopg/assignment/<assignment_id>`。
@@ -77,14 +64,3 @@ pending ref）。Git 不在数据库事务里；数据库没答应之前 history
 启动扫描恢复：它拿每个 pending ref 指向的 Version 去问数据库"哪个 Playground 把它当成
 当前版本"——有就收敛 history，没有就丢掉这个 ref。数据库没有接受过的 Version 丢掉，
 接受过的把 history ref 补上。
-
-`data/submissions/` —— 交上来的作业的人可读副本，一行记录对应一个目录：
-
-```
-data/submissions/<班级>/<姓名>/<playgroundId>[-N]/work/main.py
-                                                   /submission.json
-```
-
-`-N` 是同一个人对同一门课再交一次时的编号；`submission.json` 记着这份是谁的、基于
-哪个 Version。学生名来自请求（`work/main.py` 首行），所以每一段都做了过滤——名字
-不能变成路径。真正的记录是数据库，这份副本可以整份删掉再从 API 重新读。

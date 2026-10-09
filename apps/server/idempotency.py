@@ -2,8 +2,8 @@
 
 The module stores results in ``idempotency_results`` keyed by
 ``(scope, endpoint, request_key)``.  A scope is a caller-chosen name — the
-operator for a publish, the student's own name for a submission — so two callers
-never share a key space and no account model is implied.  A caller supplies a
+operator's publishing scope, today — so two callers cannot share a key space
+and no account model is implied.  A caller supplies a
 logical request that is canonicalized and hashed before storage; raw bodies and
 secrets never reach the database.
 

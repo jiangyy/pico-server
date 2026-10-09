@@ -231,7 +231,9 @@ class BackfillCurrentVersionsTest(PlaygroundTest):
 
     def test_it_is_idempotent(self):
         self.unfilled("pg")
-        resolve = lambda playground_id: "a" * 40
+        def resolve(playground_id):
+            return "a" * 40
+
         self.assertEqual(playgrounds.backfill_current_versions(self.connection, resolve), 1)
         self.assertEqual(playgrounds.backfill_current_versions(self.connection, resolve), 0)
         self.assertEqual(self.stored("pg"), "a" * 40)

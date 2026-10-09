@@ -140,12 +140,12 @@ class IdempotencyTest(unittest.TestCase):
             {"name": "A"}, lambda conn: (201, {"endpoint": "playgrounds"}),
         )
         second = execute(
-            connection, "scope-1", "/submissions", "key-1",
-            {"name": "B"}, lambda conn: (201, {"endpoint": "submissions"}),
+            connection, "scope-1", "/publish", "key-1",
+            {"name": "B"}, lambda conn: (201, {"endpoint": "publish"}),
         )
 
         self.assertEqual(first, (201, {"endpoint": "playgrounds"}))
-        self.assertEqual(second, (201, {"endpoint": "submissions"}))
+        self.assertEqual(second, (201, {"endpoint": "publish"}))
         self.assertEqual(self.count(connection, "idempotency_results"), 2)
 
     def test_success_commits_business_row_and_result_together(self):

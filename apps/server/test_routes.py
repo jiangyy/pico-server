@@ -71,7 +71,7 @@ class VersionRouteMatchersTest(unittest.TestCase):
             f"/api/v1/playgrounds/pg/versions/{self.VERSION}",
             f"/api/v1/playgrounds/pg/versions/{self.VERSION}/manifest/extra",
             f"/api/v1/playgrounds/pg/commits/{self.VERSION}/manifest",
-            f"/api/v1/playgrounds/pg/versions//manifest",
+            "/api/v1/playgrounds/pg/versions//manifest",
             "/api/v1/playgrounds/pg/versions/manifest",
         ):
             self.assertIsNone(routes.match_manifest(path), path)
@@ -98,18 +98,6 @@ class VersionRouteMatchersTest(unittest.TestCase):
             self.assertIsNone(routes.match_version_files(path), path)
 
 
-class SubmissionMatcherTest(unittest.TestCase):
-    def test_only_a_single_opaque_segment_matches(self):
-        self.assertEqual(routes.match_submission("/api/v1/submissions/abc"), "abc")
-        for path in (
-            "/api/v1/submissions",
-            "/api/v1/submissions/",
-            "/api/v1/submissions/a/b",
-            "/api/v1/submission/abc",
-        ):
-            self.assertIsNone(routes.match_submission(path), path)
-
-
 class MethodTableTest(unittest.TestCase):
     VERSION = "a" * 40
 
@@ -117,10 +105,6 @@ class MethodTableTest(unittest.TestCase):
         table = {
             "/healthz": ("GET", "HEAD"),
             "/api/v1/catalog": ("GET", "HEAD"),
-            # One path, two audiences: the client hands work in here, the
-            # operator reads what was handed in.
-            "/api/v1/submissions": ("GET", "HEAD", "POST"),
-            "/api/v1/submissions/abc": ("GET", "HEAD"),
             "/api/v1/playgrounds": ("POST",),
             "/api/v1/playgrounds/pg": ("DELETE",),
             "/api/v1/playgrounds/pg/versions": ("POST",),
@@ -138,7 +122,7 @@ class MethodTableTest(unittest.TestCase):
         # The table's whole job: a caller learns the path exists but not like
         # this, instead of being told the path does not exist.
         self.assertIsNotNone(routes.allowed_methods("/api/v1/catalog"))
-        self.assertIsNotNone(routes.allowed_methods("/api/v1/submissions"))
+        self.assertIsNotNone(routes.allowed_methods("/api/v1/playgrounds"))
 
 
 if __name__ == "__main__":

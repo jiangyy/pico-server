@@ -2,14 +2,12 @@
 
 Two things live here.  Reads hand a client the published course content it
 asks for: the catalog, one commit's manifest and one file's exact bytes.
-Writes accept a bundle from the operator and a bounded
-submission from a client.  Everything a read needs is public, so the read path
-holds no session, no role, and no per-caller decision; every write is bounded
-and validated before it reaches the repository or the database.
+Writes accept a bundle from the operator.  Everything a read needs is public, so
+the read path holds no session, no role, and no per-caller decision; every write
+is bounded and validated before it reaches the repository or the database.
 """
 
 import hashlib
-import json
 import os
 from contextlib import closing
 from datetime import datetime, timezone
@@ -20,11 +18,9 @@ from urllib.parse import unquote, urlsplit
 import assignments as assignments_module
 import manifests
 import playgrounds as playgrounds_module
-import pagination
 import routes
 import uuid
 from api_handler import (
-    MAX_JSON_BODY_BYTES,
     MINIMUM_CLIENT_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
     ApiHandler,
@@ -61,7 +57,6 @@ from repository import (
     DEFAULT_REPOSITORY_PATH,
     CommitMetadata,
     RepositoryError,
-    commit_in_assignment_history,
     converge_assignment_ref,
     converge_history_ref,
     delete_pending_ref,
@@ -69,19 +64,6 @@ from repository import (
     prepare_assignment_version,
     publish_playground_prepare,
     valid_playground_id,
-)
-from submissions import (
-    backfill_submission_files as submissions_backfill,
-    create_if_absent as create_submission,
-    decode_delivery as decode_submission_delivery,
-    InvalidSubmissionRequestError,
-    MissingSubmissionError,
-    StoredSubmissionError,
-    get_submission,
-    list_submissions,
-    submission_ordinal,
-    submission_to_mapping,
-    write_submission_files,
 )
 
 
@@ -94,9 +76,6 @@ DATABASE_PATH = Path("data/app.db")
 STATIC_ROOT = Path("site")
 
 COURSE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable"
-
-#: The readable copy of each handed-in work lives here, beside the database.
-SUBMISSIONS_DIRECTORY_NAME = "submissions"
 
 
 # The idempotency scope of the single operator that publishes bundles, so the
@@ -218,12 +197,6 @@ class Handler(ApiHandler):
             self._get_version_file(
                 *routes.match_version_files(path), head_only=head_only
             )
-        elif path == routes.SUBMISSIONS_PATH:
-            self._get_submissions(head_only=head_only)
-        elif routes.match_submission(path) is not None:
-            self._get_submission(
-                routes.match_submission(path), head_only=head_only
-            )
         elif routes.allowed_methods(path) is not None:
             self._method_not_allowed(head_only=head_only)
         else:
@@ -240,114 +213,10 @@ class Handler(ApiHandler):
             self._post_restore(routes.match_playground_restore(path))
         elif routes.match_assignment_versions(path) is not None:
             self._post_assignment_versions(routes.match_assignment_versions(path))
-        elif path == routes.SUBMISSIONS_PATH:
-            self._post_submission()
         elif routes.allowed_methods(path) is not None:
             self._method_not_allowed()
         else:
             self._not_found()
-
-    def _post_submission(self):
-        """Accept one hand-in: ``CreateSubmission``.
-
-        The client names the delivery, so a lost response is retried with the
-        same ``submission_id`` and lands on the same row instead of a second
-        one. The row is the record; the readable folder beside the database is a
-        copy written after the transaction, so it can never make a stored
-        hand-in fail.
-
-        Refusals are stable codes rather than sentences: the caller turns them
-        into words for whoever handed the work in.
-        """
-
-        payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
-        if payload is None:
-            return
-
-        try:
-            delivery = decode_submission_delivery(payload)
-        except InvalidSubmissionRequestError:
-            self._api_error(400, "invalid_submission")
-            return
-
-        repository = self.server.repository
-        try:
-            with self._database() as connection:
-                refusal = self._submission_refusal(connection, repository, delivery)
-                if refusal is not None:
-                    status, code = refusal
-                    self._api_error(status, code)
-                    return
-
-                with immediate_transaction(connection):
-                    write = create_submission(connection, delivery)
-        except RepositoryError:
-            self._api_error(500, "internal_error")
-            return
-
-        if write.status == "conflict":
-            self._api_error(409, "submission_conflict")
-            return
-
-        self._write_submitted_work(delivery, write.created_at)
-        self._respond_json(
-            200 if write.status == "existing_same" else 201,
-            {
-                "status": write.status,
-                "submission": {
-                    "id": delivery.submission_id,
-                    "assignment_id": delivery.assignment_id,
-                    "version_id": delivery.version_id,
-                    "student": delivery.student,
-                    "created_at": write.created_at,
-                },
-            },
-        )
-
-    def _submission_refusal(self, connection, repository, delivery):
-        """``None`` when this hand-in may be stored, or ``(status, code)``.
-
-        A hand-in answers one Assignment, and the Version it names has to belong
-        to that Assignment's own history — a Version of a different Assignment,
-        or of a Playground, is not something a hand-in can be based on.
-        """
-
-        source = assignments_module.get_assignment(connection, delivery.assignment_id)
-        if source is None:
-            return 404, "invalid_version"
-        if source.state == "stopped":
-            return 409, "assignment_stopped"
-        known = commit_in_assignment_history(
-            repository, delivery.assignment_id, delivery.version_id
-        )
-        return None if known else (404, "invalid_version")
-
-    def _write_submitted_work(self, delivery, created_at):
-        """Write a folder per hand-in, for a human to open.
-
-        The row is the record and the folder is a copy of it, so this never runs
-        inside the transaction: an aborted delivery must not leave a folder
-        behind, and a folder must not be able to fail a stored hand-in. It runs
-        on a retry too, which is what makes a lost folder self-healing.
-        """
-
-        with self._database() as connection:
-            ordinal = submission_ordinal(
-                connection,
-                delivery.student,
-                delivery.submission_id,
-                created_at,
-            )
-            write_submission_files(
-                self.server.submissions_path,
-                delivery.submission_id,
-                delivery.student,
-                delivery.assignment_id,
-                delivery.version_id,
-                created_at,
-                dict(delivery.files),
-                ordinal,
-            )
 
     def _route_delete(self):
         path = urlsplit(self.path).path
@@ -391,9 +260,8 @@ class Handler(ApiHandler):
         """Take a Playground out of the catalog.
 
         Students stop seeing it on their next refresh; nothing else changes.
-        The database row stays (submissions keep a valid parent) and the
-        commits stay in the repository, so publishing the same id again
-        restores it. The playground is marked ``state = stopped``, and the Git
+        The database row stays and the commits stay in the repository, so
+        publishing the same id again restores it. The playground is marked ``state = stopped``, and the Git
         ref is left intact so history remains reachable — a client pinned to a
         Version can still read it.
 
@@ -947,59 +815,6 @@ class Handler(ApiHandler):
             "version_id": result.commit_id,
         }
 
-    def _get_submissions(self, head_only=False):
-        if not self._require_operator(head_only=head_only):
-            return
-
-        parsed = self._list_query(pagination.SUBMISSIONS_ROUTE, head_only)
-        if parsed is None:
-            return
-        limit, after = parsed
-
-        try:
-            with self._database() as connection:
-                page = list_submissions(connection, limit=limit, after=after)
-        except (InvalidSubmissionRequestError, StoredSubmissionError):
-            self._api_error(500, "internal_error", head_only=head_only)
-            return
-
-        self._respond_json(
-            200,
-            {
-                "submissions": [
-                    submission_to_mapping(item) for item in page.items
-                ],
-                "nextCursor": self._next_cursor(
-                    pagination.SUBMISSIONS_ROUTE, page.next_key
-                ),
-            },
-            head_only=head_only,
-        )
-
-    def _get_submission(self, submission_id, head_only=False):
-        if not self._require_operator(head_only=head_only):
-            return
-
-        try:
-            with self._database() as connection:
-                stored = get_submission(connection, submission_id)
-        except MissingSubmissionError:
-            self._api_error(404, "not_found", head_only=head_only)
-            return
-        except StoredSubmissionError:
-            self._api_error(500, "internal_error", head_only=head_only)
-            return
-
-        self._respond_json(
-            200,
-            {
-                "submission": submission_to_mapping(
-                    stored.submission, files=stored.files
-                )
-            },
-            head_only=head_only,
-        )
-
     @staticmethod
     def _playground_payload(playground):
         return {
@@ -1071,29 +886,18 @@ def make_server(
     port=PORT,
     database_path=DATABASE_PATH,
     repository_path=DEFAULT_REPOSITORY_PATH,
-    submissions_path=None,
     static_path=STATIC_ROOT,
     operator_token=None,
 ):
     """Return an initialized HTTP server bound to ``host:port``.
 
     ``static_path`` is the root the built site is served from.
-
-    ``submissions_path`` is where the readable copy of each handed-in work goes.
-    It defaults to a sibling of the database, so every deployment path stays
-    under one data directory; the directory is created lazily by the writer, so
-    a read-only or unused one never becomes a start-up failure.
     """
     operator_token = _validate_operator_token(operator_token)
 
     database_path = Path(database_path)
     database = open_database(database_path)
     database.close()
-
-    if submissions_path is None:
-        submissions_path = database_path.parent / SUBMISSIONS_DIRECTORY_NAME
-    else:
-        submissions_path = Path(submissions_path)
 
     repository_path = Path(repository_path)
     repository = open_repository(repository_path)
@@ -1112,9 +916,6 @@ def make_server(
                 repository, playground_id
             ),
         )
-        # Same idea for the readable copy of handed-in work: the row is the
-        # record, so a missing folder is written rather than reported.
-        submissions_backfill(connection, submissions_path)
         # A publish that was interrupted leaves a pending ref behind. Settle
         # every one of them before the first request: a pending ref that turned
         # out to be unaccepted must not stay reachable, and one that turned out
@@ -1125,7 +926,6 @@ def make_server(
     server.database_path = database_path
     server.repository_path = repository_path
     server.repository = repository
-    server.submissions_path = submissions_path
     # Resolved once: every static request checks its path against this root.
     server.static_path = Path(static_path).resolve()
     server.operator_token = operator_token

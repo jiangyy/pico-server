@@ -199,7 +199,7 @@ class AssignmentRecoveryTest(unittest.TestCase):
             message="Publish assignment",
         )
         # 一次没有被数据库接受的发布：只有 pending ref，什么都不该留下
-        dropped = repository.prepare_assignment_version(
+        repository.prepare_assignment_version(
             self.repository, "hw-1", b"# never\n", metadata, "publish-1"
         )
         dropped_count, converged = playgrounds.recover_pending_refs(

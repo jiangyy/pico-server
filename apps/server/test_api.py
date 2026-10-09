@@ -1,7 +1,7 @@
 """HTTP tests for the two functions this service has.
 
 Reads are anonymous: catalog, manifest and exact files.
-Writes are the operator's bundle upload and a client's bounded submission.
+Writes are the operator's bundle upload.
 Every test drives a real server over a real socket against a temporary data
 directory, so a passing test is evidence about the HTTP contract rather than
 about an in-process call.
@@ -16,7 +16,6 @@ import threading
 import os
 import sys
 import tempfile
-import threading
 import unittest
 import uuid
 import zipfile
@@ -247,53 +246,6 @@ class ServerTestCase(unittest.TestCase):
 
     def listed_assignment_ids(self):
         return [entry["assignment_id"] for entry in self.listed_assignments()]
-
-    def hand_in(
-        self,
-        assignment_id,
-        version_id,
-        header="# 姓名：2026-001",
-        files=None,
-        submission_id=None,
-    ):
-        """Hand one piece of work in through the client's one write path.
-
-        Returns ``{"status", "reason", "submission_id"}`` — the same shape a
-        caller asserts on whatever the outcome was: the endpoint answers a
-        stored hand-in with 2xx and a refusal with a stable code, and this
-        helper reads both into one vocabulary.
-        """
-
-        delivery_id = submission_id or uuid.uuid4().hex
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/submissions",
-            payload={
-                "submission_id": delivery_id,
-                "assignment_id": assignment_id,
-                "version_id": version_id,
-                "files": files if files is not None else {"work/main.py": f"{header}\nprint(1)\n"},
-            },
-        )
-        if status in (200, 201):
-            return {"status": body["status"], "reason": "", "submission_id": delivery_id}
-        return {
-            "status": "rejected",
-            "reason": body.get("code", ""),
-            "submission_id": delivery_id,
-        }
-
-    def stored_submissions(self, assignment_id):
-        status, _, body = self.request(
-            "GET", "/api/v1/submissions", token=OPERATOR_TOKEN
-        )
-        self.assertEqual(status, 200)
-        return [
-            entry
-            for entry in body["submissions"]
-            if entry["assignmentId"] == assignment_id
-        ]
-
 
 class DistributionTest(ServerTestCase):
     """What a client can read: the catalog, a manifest and exact bytes."""
@@ -1048,8 +1000,8 @@ class PublishTest(ServerTestCase):
 class RetiringTest(ServerTestCase):
     """Operator takes a course out of the catalog: students stop seeing it.
 
-    Archive is not a delete: the row, the commits and the submissions stay,
-    the Git ref stays reachable, and the catalog filters the playground out
+    Archive is not a delete: the row and the commits stay, the Git ref stays
+    reachable, and the catalog filters the playground out
     by ``state = stopped``. Re-archiving is a no-op; republishing an
     archived course is rejected.
     """
@@ -1099,116 +1051,11 @@ class RetiringTest(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "no_op")
 
-    def test_a_stopped_assignment_keeps_the_work_already_handed_in(self):
-        assignment_id, version_id = self.seed_assignment()
-        self.assertEqual(self.hand_in(assignment_id, version_id)["status"], "accepted")
-        (stored,) = self.stored_submissions(assignment_id)
-        submission_id = stored["id"]
-
-        status, _, _ = self.request(
-            "DELETE", f"/api/v1/assignments/{assignment_id}", token=OPERATOR_TOKEN
-        )
-        self.assertEqual(status, 200)
-
-        # The hand-in is still readable: 取消发布撤的是题目，不是已经交上来的作业。
-        status, _, body = self.request(
-            "GET", f"/api/v1/submissions/{submission_id}", token=OPERATOR_TOKEN
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(body["submission"]["assignmentId"], assignment_id)
-
-        # A new submission against a stopped assignment is refused.
-        result = self.hand_in(assignment_id, version_id)
-        self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["reason"], "assignment_stopped")
-
-
-class SubmissionTest(ServerTestCase):
-    """Submissions arrive through sync; the operator only reads them back."""
-
-    def test_the_operator_reads_the_submitted_files_back(self):
-        assignment_id, version_id = self.seed_assignment()
-        self.assertEqual(self.hand_in(assignment_id, version_id)["status"], "accepted")
-
-        (stored,) = self.stored_submissions(assignment_id)
-        status, _, body = self.request(
-            "GET",
-            f"/api/v1/submissions/{stored['id']}",
-            token=OPERATOR_TOKEN,
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(
-            body["submission"]["files"],
-            [{"path": "work/main.py", "text": "# 姓名：2026-001\nprint(1)\n"}],
-        )
-
-    def test_listing_submissions_requires_the_operator_token(self):
-        assignment_id, version_id = self.seed_assignment()
-        self.hand_in(assignment_id, version_id)
-
-        anonymous = self.request("GET", "/api/v1/submissions")
-        self.assertEqual(anonymous[0], 401)
-
-        listed = self.request("GET", "/api/v1/submissions", token=OPERATOR_TOKEN)
-        self.assertEqual(listed[0], 200)
-        self.assertGreaterEqual(len(listed[2]["submissions"]), 1)
-        for entry in listed[2]["submissions"]:
-            self.assertNotIn("files", entry)
-
-    def test_a_hand_in_records_the_exact_version_and_files(self):
-        assignment_id, version_id = self.seed_assignment()
-        self.hand_in(assignment_id, version_id)
-
-        (stored,) = self.stored_submissions(assignment_id)
-        self.assertEqual(stored["versionId"], version_id)
-        self.assertEqual(stored["assignmentId"], assignment_id)
-        self.assertEqual(stored["student"], "2026-001")
-
-    def test_the_same_delivery_name_twice_is_one_submission(self):
-        # 重发同一个名字（响应丢了、客户端重试）必须落回同一行：客户端拿到的是
-        # 同一个结果，服务端不会多出一份作业。
-        assignment_id, version_id = self.seed_assignment()
-        first = self.hand_in(assignment_id, version_id, submission_id="same-name")
-        second = self.hand_in(assignment_id, version_id, submission_id="same-name")
-
-        self.assertEqual(
-            [first["status"], second["status"]], ["accepted", "existing_same"]
-        )
-        self.assertEqual(len(self.stored_submissions(assignment_id)), 1)
-
-    def test_one_delivery_name_with_different_content_is_refused(self):
-        # 同一个名字配不同内容：这是两份不同的作业抢一个名字，不是重试。什么都不写，
-        # 而且重发也没用（所以是稳定的拒绝码，不是"再试一次"）。
-        assignment_id, version_id = self.seed_assignment()
-        self.hand_in(assignment_id, version_id, submission_id="collision")
-        again = self.hand_in(
-            assignment_id,
-            version_id,
-            header="# 姓名：另一个学生",
-            files={"work/main.py": "# 姓名：另一个学生\nprint(2)\n"},
-            submission_id="collision",
-        )
-
-        self.assertEqual(again["status"], "rejected")
-        self.assertEqual(again["reason"], "submission_conflict")
-        (stored,) = self.stored_submissions(assignment_id)
-        self.assertEqual(stored["student"], "2026-001", "先到的那份没被改写")
-
-    def test_a_hand_in_without_an_attribution_is_refused(self):
-        # The name lives in the hand-in's own header, so an empty file set
-        # carries none and cannot be filed under anyone.
-        assignment_id, version_id = self.seed_assignment()
-        result = self.hand_in(assignment_id, version_id, files={})
-        self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["reason"], "invalid_submission")
-        self.assertEqual(self.stored_submissions(assignment_id), [])
-
-
 class ProtocolVersionTest(ServerTestCase):
     """Requests must say which protocol they speak."""
 
     def test_a_request_without_the_header_is_refused(self):
-        for path in ("/api/v1/catalog", "/api/v1/submissions"):
+        for path in ("/api/v1/catalog", "/api/v1/playgrounds"):
             with self.subTest(path=path):
                 status, _, body = self.request(
                     "GET", path, extra_headers={"X-Protocol-Version": ""}
@@ -1364,120 +1211,6 @@ class AssignmentTest(ServerTestCase):
         self.assertNotIn(stopped, ids)
         self.assertIn(kept, ids)
 
-class SubmittedWorkOnDiskTest(ServerTestCase):
-    """交上来的作业在磁盘上是一份人能直接打开的东西。
-
-    行是记录，文件夹是给老师看的那份副本。学生名是这条路径上唯一来自请求的
-    部分，所以这里既验证老师会读到的布局，也验证一个恶意名字做不到什么。
-    """
-
-    def root(self):
-        return Path(self.server.submissions_path)
-
-    def hand_in(self, student, files=None, assignment=None):
-        # 每个用例一道新作业：`ServerTestCase` 共享一个库，同名 id 会撞幂等键。
-        assignment_id, version_id = self.seed_assignment(assignment)
-        text = files or {"work/main.py": f"# 姓名：{student}\nprint(1)\n"}
-        result = self.hand_in_event(assignment_id, version_id, text)
-        return assignment_id, version_id, result
-
-    def hand_in_event(self, assignment_id, version_id, files, submission_id=None):
-        """One hand-in, exactly as the endpoint receives it."""
-
-        status, _, body = self.request(
-            "POST",
-            "/api/v1/submissions",
-            payload={
-                "submission_id": submission_id or uuid.uuid4().hex,
-                "assignment_id": assignment_id,
-                "version_id": version_id,
-                "files": files,
-            },
-        )
-        if status in (200, 201):
-            return {"status": body["status"], "reason": "", "submission_id": body["submission"]["id"]}
-        return {"status": "rejected", "reason": body.get("code", ""), "submission_id": submission_id}
-
-    def test_an_accepted_hand_in_lands_in_a_folder(self):
-        assignment_id, version_id, result = self.hand_in("张三（1 班）")
-        self.assertEqual(result["status"], "accepted")
-
-        folder = self.root() / "1 班" / "张三" / assignment_id
-        self.assertTrue(folder.is_dir(), f"没有这个目录：{folder}")
-        self.assertEqual(
-            (folder / "work" / "main.py").read_text(encoding="utf-8"),
-            "# 姓名：张三（1 班）\nprint(1)\n",
-        )
-
-        # 文件夹里还有一张条，说明这份是谁的、基于哪个版本
-        manifest = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["student"], "张三（1 班）")
-        self.assertEqual(manifest["versionId"], version_id)
-        self.assertEqual(manifest["assignmentId"], assignment_id)
-        self.assertEqual(manifest["files"], ["work/main.py"])
-
-    def test_a_second_hand_in_of_the_same_assignment_is_numbered(self):
-        assignment_id, version_id = self.seed_assignment()
-        first = self.hand_in_event(assignment_id, version_id, {"work/main.py": "# 姓名：李四\nprint(1)\n"})
-        second = self.hand_in_event(assignment_id, version_id, {"work/main.py": "# 姓名：李四\nprint(2)\n"})
-        self.assertEqual([first["status"], second["status"]], ["accepted", "accepted"])
-
-        base = self.root() / "李四"
-        self.assertEqual(sorted(p.name for p in base.iterdir()), [assignment_id, f"{assignment_id}-2"])
-        self.assertEqual(
-            (base / f"{assignment_id}-2" / "work" / "main.py").read_text(encoding="utf-8"),
-            "# 姓名：李四\nprint(2)\n",
-        )
-
-    def test_a_replay_repaints_the_same_folder(self):
-        # 响应丢了、客户端原样重试：同一个 delivery 名字，落回同一行、同一个文件夹，
-        # 不会多出一个编号目录。
-        assignment_id, version_id = self.seed_assignment()
-        files = {"work/main.py": "# 姓名：王五\nprint(1)\n"}
-
-        first = self.hand_in_event(assignment_id, version_id, files, submission_id="disk-replay-1")
-        second = self.hand_in_event(assignment_id, version_id, files, submission_id="disk-replay-1")
-        self.assertEqual(
-            [first["status"], second["status"]], ["accepted", "existing_same"]
-        )
-
-        base = self.root() / "王五"
-        self.assertEqual([p.name for p in base.iterdir()], [assignment_id])
-
-    def test_a_rejected_hand_in_writes_nothing(self):
-        assignment_id, version_id = self.seed_assignment()
-        result = self.hand_in_event(assignment_id, version_id, {"course/index.html": "x"})
-        self.assertEqual(result["status"], "rejected")
-        # 只有目录被建出来（或根本没有），不该有内容
-        for path in self.root().rglob("*") if self.root().exists() else []:
-            self.assertNotIn("course", path.parts)
-
-    def test_a_hostile_student_name_stays_inside_the_root(self):
-        assignment_id, version_id = self.seed_assignment()
-        result = self.hand_in_event(
-            assignment_id,
-            version_id,
-            {"work/main.py": "# 姓名：../../etc/passwd 班级：../../..\nprint(1)\n"},
-        )
-        self.assertEqual(result["status"], "accepted")
-
-        root = self.root()
-        created = list(root.rglob("*"))
-        self.assertTrue(created)
-        for path in created:
-            self.assertIn(root, path.parents)
-            self.assertNotIn("..", path.relative_to(root).parts)
-        self.assertFalse((root.parent.parent / "etc").exists())
-
-    def test_the_folder_is_not_world_readable(self):
-        # 独立的姓名：同一个人同一门课再交一次会被编号成 `-2`，那是另一条用例在测的
-        # 行为，不该在这里悄悄影响路径。
-        assignment_id, _, _ = self.hand_in("权限（9 班）")
-        folder = self.root() / "9 班" / "权限" / assignment_id
-        mode = folder.stat().st_mode & 0o777
-        self.assertEqual(mode & 0o077, 0, f"目录权限 {oct(mode)} 对同组/其他用户开放了")
-
-
 class ConditionalReadTest(ServerTestCase):
     """`If-None-Match` on the byte routes.
 
@@ -1534,22 +1267,26 @@ class OperatorTokenShapeTest(ServerTestCase):
     """
 
     def header(self, value):
+        # A body-less operator route: a real token gets past the check and lands
+        # on the unknown-playground 404, so the token alone decides the status.
         return self.request(
-            "GET", "/api/v1/submissions", extra_headers={"Authorization": value}
+            "DELETE",
+            "/api/v1/playgrounds/never-published",
+            extra_headers={"Authorization": value},
         )
 
     def test_a_well_formed_header_is_accepted(self):
-        self.assertEqual(self.header(f"Bearer {OPERATOR_TOKEN}")[0], 200)
+        self.assertEqual(self.header(f"Bearer {OPERATOR_TOKEN}")[0], 404)
         # The scheme is case-insensitive by RFC 7235.
-        self.assertEqual(self.header(f"bearer {OPERATOR_TOKEN}")[0], 200)
-        self.assertEqual(self.header(f"BEARER {OPERATOR_TOKEN}")[0], 200)
+        self.assertEqual(self.header(f"bearer {OPERATOR_TOKEN}")[0], 404)
+        self.assertEqual(self.header(f"BEARER {OPERATOR_TOKEN}")[0], 404)
 
     def test_a_malformed_header_is_not(self):
         for value in (
             "",
             OPERATOR_TOKEN,                     # no scheme
             f"Basic {OPERATOR_TOKEN}",          # wrong scheme
-            f"Bearer",                          # no token
+            "Bearer",                           # no token
             f"Bearer  {OPERATOR_TOKEN}",        # two spaces: the token would be empty
             f"Bearer {OPERATOR_TOKEN} extra",   # trailing material
         ):

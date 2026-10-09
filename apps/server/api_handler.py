@@ -6,7 +6,7 @@ non-2xx means, refusing a request whose protocol version this server cannot
 serve, holding the operator token, and keeping every request on its own database
 connection.
 
-It knows nothing about Playgrounds, bundles, Git or submissions — those live in
+It knows nothing about Playgrounds, bundles or Git — those live in
 `server.py` and the domain modules — so everything here can be understood from
 its shape alone, and an endpoint cannot reach storage through it by accident.
 """
@@ -19,12 +19,11 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import unquote, urlsplit
 
-import pagination
 from database import open_database
 from idempotency import MAX_REQUEST_KEY_LENGTH
 
-#: A JSON request body (a publish sends a ZIP; a submission body is bounded
-#: larger in `server.py`); anything bigger is refused before it is read.
+#: A JSON request body (a publish sends a ZIP, not JSON); anything bigger is
+#: refused before it is read.
 MAX_JSON_BODY_BYTES = 16 * 1024
 
 # the publish request is `{playground_id, base_version_id?, bundle}`:
@@ -205,23 +204,6 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _database(self):
         return closing(open_database(self.server.database_path))
-
-    def _list_query(self, route, head_only=False):
-        """Parse the common ``limit``/``cursor`` query or answer 400."""
-
-        try:
-            return pagination.parse_pagination(
-                urlsplit(self.path).query, route
-            )
-        except pagination.PaginationError:
-            self._api_error(400, "invalid_request", head_only=head_only)
-            return None
-
-    @staticmethod
-    def _next_cursor(route, next_key):
-        if next_key is None:
-            return None
-        return pagination.encode_cursor(route, next_key)
 
     def _not_found(self, head_only=False):
         if urlsplit(self.path).path.startswith("/api/"):
