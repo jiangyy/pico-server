@@ -121,10 +121,15 @@ def _bindings_enforcement(tmp: Path) -> None:
         )
         _expect(status == 200, f"bound head returned {status}")
 
-        status, _, body = _get(
+        status, _, _ = _get(
             f"{base_url}/api/v1/replica/logs/mirror/head", headers=auth,
         )
-        _expect(status == 403, f"mirror log must reject head, got {status}")
+        _expect(status == 200, f"append-bound head returned {status}")
+
+        status, _, body = _get(
+            f"{base_url}/api/v1/replica/logs/mirror/records", headers=auth,
+        )
+        _expect(status == 403, f"append-bound log must reject reads, got {status}")
         payload = json.loads(body.decode("utf-8"))
         _expect(payload["error"]["code"] == "capability.denied",
                 f"expected capability.denied, got {payload['error']['code']}")

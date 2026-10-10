@@ -328,6 +328,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                 pass
             else:
                 return (405, "method.not_allowed", "method not allowed")
+            if access == "append" and action in ("head", "has"):
+                return None
             if access != "read":
                 return (403, "capability.denied", f"Log {log_id} is not readable")
             return None
