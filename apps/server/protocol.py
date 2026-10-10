@@ -20,6 +20,8 @@ from picopg.api import (
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGE_RECORDS = 128
+PROTOCOL_VERSION = 1
+HANDSHAKE_CAPABILITIES = ("replicate",)
 logger = logging.getLogger("picopg.server")
 
 
@@ -58,6 +60,19 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             url = urlsplit(self.path)
             if url.path == "/healthz" and self.command in ("GET", "HEAD"):
                 self._send_json(200, {"status": "ok"})
+                return
+            if url.path == "/api/v1/replica/handshake":
+                if self.command != "GET":
+                    self._error(405, "method.not_allowed", "method not allowed")
+                    return
+                self._send_json(
+                    200,
+                    {
+                        "protocol": PROTOCOL_VERSION,
+                        "server": "picopg-server",
+                        "capabilities": list(HANDSHAKE_CAPABILITIES),
+                    },
+                )
                 return
             route = _route(url.path)
             if route is None:
