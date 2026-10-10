@@ -18,7 +18,6 @@ src/picopg/api/replica_log.py       Position、Record、Page、Store port
 src/picopg/impl/file_replica_log.py 原子文件持久化
 apps/server/protocol.py             HTTP RemotePeer adapter
 apps/server/main.py                 组装和进程生命周期
-tests/                              store contract 与 HTTP 集成测试
 ~~~
 
 ## HTTP
@@ -62,15 +61,6 @@ PYTHONPATH=src python3 apps/server/main.py \
 ~~~
 
 Token 优先读取 PICOPG_REPLICA_TOKEN，其次是 --token；两者都没有时生成 data/replica.token，权限为 0600。
-
-## 测试
-
-~~~bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
-  python3 -m unittest discover -s tests -v
-
-RUFF_CACHE_DIR=/tmp/picopg-ruff-cache ruff check src apps tests
-~~~
 
 ## 当前不包含
 
