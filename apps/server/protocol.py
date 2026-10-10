@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+from collections.abc import Iterable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -24,6 +25,10 @@ PROTOCOL_VERSION = 1
 HANDSHAKE_CAPABILITIES = ("replicate",)
 logger = logging.getLogger("picopg.server")
 
+LogAccess = str
+LogBinding = tuple[str, LogAccess]
+_READ_ACTIONS = {"head", "records", "has"}
+
 
 class ReplicaHttpServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -33,14 +38,33 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         address: tuple[str, int],
         store: ReplicaLogStore,
         token: str,
+        bindings: Iterable[LogBinding] | None = None,
     ) -> None:
         if not token:
             raise ValueError("replica token must be non-empty")
-        # shortcut: one trusted participant shares this token; provision
-        # per-Log capabilities before accepting mutually untrusted clients.
         self.store = store
         self.replica_token = token
+        self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
         super().__init__(address, ReplicaRequestHandler)
+
+    @staticmethod
+    def _compile_bindings(
+        bindings: Iterable[LogBinding] | None,
+    ) -> Mapping[str, LogAccess]:
+        if bindings is None:
+            return {}
+        compiled: dict[str, LogAccess] = {}
+        for log_id, access in bindings:
+            if not isinstance(log_id, str) or not log_id:
+                raise ValueError("binding logId must be a non-empty string")
+            if access not in ("push", "pull"):
+                raise ValueError(
+                    f"binding access for {log_id!r} must be 'push' or 'pull', got {access!r}"
+                )
+            if log_id in compiled:
+                raise ValueError(f"duplicate binding for {log_id!r}")
+            compiled[log_id] = access
+        return compiled
 
 
 class ReplicaRequestHandler(BaseHTTPRequestHandler):
@@ -82,6 +106,10 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                 self._error(401, "auth.required", "valid bearer token required")
                 return
             log_id, action, record_id = route
+            error = self._authorize(log_id, action, self.command)
+            if error is not None:
+                self._error(error[0], error[1], error[2])
+                return
             if action == "head" and self.command == "GET":
                 head = self.server.store.head(log_id)
                 self._send_json(
@@ -204,6 +232,30 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         expected = f"Bearer {self.server.replica_token}"
         actual = self.headers.get("Authorization", "")
         return hmac.compare_digest(actual, expected)
+
+    def _authorize(
+        self, log_id: str, action: str, method: str
+    ) -> tuple[int, str, str] | None:
+        access = self.server.bindings.get(log_id)
+        if access is None:
+            return (403, "log.not_exposed", f"Log {log_id} is not exposed")
+        if method == "POST":
+            if action != "records":
+                return (405, "method.not_allowed", "method not allowed")
+            if access != "pull":
+                return (403, "capability.denied", f"Log {log_id} does not accept pushes")
+            return None
+        if method in ("GET", "HEAD"):
+            if action == "records" and method == "GET":
+                pass
+            elif action in _READ_ACTIONS:
+                pass
+            else:
+                return (405, "method.not_allowed", "method not allowed")
+            if access != "push":
+                return (403, "capability.denied", f"Log {log_id} is not readable")
+            return None
+        return (405, "method.not_allowed", "method not allowed")
 
     def _send_json(self, status: int, value: object) -> None:
         body = json.dumps(

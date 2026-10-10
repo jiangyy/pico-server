@@ -26,7 +26,59 @@ def build_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--data", type=Path, default=Path("data"))
     parser.add_argument("--token")
+    parser.add_argument(
+        "--binding",
+        action="append",
+        default=[],
+        metavar="LOG_ID=ACCESS",
+        help="Expose LOG_ID with ACCESS in {push, pull}; repeat per Log.",
+    )
+    parser.add_argument(
+        "--binding-config",
+        type=Path,
+        help="Path to a JSON file of [[logId, access], ...] bindings.",
+    )
     return parser.parse_args(argv)
+
+
+def _parse_pair(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise ValueError(f"--binding expects LOG_ID=ACCESS, got {value!r}")
+    log_id, _, access = value.partition("=")
+    log_id = log_id.strip()
+    access = access.strip()
+    if not log_id:
+        raise ValueError(f"--binding expects non-empty logId in {value!r}")
+    if access not in ("push", "pull"):
+        raise ValueError(
+            f"--binding access for {log_id!r} must be 'push' or 'pull', got {access!r}"
+        )
+    return log_id, access
+
+
+def load_bindings(
+    pairs: list[str], config_path: Path | None
+) -> list[tuple[str, str]]:
+    bindings = [_parse_pair(item) for item in pairs]
+    if config_path is None:
+        return bindings
+    import json
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("binding config must be a JSON array of [logId, access] pairs")
+    for entry in raw:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not entry[0]
+            or entry[1] not in ("push", "pull")
+        ):
+            raise ValueError(
+                f"binding config entry must be [logId, 'push'|'pull'], got {entry!r}"
+            )
+        bindings.append((entry[0], entry[1]))
+    return bindings
 
 
 def load_token(data_dir: Path, argument: str | None) -> str:
@@ -58,9 +110,10 @@ def build_server(
     host: str = "127.0.0.1",
     port: int = 8001,
     token: str,
+    bindings: list[tuple[str, str]] | None = None,
 ) -> ReplicaHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
-    return ReplicaHttpServer((host, port), store, token)
+    return ReplicaHttpServer((host, port), store, token, bindings=bindings)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,14 +123,27 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     token = load_token(arguments.data, arguments.token)
+    try:
+        bindings = load_bindings(arguments.binding, arguments.binding_config)
+    except ValueError as error:
+        logger.error("invalid binding configuration: %s", error)
+        return 2
+    if not bindings:
+        logger.warning(
+            "no bindings configured; the server will reject every replica request"
+        )
     server = build_server(
         arguments.data,
         host=arguments.host,
         port=arguments.port,
         token=token,
+        bindings=bindings,
     )
     host, port = server.server_address
-    logger.info("replica server listening on http://%s:%s", host, port)
+    logger.info(
+        "replica server listening on http://%s:%s with %d Log binding(s)",
+        host, port, len(bindings),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
