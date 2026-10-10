@@ -5,9 +5,9 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from apps.server.playgrounds import (
-    MAX_ARCHIVE_BYTES,
     PLAYGROUND_RELEASES_LOG_ID,
     FilePackageStore,
+    PackageAdapter,
     PackageError,
     PackageNotFound,
     PlaygroundPublisher,
@@ -24,6 +24,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         token: str,
         package_root: Path,
         bindings: Iterable[LogBinding] | None = None,
+        package_adapter: PackageAdapter | None = None,
     ) -> None:
         exposed = list(bindings or ())
         release_access = next(
@@ -47,7 +48,9 @@ class PicoPGHttpServer(ReplicaHttpServer):
             bindings=exposed,
             handler_class=PicoRequestHandler,
         )
-        self.playgrounds = PlaygroundPublisher(self, FilePackageStore(package_root))
+        self.playgrounds = PlaygroundPublisher(
+            self, FilePackageStore(package_root), package_adapter
+        )
 
 
 class PicoRequestHandler(ReplicaRequestHandler):
@@ -122,8 +125,8 @@ class PicoRequestHandler(ReplicaRequestHandler):
             raise PackageError("content-length is invalid") from error
         if length < 0:
             raise PackageError("content-length is invalid")
-        if length > MAX_ARCHIVE_BYTES:
-            self._error(413, "package.too_large", "package is larger than 10 MiB")
+        if length > self.server.playgrounds.max_package_bytes:
+            self._error(413, "package.too_large", "package is too large")
             raise _PackageResponseSent()
         payload = self.rfile.read(length)
         if len(payload) != length:

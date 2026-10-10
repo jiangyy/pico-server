@@ -20,7 +20,12 @@ for _entry in (_ROOT, _SRC):
         sys.path.insert(0, str(_entry))
 
 from apps.server.main import build_server  # noqa: E402
-from apps.server.playgrounds import PLAYGROUND_RELEASES_LOG_ID  # noqa: E402
+from apps.server.application import PicoPGHttpServer  # noqa: E402
+from apps.server.playgrounds import (  # noqa: E402
+    PLAYGROUND_RELEASES_LOG_ID,
+    PackageInfo,
+)
+from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
 def _package(title: str, course: str = "course") -> bytes:
@@ -63,7 +68,48 @@ def _expect(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _replaceable_package_format(root: Path) -> None:
+    class FuturePackageAdapter:
+        media_type = "application/x-pico"
+        max_bytes = 64
+
+        def inspect(self, payload: bytes) -> PackageInfo:
+            if payload != b"future-package":
+                raise AssertionError("adapter received different bytes")
+            return PackageInfo(self.media_type, "Future")
+
+    server = PicoPGHttpServer(
+        ("127.0.0.1", 0),
+        FileReplicaLogStore(root / "replica"),
+        "secret",
+        root / "packages",
+        package_adapter=FuturePackageAdapter(),
+    )
+    try:
+        result = server.playgrounds.publish(
+            "future", None, "application/x-pico", b"future-package"
+        )
+        _expect(result.status == "accepted", "replacement adapter did not publish")
+        release = server.playgrounds.catalog()[0]
+        _expect(
+            release.media_type == "application/x-pico",
+            "replacement media type did not reach the release",
+        )
+        media_type, payload = server.playgrounds.package(
+            "future", result.version_id
+        )
+        _expect(
+            media_type == "application/x-pico" and payload == b"future-package",
+            "replacement package could not be read",
+        )
+    finally:
+        server.server_close()
+
+
 def main() -> int:
+    with tempfile.TemporaryDirectory() as raw_dir:
+        _replaceable_package_format(Path(raw_dir))
+
     with tempfile.TemporaryDirectory() as raw_dir:
         root = Path(raw_dir)
         server = build_server(root, port=0, token="secret")
@@ -166,7 +212,7 @@ def main() -> int:
         finally:
             restarted.server_close()
 
-    print("playground validation, publish, conflict, download and restart passed")
+    print("playground format seam, validation, publish, conflict, download and restart passed")
     return 0
 
 

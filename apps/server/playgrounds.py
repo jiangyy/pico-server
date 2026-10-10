@@ -52,6 +52,7 @@ class PackageInfo:
 
 class PackageAdapter(Protocol):
     media_type: str
+    max_bytes: int
 
     def inspect(self, payload: bytes) -> PackageInfo: ...
 
@@ -93,6 +94,7 @@ class PublishResult:
 
 class ZipPackageAdapter:
     media_type = ZIP_MEDIA_TYPE
+    max_bytes = MAX_ARCHIVE_BYTES
 
     def inspect(self, payload: bytes) -> PackageInfo:
         if len(payload) > MAX_ARCHIVE_BYTES:
@@ -210,6 +212,10 @@ class PlaygroundPublisher:
         self._packages = packages
         self._adapter = adapter or ZipPackageAdapter()
         self._lock = threading.Lock()
+
+    @property
+    def max_package_bytes(self) -> int:
+        return self._adapter.max_bytes
 
     def catalog(self) -> tuple[PlaygroundRelease, ...]:
         current: dict[str, PlaygroundRelease] = {}
