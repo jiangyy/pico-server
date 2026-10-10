@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import stat
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from apps.server.main import build_server
+from apps.server.main import build_server, load_token
+from apps.server.protocol import MAX_BODY_BYTES
 from picopg.api import Position, ReplicatedRecord
 
 
@@ -195,6 +199,35 @@ class ReplicaServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertIsNone(json.loads(body)["head"])
+
+    def test_oversized_body_has_one_stable_response(self) -> None:
+        connection = http.client.HTTPConnection(self.address, timeout=5)
+        connection.putrequest(
+            "POST", "/api/v1/replica/logs/work/records"
+        )
+        connection.putheader("Authorization", f"Bearer {TOKEN}")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(MAX_BODY_BYTES + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 413)
+        self.assertEqual(body["error"]["code"], "request.too_large")
+
+
+class TokenTests(unittest.TestCase):
+    def test_generated_token_is_private_and_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {"PICOPG_REPLICA_TOKEN": ""}):
+                first = load_token(root, None)
+                second = load_token(root, None)
+            self.assertEqual(first, second)
+            self.assertEqual(
+                stat.S_IMODE((root / "replica.token").stat().st_mode),
+                0o600,
+            )
 
 
 if __name__ == "__main__":
