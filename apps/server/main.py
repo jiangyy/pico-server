@@ -13,7 +13,7 @@ for _entry in (_ROOT, _SRC):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
-from apps.server.protocol import ReplicaHttpServer  # noqa: E402
+from apps.server.application import PicoPGHttpServer  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
@@ -111,9 +111,15 @@ def build_server(
     port: int = 8001,
     token: str,
     bindings: list[tuple[str, str]] | None = None,
-) -> ReplicaHttpServer:
+) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
-    return ReplicaHttpServer((host, port), store, token, bindings=bindings)
+    return PicoPGHttpServer(
+        (host, port),
+        store,
+        token,
+        data_dir / "packages",
+        bindings=bindings,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,10 +134,6 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         logger.error("invalid binding configuration: %s", error)
         return 2
-    if not bindings:
-        logger.warning(
-            "no bindings configured; the server will reject every replica request"
-        )
     server = build_server(
         arguments.data,
         host=arguments.host,
@@ -142,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     host, port = server.server_address
     logger.info(
         "replica server listening on http://%s:%s with %d Log binding(s)",
-        host, port, len(bindings),
+        host, port, len(server.bindings),
     )
     try:
         server.serve_forever()

@@ -61,6 +61,7 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         store: ReplicaLogStore,
         token: str,
         bindings: Iterable[LogBinding] | None = None,
+        handler_class: type[BaseHTTPRequestHandler] | None = None,
     ) -> None:
         if not token:
             raise ValueError("replica token must be non-empty")
@@ -69,7 +70,7 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
         self._subscriber_lock = threading.Lock()
         self._subscribers: list[queue.Queue[str]] = []
-        super().__init__(address, ReplicaRequestHandler)
+        super().__init__(address, handler_class or ReplicaRequestHandler)
 
     def broadcast(self, log_id: str, head: "Position | None") -> None:
         event = json.dumps(
