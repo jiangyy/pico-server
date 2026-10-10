@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/picopg
-ExecStart=/usr/bin/python3 %h/picopg/apps/server/server.py
+ExecStart=/usr/bin/python3 %h/picopg/apps/server/main.py --host 127.0.0.1 --port 8001 --data %h/picopg/data
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
