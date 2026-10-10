@@ -15,7 +15,13 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 from uuid import uuid4
 
-from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
+from picopg.api import (
+    AppendResult,
+    Position,
+    ReplicaLogStore,
+    ReplicatedRecord,
+    record_id_of,
+)
 
 
 PLAYGROUND_RELEASES_LOG_ID = "playground-releases"
@@ -48,6 +54,17 @@ class PackageAdapter(Protocol):
     media_type: str
 
     def inspect(self, payload: bytes) -> PackageInfo: ...
+
+
+class PublishServer(Protocol):
+    store: ReplicaLogStore
+
+    def append_and_broadcast(
+        self,
+        log_id: str,
+        expected_head: Position | None,
+        records: tuple[ReplicatedRecord, ...],
+    ) -> AppendResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,12 +201,12 @@ class FilePackageStore:
 class PlaygroundPublisher:
     def __init__(
         self,
-        server: object,
+        server: PublishServer,
         packages: FilePackageStore,
         adapter: PackageAdapter | None = None,
     ) -> None:
         self._server = server
-        self._store: ReplicaLogStore = server.store  # type: ignore[attr-defined]
+        self._store = server.store
         self._packages = packages
         self._adapter = adapter or ZipPackageAdapter()
         self._lock = threading.Lock()
@@ -245,7 +262,7 @@ class PlaygroundPublisher:
                 requires=(),
                 data=data,
             )
-            result = self._server.append_and_broadcast(  # type: ignore[attr-defined]
+            result = self._server.append_and_broadcast(
                 PLAYGROUND_RELEASES_LOG_ID, parent, (record,)
             )
             if result.kind != "accepted":
