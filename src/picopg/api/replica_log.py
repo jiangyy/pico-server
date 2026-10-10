@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -16,6 +18,8 @@ JsonValue: TypeAlias = (
     | tuple["JsonValue", ...]
     | Mapping[str, "JsonValue"]
 )
+
+_HASH_PREFIX = "sha256:"
 
 
 class ReplicaLogError(Exception):
@@ -64,6 +68,60 @@ def _freeze_json(value: object, seen: set[int] | None = None) -> JsonValue:
         seen.remove(id(value))
 
 
+def _size(value: int) -> bytes:
+    if not 0 <= value <= 0xFFFF_FFFF:
+        raise InvalidReplicaData("value is too large")
+    return struct.pack(">I", value)
+
+
+def _raw(value: bytes) -> bytes:
+    return _size(len(value)) + value
+
+
+def _text(value: str) -> bytes:
+    return _raw(value.encode("utf-8"))
+
+
+def _value_bytes(value: JsonValue) -> bytes:
+    if value is None:
+        return b"\x00"
+    if value is False:
+        return b"\x01"
+    if value is True:
+        return b"\x02"
+    if type(value) in (int, float):
+        number = float(value)
+        if not math.isfinite(number):
+            raise InvalidReplicaData("data must contain only finite numbers")
+        return b"\x03" + _raw(struct.pack(">d", number))
+    if isinstance(value, str):
+        return b"\x04" + _text(value)
+    if isinstance(value, tuple):
+        return b"\x05" + _size(len(value)) + b"".join(
+            _value_bytes(item) for item in value
+        )
+    entries = sorted(
+        ((key.encode("utf-8"), item) for key, item in value.items()),
+        key=lambda entry: entry[0],
+    )
+    return b"\x06" + _size(len(entries)) + b"".join(
+        _raw(key) + _value_bytes(item) for key, item in entries
+    )
+
+
+def _position_bytes(position: "Position | None") -> bytes:
+    if position is None:
+        return b"\x00"
+    return b"\x01" + _text(position.log_id) + _text(position.record_id)
+
+
+def valid_object_id(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith(_HASH_PREFIX):
+        return False
+    digest = value[len(_HASH_PREFIX) :]
+    return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
+
+
 def plain_json(value: JsonValue) -> object:
     if isinstance(value, Mapping):
         return {key: plain_json(item) for key, item in value.items()}
@@ -105,6 +163,7 @@ class ReplicatedRecord:
     log_id: str
     parent: Position | None
     requires: tuple[Position, ...]
+    objects: tuple[str, ...]
     data: JsonValue
 
     def __post_init__(self) -> None:
@@ -121,7 +180,15 @@ class ReplicatedRecord:
             raise InvalidReplicaData("record.requires must be Positions")
         if any(item.log_id == self.log_id for item in self.requires):
             raise InvalidReplicaData("same-Log causality must use parent")
+        if type(self.objects) is not tuple or any(
+            not valid_object_id(item) for item in self.objects
+        ):
+            raise InvalidReplicaData("record.objects must contain ObjectIds")
         object.__setattr__(self, "data", _freeze_json(self.data))
+        if self.id != record_id_of(
+            self.log_id, self.parent, self.requires, self.objects, self.data
+        ):
+            raise InvalidReplicaData("record identity does not match its content")
 
     @property
     def position(self) -> Position:
@@ -131,7 +198,7 @@ class ReplicatedRecord:
     def from_value(
         cls, value: object, *, log_id: str | None = None
     ) -> "ReplicatedRecord":
-        fields = {"id", "logId", "parent", "requires", "data"}
+        fields = {"id", "logId", "parent", "requires", "objects", "data"}
         if not isinstance(value, dict) or set(value) != fields:
             raise InvalidReplicaData("record shape is invalid")
         actual_log_id = _non_empty(value["logId"], "record.logId")
@@ -146,11 +213,15 @@ class ReplicatedRecord:
         requires_value = value["requires"]
         if not isinstance(requires_value, list):
             raise InvalidReplicaData("record.requires must be an array")
+        objects_value = value["objects"]
+        if not isinstance(objects_value, list):
+            raise InvalidReplicaData("record.objects must be an array")
         return cls(
             id=_non_empty(value["id"], "record.id"),
             log_id=actual_log_id,
             parent=parent,
             requires=tuple(Position.from_value(item) for item in requires_value),
+            objects=tuple(objects_value),
             data=value["data"],
         )
 
@@ -160,8 +231,31 @@ class ReplicatedRecord:
             "logId": self.log_id,
             "parent": None if self.parent is None else self.parent.to_value(),
             "requires": [item.to_value() for item in self.requires],
+            "objects": list(self.objects),
             "data": plain_json(self.data),
         }
+
+
+def record_id_of(
+    log_id: str,
+    parent: Position | None,
+    requires: tuple[Position, ...],
+    objects: tuple[str, ...],
+    data: JsonValue,
+) -> str:
+    payload = b"".join(
+        (
+            _text("pico.replica.record.v1"),
+            _text(log_id),
+            _position_bytes(parent),
+            _size(len(requires)),
+            *(_position_bytes(item) for item in requires),
+            _size(len(objects)),
+            *(_text(item) for item in objects),
+            _value_bytes(data),
+        )
+    )
+    return _HASH_PREFIX + hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
