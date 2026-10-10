@@ -171,6 +171,36 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+def _append_and_broadcast(tmp: Path) -> None:
+    from picopg.api import record_id_of, Position, ReplicatedRecord
+    server, base_url = _start_server(tmp, bindings=[("owned", "push")])
+    host, port = server.server_address
+    try:
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request("GET", "/api/v1/replica/events",
+                     headers={"Authorization": "Bearer secret"})
+        response = conn.getresponse()
+        _expect(response.status == 200, f"events status was {response.status}")
+        _read_sse(response, _monotonic() + 1)
+
+        record_id = record_id_of("owned", None, (), (), {"value": 1})
+        record = ReplicatedRecord(
+            id=record_id, log_id="owned", parent=None,
+            requires=(), objects=(), data={"value": 1},
+        )
+        result = server.append_and_broadcast("owned", None, (record,))
+        _expect(result.kind == "accepted", f"append_and_broadcast returned {result.kind}")
+        _expect(server.store.has(Position("owned", record_id)), "store did not retain record")
+
+        body = _read_sse(response, _monotonic() + 2)
+        _expect('"logId":"owned"' in body, f"event logId missing in {body!r}")
+        _expect(f'"recordId":"{record_id}"' in body, f"event recordId missing in {body!r}")
+        response.close()
+        conn.close()
+    finally:
+        _stop(server)
+
+
 def _push_channel(tmp: Path) -> None:
     server, base_url = _start_server(
         tmp, bindings=[("owned", "push"), ("mirror", "pull")]
@@ -248,7 +278,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as raw_dir:
         _push_channel(Path(raw_dir))
 
-    print("server handshake, public endpoint, binding enforcement and push events passed")
+    with tempfile.TemporaryDirectory() as raw_dir:
+        _append_and_broadcast(Path(raw_dir))
+
+    print("server handshake, public endpoint, binding enforcement, push events and append_and_broadcast passed")
     return 0
 
 

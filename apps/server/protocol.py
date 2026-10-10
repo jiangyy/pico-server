@@ -11,6 +11,7 @@ from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from picopg.api import (
+    AppendResult,
     InvalidReplicaData,
     MissingDependency,
     Position,
@@ -87,6 +88,17 @@ class ReplicaHttpServer(ThreadingHTTPServer):
                 subscriber.put_nowait(event)
             except queue.Full:
                 logger.warning("subscriber queue is full, dropping event for %s", log_id)
+
+    def append_and_broadcast(
+        self,
+        log_id: str,
+        expected_head: Position | None,
+        records: tuple[ReplicatedRecord, ...],
+    ) -> AppendResult:
+        result = self.store.append(log_id, expected_head, records)
+        if result.kind == "accepted":
+            self.broadcast(log_id, result.head)
+        return result
 
 
 class ReplicaRequestHandler(BaseHTTPRequestHandler):
