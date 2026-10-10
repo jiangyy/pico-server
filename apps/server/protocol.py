@@ -46,9 +46,9 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         for log_id, access in bindings:
             if not isinstance(log_id, str) or not log_id:
                 raise ValueError("binding logId must be a non-empty string")
-            if access not in ("push", "pull"):
+            if access not in ("read", "append"):
                 raise ValueError(
-                    f"binding access for {log_id!r} must be 'push' or 'pull', got {access!r}"
+                    f"binding access for {log_id!r} must be 'read' or 'append', got {access!r}"
                 )
             if log_id in compiled:
                 raise ValueError(f"duplicate binding for {log_id!r}")
@@ -272,8 +272,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._error(401, "auth.required", "valid bearer token required")
             return
-        if not any(access == "push" for access in self.server.bindings.values()):
-            self._error(403, "log.not_exposed", "no push-bound Logs available")
+        if not any(access == "read" for access in self.server.bindings.values()):
+            self._error(403, "log.not_exposed", "no readable Logs available")
             return
         subscriber: queue.Queue[str] = queue.Queue(maxsize=64)
         with self.server._subscriber_lock:
@@ -318,8 +318,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if method == "POST":
             if action != "records":
                 return (405, "method.not_allowed", "method not allowed")
-            if access != "pull":
-                return (403, "capability.denied", f"Log {log_id} does not accept pushes")
+            if access != "append":
+                return (403, "capability.denied", f"Log {log_id} does not accept appends")
             return None
         if method in ("GET", "HEAD"):
             if action == "records" and method == "GET":
@@ -328,7 +328,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                 pass
             else:
                 return (405, "method.not_allowed", "method not allowed")
-            if access != "push":
+            if access != "read":
                 return (403, "capability.denied", f"Log {log_id} is not readable")
             return None
         return (405, "method.not_allowed", "method not allowed")

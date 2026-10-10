@@ -64,10 +64,19 @@ def _expect(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _identity_vector() -> None:
+    from picopg.api import record_id_of
+    actual = record_id_of("work", None, (), {"source": "print(17)"})
+    _expect(
+        actual == "sha256:739461235b1f2584b68c8383876ccda00dd59caffa099d13461ec684153d516b",
+        f"record identity was {actual}",
+    )
+
+
 def _handshake_and_auth(tmp: Path) -> tuple[ReplicaHttpServer, str]:
     server, base_url = _start_server(
         tmp,
-        bindings=[("work", "push"), ("results", "push"), ("requests", "pull")],
+        bindings=[("work", "read"), ("results", "read"), ("requests", "append")],
     )
     status, headers, body = _get(f"{base_url}/api/v1/replica/handshake")
     _expect(status == 200, f"handshake status was {status}, expected 200")
@@ -102,7 +111,7 @@ def _handshake_and_auth(tmp: Path) -> tuple[ReplicaHttpServer, str]:
 
 def _bindings_enforcement(tmp: Path) -> None:
     server, base_url = _start_server(
-        tmp, bindings=[("owned", "push"), ("mirror", "pull")]
+        tmp, bindings=[("owned", "read"), ("mirror", "append")]
     )
     try:
         auth = {"Authorization": "Bearer secret"}
@@ -136,7 +145,7 @@ def _bindings_enforcement(tmp: Path) -> None:
             response = conn.getresponse()
             response.read()
             _expect(response.status == 403,
-                    f"push to push-bound log returned {response.status}")
+                    f"append to read-only log returned {response.status}")
         finally:
             conn.close()
     finally:
@@ -173,7 +182,7 @@ def _monotonic() -> float:
 
 def _append_and_broadcast(tmp: Path) -> None:
     from picopg.api import record_id_of, Position, ReplicatedRecord
-    server, base_url = _start_server(tmp, bindings=[("owned", "push")])
+    server, base_url = _start_server(tmp, bindings=[("owned", "read")])
     host, port = server.server_address
     try:
         conn = HTTPConnection(host, port, timeout=5)
@@ -183,10 +192,10 @@ def _append_and_broadcast(tmp: Path) -> None:
         _expect(response.status == 200, f"events status was {response.status}")
         _read_sse(response, _monotonic() + 1)
 
-        record_id = record_id_of("owned", None, (), (), {"value": 1})
+        record_id = record_id_of("owned", None, (), {"value": 1})
         record = ReplicatedRecord(
             id=record_id, log_id="owned", parent=None,
-            requires=(), objects=(), data={"value": 1},
+            requires=(), data={"value": 1},
         )
         result = server.append_and_broadcast("owned", None, (record,))
         _expect(result.kind == "accepted", f"append_and_broadcast returned {result.kind}")
@@ -203,7 +212,7 @@ def _append_and_broadcast(tmp: Path) -> None:
 
 def _push_channel(tmp: Path) -> None:
     server, base_url = _start_server(
-        tmp, bindings=[("owned", "push"), ("mirror", "pull")]
+        tmp, bindings=[("owned", "read"), ("mirror", "append")]
     )
     host, port = server.server_address
     auth = {"Authorization": "Bearer secret"}
@@ -222,13 +231,12 @@ def _push_channel(tmp: Path) -> None:
         _expect(preamble.startswith(": "), f"events preamble was {preamble!r}")
 
         from picopg.api import record_id_of, Position, ReplicatedRecord
-        record_id = record_id_of("owned", None, (), (), {"value": 1})
+        record_id = record_id_of("owned", None, (), {"value": 1})
         record = ReplicatedRecord(
             id=record_id,
             log_id="owned",
             parent=None,
             requires=(),
-            objects=(),
             data={"value": 1},
         )
         head_position = Position("owned", record.id)
@@ -257,6 +265,8 @@ def _push_channel(tmp: Path) -> None:
 
 
 def main() -> int:
+    _identity_vector()
+
     with tempfile.TemporaryDirectory() as raw_dir:
         root = Path(raw_dir)
         server, base_url = _handshake_and_auth(root)

@@ -31,7 +31,7 @@ def build_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="LOG_ID=ACCESS",
-        help="Expose LOG_ID with ACCESS in {push, pull}; repeat per Log.",
+        help="Expose LOG_ID with ACCESS in {read, append}; repeat per Log.",
     )
     parser.add_argument(
         "--binding-config",
@@ -49,9 +49,9 @@ def _parse_pair(value: str) -> tuple[str, str]:
     access = access.strip()
     if not log_id:
         raise ValueError(f"--binding expects non-empty logId in {value!r}")
-    if access not in ("push", "pull"):
+    if access not in ("read", "append"):
         raise ValueError(
-            f"--binding access for {log_id!r} must be 'push' or 'pull', got {access!r}"
+            f"--binding access for {log_id!r} must be 'read' or 'append', got {access!r}"
         )
     return log_id, access
 
@@ -72,10 +72,10 @@ def load_bindings(
             or len(entry) != 2
             or not isinstance(entry[0], str)
             or not entry[0]
-            or entry[1] not in ("push", "pull")
+            or entry[1] not in ("read", "append")
         ):
             raise ValueError(
-                f"binding config entry must be [logId, 'push'|'pull'], got {entry!r}"
+                f"binding config entry must be [logId, 'read'|'append'], got {entry!r}"
             )
         bindings.append((entry[0], entry[1]))
     return bindings

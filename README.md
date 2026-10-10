@@ -24,13 +24,17 @@ apps/server/main.py                 组装和进程生命周期
 
 ~~~text
 GET  /healthz
+GET  /api/v1/replica/handshake
+GET  /api/v1/replica/events
 GET  /api/v1/replica/logs/{logId}/head
 HEAD /api/v1/replica/logs/{logId}/records/{recordId}
 GET  /api/v1/replica/logs/{logId}/records?after={recordId}&limit=128
 POST /api/v1/replica/logs/{logId}/records
 ~~~
 
-Replica 路由要求 Authorization: Bearer &lt;token&gt;。当前最小版本使用一个 server-wide token，适合一个可信参与者；接入多个互不信任的用户前，必须增加 Log provisioning 和 per-Log capability，不能让 Client 自己声明 access。
+Replica 路由要求 Authorization: Bearer &lt;token&gt;。每个 Log 由启动参数绑定为 `read` 或 `append`：`read` 允许 Client 读取 server-owned Log，`append` 允许 Client 写入 client-owned Log。当前最小版本使用一个 server-wide token；接入多个互不信任的用户前，必须增加 provisioning，不能让 Client 自己声明权限。
+
+`/events` 是允许丢失的 SSE 唤醒通道。它只通知 Log 可能变化，Client 首次连接和每次重连后都要比较 head；正确性不依赖事件回放。
 
 POST body 与 Client 的 ReplicaLogStore.append 一致：
 
@@ -39,7 +43,7 @@ POST body 与 Client 的 ReplicaLogStore.append 一致：
   "expectedHead": null,
   "records": [
     {
-      "id": "opaque-record-id",
+      "id": "sha256:739461235b1f2584b68c8383876ccda00dd59caffa099d13461ec684153d516b",
       "logId": "work",
       "parent": null,
       "requires": [],
@@ -57,7 +61,9 @@ POST body 与 Client 的 ReplicaLogStore.append 一致：
 PYTHONPATH=src python3 apps/server/main.py \
   --host 127.0.0.1 \
   --port 8001 \
-  --data data
+  --data data \
+  --binding work=append \
+  --binding results=read
 ~~~
 
 Token 优先读取 PICOPG_REPLICA_TOKEN，其次是 --token；两者都没有时生成 data/replica.token，权限为 0600。
