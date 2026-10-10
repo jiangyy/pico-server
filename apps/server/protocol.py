@@ -3,6 +3,8 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import queue
+import threading
 from collections.abc import Iterable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NoReturn
@@ -33,20 +35,6 @@ _READ_ACTIONS = {"head", "records", "has"}
 class ReplicaHttpServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(
-        self,
-        address: tuple[str, int],
-        store: ReplicaLogStore,
-        token: str,
-        bindings: Iterable[LogBinding] | None = None,
-    ) -> None:
-        if not token:
-            raise ValueError("replica token must be non-empty")
-        self.store = store
-        self.replica_token = token
-        self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
-        super().__init__(address, ReplicaRequestHandler)
-
     @staticmethod
     def _compile_bindings(
         bindings: Iterable[LogBinding] | None,
@@ -65,6 +53,40 @@ class ReplicaHttpServer(ThreadingHTTPServer):
                 raise ValueError(f"duplicate binding for {log_id!r}")
             compiled[log_id] = access
         return compiled
+
+    def __init__(
+        self,
+        address: tuple[str, int],
+        store: ReplicaLogStore,
+        token: str,
+        bindings: Iterable[LogBinding] | None = None,
+    ) -> None:
+        if not token:
+            raise ValueError("replica token must be non-empty")
+        self.store = store
+        self.replica_token = token
+        self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
+        self._subscriber_lock = threading.Lock()
+        self._subscribers: list[queue.Queue[str]] = []
+        super().__init__(address, ReplicaRequestHandler)
+
+    def broadcast(self, log_id: str, head: "Position | None") -> None:
+        event = json.dumps(
+            {
+                "logId": log_id,
+                "head": None if head is None else head.to_value(),
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        with self._subscriber_lock:
+            queues = list(self._subscribers)
+        for subscriber in queues:
+            try:
+                subscriber.put_nowait(event)
+            except queue.Full:
+                logger.warning("subscriber queue is full, dropping event for %s", log_id)
 
 
 class ReplicaRequestHandler(BaseHTTPRequestHandler):
@@ -97,6 +119,12 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                         "capabilities": list(HANDSHAKE_CAPABILITIES),
                     },
                 )
+                return
+            if url.path == "/api/v1/replica/events":
+                if self.command != "GET":
+                    self._error(405, "method.not_allowed", "method not allowed")
+                    return
+                self._stream_events()
                 return
             route = _route(url.path)
             if route is None:
@@ -227,6 +255,42 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             )
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise InvalidReplicaData("request body is invalid JSON") from error
+
+    def _stream_events(self) -> None:
+        if not self._authorized():
+            self._error(401, "auth.required", "valid bearer token required")
+            return
+        if not any(access == "push" for access in self.server.bindings.values()):
+            self._error(403, "log.not_exposed", "no push-bound Logs available")
+            return
+        subscriber: queue.Queue[str] = queue.Queue(maxsize=64)
+        with self.server._subscriber_lock:
+            self.server._subscribers.append(subscriber)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    event = subscriber.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(b"data: ")
+                self.wfile.write(event.encode("utf-8"))
+                self.wfile.write(b"\n\n")
+                self.wfile.flush()
+        except (ConnectionError, BrokenPipeError, OSError):
+            pass
+        finally:
+            with self.server._subscriber_lock:
+                if subscriber in self.server._subscribers:
+                    self.server._subscribers.remove(subscriber)
 
     def _authorized(self) -> bool:
         expected = f"Bearer {self.server.replica_token}"

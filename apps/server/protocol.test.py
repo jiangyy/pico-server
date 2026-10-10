@@ -143,6 +143,89 @@ def _bindings_enforcement(tmp: Path) -> None:
         _stop(server)
 
 
+def _read_sse(response, deadline: float) -> str:
+    chunks: list[bytes] = []
+    while _monotonic() < deadline:
+        buffered = response.fp.peek(4096)
+        if buffered:
+            chunks.append(buffered)
+            response.fp.read(len(buffered))
+            if b"\n\n" in b"".join(chunks):
+                break
+            continue
+        response.fp.raw._sock.settimeout(max(0.05, deadline - _monotonic()))
+        try:
+            chunk = response.fp.raw._sock.recv(4096)
+        except (TimeoutError, OSError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n\n" in b"".join(chunks):
+            break
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _monotonic() -> float:
+    import time
+    return time.monotonic()
+
+
+def _push_channel(tmp: Path) -> None:
+    server, base_url = _start_server(
+        tmp, bindings=[("owned", "push"), ("mirror", "pull")]
+    )
+    host, port = server.server_address
+    auth = {"Authorization": "Bearer secret"}
+    stream_conn = HTTPConnection(host, port, timeout=5)
+    stream_conn.request("GET", "/api/v1/replica/events", headers=auth)
+    stream_response = stream_conn.getresponse()
+    try:
+        _expect(stream_response.status == 200,
+                f"events status was {stream_response.status}")
+        _expect(
+            stream_response.getheader("Content-Type", "").startswith("text/event-stream"),
+            f"events content-type was {stream_response.getheader('Content-Type')!r}",
+        )
+
+        preamble = _read_sse(stream_response, _monotonic() + 1)
+        _expect(preamble.startswith(": "), f"events preamble was {preamble!r}")
+
+        from picopg.api import record_id_of, Position, ReplicatedRecord
+        record_id = record_id_of("owned", None, (), (), {"value": 1})
+        record = ReplicatedRecord(
+            id=record_id,
+            log_id="owned",
+            parent=None,
+            requires=(),
+            objects=(),
+            data={"value": 1},
+        )
+        head_position = Position("owned", record.id)
+
+        result = server.store.append("owned", None, (record,))
+        _expect(result.kind == "accepted", f"direct append returned {result.kind}")
+        server.broadcast("owned", result.head)
+
+        event = _read_sse(stream_response, _monotonic() + 2)
+        _expect('"logId":"owned"' in event, f"event logId missing in {event!r}")
+        _expect(f'"recordId":"{head_position.record_id}"' in event,
+                f"event head recordId missing in {event!r}")
+
+        no_auth_conn = HTTPConnection(host, port, timeout=2)
+        no_auth_conn.request("GET", "/api/v1/replica/events")
+        no_auth_response = no_auth_conn.getresponse()
+        _expect(no_auth_response.status == 401,
+                f"events without auth returned {no_auth_response.status}")
+        no_auth_response.read()
+        no_auth_conn.close()
+
+        stream_response.close()
+        stream_conn.close()
+    finally:
+        _stop(server)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw_dir:
         root = Path(raw_dir)
@@ -162,7 +245,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as raw_dir:
         _bindings_enforcement(Path(raw_dir))
 
-    print("server handshake, public endpoint and binding enforcement passed")
+    with tempfile.TemporaryDirectory() as raw_dir:
+        _push_channel(Path(raw_dir))
+
+    print("server handshake, public endpoint, binding enforcement and push events passed")
     return 0
 
 
