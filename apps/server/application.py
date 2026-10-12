@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from apps.server.authorization import PrincipalSession
 from apps.server.playgrounds import (
     PLAYGROUND_RELEASES_LOG_ID,
     FilePackageStore,
@@ -13,6 +14,15 @@ from apps.server.playgrounds import (
     PlaygroundPublisher,
 )
 from apps.server.protocol import LogBinding, ReplicaHttpServer, ReplicaRequestHandler
+from apps.server.workers import (
+    DraftRequestConsumer,
+    LogWorker,
+    ServerWorkerThread,
+    SubmissionHandler,
+    SubmissionTagWriter,
+    draft_request_logs,
+    submission_request_logs,
+)
 from picopg.api import ReplicaLogStore
 
 
@@ -25,7 +35,12 @@ class PicoPGHttpServer(ReplicaHttpServer):
         package_root: Path,
         bindings: Iterable[LogBinding] | None = None,
         package_adapter: PackageAdapter | None = None,
+        principal_sessions: Iterable[PrincipalSession] = (),
+        submission_tag_writer: SubmissionTagWriter | None = None,
     ) -> None:
+        sessions = tuple(principal_sessions)
+        if any(session.grants.get(PLAYGROUND_RELEASES_LOG_ID) == "append" for session in sessions):
+            raise ValueError(f"{PLAYGROUND_RELEASES_LOG_ID!r} is server-owned and read-only")
         exposed = list(bindings or ())
         release_access = next(
             (
@@ -47,10 +62,48 @@ class PicoPGHttpServer(ReplicaHttpServer):
             token,
             bindings=exposed,
             handler_class=PicoRequestHandler,
+            principal_sessions=sessions,
         )
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
         )
+        worker_bindings = dict(self.bindings)
+        for session in self.principal_sessions.values():
+            for log_id, access in session.grants.items():
+                if access == "append":
+                    worker_bindings[log_id] = "append"
+        request_logs = draft_request_logs(worker_bindings)
+        consumers = []
+        if request_logs:
+            consumers.append(DraftRequestConsumer(
+                self.store,
+                request_logs,
+                lambda log_id, head: self.broadcast(log_id, head),
+            ))
+        if submission_tag_writer is not None:
+            submission_logs = submission_request_logs(worker_bindings)
+            if submission_logs:
+                consumers.append(LogWorker(
+                    self.store,
+                    submission_logs,
+                    "submission/results",
+                    SubmissionHandler(self.store, submission_tag_writer),
+                    lambda log_id, head: self.broadcast(log_id, head),
+                ))
+        self.workers = ServerWorkerThread(tuple(consumers)) if consumers else None
+        if self.workers is not None:
+            self.workers.start()
+
+    def append_and_broadcast(self, log_id, expected_head, records):
+        result = super().append_and_broadcast(log_id, expected_head, records)
+        if result.kind == "accepted" and self.workers is not None:
+            self.workers.notify_append(log_id)
+        return result
+
+    def server_close(self) -> None:
+        if self.workers is not None:
+            self.workers.close()
+        super().server_close()
 
 
 class PicoRequestHandler(ReplicaRequestHandler):
@@ -62,10 +115,15 @@ class PicoRequestHandler(ReplicaRequestHandler):
             super()._dispatch()
             return
         try:
-            if not self._authorized():
+            action, playground_id, version_id = route
+            authenticated = (
+                self._admin_authorized()
+                if action == "publish"
+                else self._authorized() or self._admin_authorized()
+            )
+            if not authenticated:
                 self._error(401, "auth.required", "valid bearer token required")
                 return
-            action, playground_id, version_id = route
             if action == "catalog" and self.command == "GET":
                 self._send_json(
                     200,

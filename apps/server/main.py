@@ -14,6 +14,9 @@ for _entry in (_ROOT, _SRC):
         sys.path.insert(0, str(_entry))
 
 from apps.server.application import PicoPGHttpServer  # noqa: E402
+from apps.server.authorization import PrincipalSession  # noqa: E402
+from apps.server.git_submissions import GitSubmissionTagWriter  # noqa: E402
+from apps.server.workers import SubmissionTagWriter  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
@@ -37,6 +40,16 @@ def build_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--binding-config",
         type=Path,
         help="Path to a JSON file of [[logId, access], ...] bindings.",
+    )
+    parser.add_argument(
+        "--principal-config",
+        type=Path,
+        help="JSON array of {principalId, replicaId, token, grants:[[logId, access], ...]}.",
+    )
+    parser.add_argument(
+        "--submission-repositories",
+        type=Path,
+        help="JSON object mapping playground IDs to Git repository paths.",
     )
     return parser.parse_args(argv)
 
@@ -81,6 +94,57 @@ def load_bindings(
     return bindings
 
 
+def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
+    if path is None:
+        return []
+    import json
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("principal config must be a JSON array")
+    sessions: list[PrincipalSession] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"principalId", "replicaId", "token", "grants"}:
+            raise ValueError("principal entry must contain principalId, replicaId, token and grants")
+        grants = item["grants"]
+        if not isinstance(grants, list):
+            raise ValueError("principal grants must be an array")
+        mapped: dict[str, str] = {}
+        for grant in grants:
+            if (not isinstance(grant, list) or len(grant) != 2
+                    or not isinstance(grant[0], str) or not grant[0]
+                    or grant[1] not in ("read", "append")):
+                raise ValueError("principal grant must be [logId, 'read'|'append']")
+            if grant[0] in mapped:
+                raise ValueError(f"duplicate principal grant for {grant[0]!r}")
+            mapped[grant[0]] = grant[1]
+        sessions.append(PrincipalSession.create(
+            item["principalId"], item["replicaId"], item["token"], mapped,
+        ))
+    if len({session.token for session in sessions}) != len(sessions):
+        raise ValueError("principal tokens must be unique")
+    return sessions
+
+
+def load_submission_tag_writer(path: Path | None) -> SubmissionTagWriter | None:
+    if path is None:
+        return None
+    import json
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or any(
+        not isinstance(playground_id, str) or not playground_id
+        or not isinstance(repository, str) or not repository
+        for playground_id, repository in raw.items()
+    ):
+        raise ValueError("submission repository config must map non-empty playground IDs to paths")
+    repositories = {
+        playground_id: (path.parent / repository).resolve()
+        if not Path(repository).is_absolute()
+        else Path(repository)
+        for playground_id, repository in raw.items()
+    }
+    return GitSubmissionTagWriter(repositories)
+
+
 def load_token(data_dir: Path, argument: str | None) -> str:
     configured = os.environ.get("PICOPG_REPLICA_TOKEN") or argument
     if configured:
@@ -111,6 +175,8 @@ def build_server(
     port: int = 8001,
     token: str,
     bindings: list[tuple[str, str]] | None = None,
+    principal_sessions: list[PrincipalSession] | None = None,
+    submission_tag_writer: SubmissionTagWriter | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
     return PicoPGHttpServer(
@@ -119,6 +185,8 @@ def build_server(
         token,
         data_dir / "packages",
         bindings=bindings,
+        principal_sessions=principal_sessions or (),
+        submission_tag_writer=submission_tag_writer,
     )
 
 
@@ -131,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
     token = load_token(arguments.data, arguments.token)
     try:
         bindings = load_bindings(arguments.binding, arguments.binding_config)
+        principal_sessions = load_principal_sessions(arguments.principal_config)
+        submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
     except ValueError as error:
         logger.error("invalid binding configuration: %s", error)
         return 2
@@ -140,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         port=arguments.port,
         token=token,
         bindings=bindings,
+        principal_sessions=principal_sessions,
+        submission_tag_writer=submission_tag_writer,
     )
     host, port = server.server_address
     logger.info(

@@ -20,6 +20,7 @@ from picopg.api import (
     ReplicatedRecord,
     UnknownPosition,
 )
+from apps.server.authorization import PrincipalSession
 
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -62,14 +63,21 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         token: str,
         bindings: Iterable[LogBinding] | None = None,
         handler_class: type[BaseHTTPRequestHandler] | None = None,
+        principal_sessions: Iterable[PrincipalSession] = (),
     ) -> None:
         if not token:
             raise ValueError("replica token must be non-empty")
         self.store = store
         self.replica_token = token
         self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
+        sessions = tuple(principal_sessions)
+        self.principal_sessions: Mapping[str, PrincipalSession] = {
+            session.token: session for session in sessions
+        }
+        if len(self.principal_sessions) != len(sessions):
+            raise ValueError("principal session tokens must be unique")
         self._subscriber_lock = threading.Lock()
-        self._subscribers: list[queue.Queue[str]] = []
+        self._subscribers: list[tuple[queue.Queue[str], frozenset[str]]] = []
         super().__init__(address, handler_class or ReplicaRequestHandler)
 
     def broadcast(self, log_id: str, head: "Position | None") -> None:
@@ -84,7 +92,9 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         )
         with self._subscriber_lock:
             queues = list(self._subscribers)
-        for subscriber in queues:
+        for subscriber, readable_logs in queues:
+            if log_id not in readable_logs:
+                continue
             try:
                 subscriber.put_nowait(event)
             except queue.Full:
@@ -235,7 +245,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             ReplicatedRecord.from_value(record, log_id=log_id)
             for record in records_value
         )
-        result = self.server.store.append(log_id, expected, records)
+        result = self.server.append_and_broadcast(log_id, expected, records)
         self._send_json(
             409 if result.kind == "changed" else 200,
             result.to_value(),
@@ -273,12 +283,18 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._error(401, "auth.required", "valid bearer token required")
             return
-        if not any(access == "read" for access in self.server.bindings.values()):
+        session = self._principal_session()
+        readable_logs = (
+            session.readable_logs
+            if session is not None
+            else frozenset(log_id for log_id, access in self.server.bindings.items() if access == "read")
+        )
+        if not readable_logs:
             self._error(403, "log.not_exposed", "no readable Logs available")
             return
         subscriber: queue.Queue[str] = queue.Queue(maxsize=64)
         with self.server._subscriber_lock:
-            self.server._subscribers.append(subscriber)
+            self.server._subscribers.append((subscriber, readable_logs))
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -302,10 +318,26 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             pass
         finally:
             with self.server._subscriber_lock:
-                if subscriber in self.server._subscribers:
-                    self.server._subscribers.remove(subscriber)
+                entry = next((item for item in self.server._subscribers if item[0] is subscriber), None)
+                if entry is not None:
+                    self.server._subscribers.remove(entry)
+
+    def _principal_session(self) -> PrincipalSession | None:
+        if not self.server.principal_sessions:
+            return None
+        actual = self.headers.get("Authorization", "")
+        if not actual.startswith("Bearer "):
+            return None
+        token = actual[7:]
+        return next((session for known, session in self.server.principal_sessions.items()
+                     if hmac.compare_digest(token, known)), None)
 
     def _authorized(self) -> bool:
+        if self.server.principal_sessions:
+            return self._principal_session() is not None
+        return self._admin_authorized()
+
+    def _admin_authorized(self) -> bool:
         expected = f"Bearer {self.server.replica_token}"
         actual = self.headers.get("Authorization", "")
         return hmac.compare_digest(actual, expected)
@@ -313,6 +345,13 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     def _authorize(
         self, log_id: str, action: str, method: str
     ) -> tuple[int, str, str] | None:
+        session = self._principal_session()
+        if session is not None:
+            if session.permits(log_id, action, method):
+                return None
+            if log_id not in session.grants:
+                return (403, "log.not_exposed", f"Log {log_id} is not exposed")
+            return (403, "capability.denied", f"Log {log_id} does not permit this operation")
         access = self.server.bindings.get(log_id)
         if access is None:
             return (403, "log.not_exposed", f"Log {log_id} is not exposed")
