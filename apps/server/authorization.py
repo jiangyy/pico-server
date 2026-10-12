@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -64,3 +65,41 @@ def _replica_owner(log_id: str) -> str | None:
     if len(parts) == 3 and parts[0] == "submission" and parts[2] == "requests":
         return parts[1]
     return None
+
+
+def readable_principal_logs(
+    session: PrincipalSession, sessions: Iterable[PrincipalSession]
+) -> frozenset[str]:
+    readable = set(session.readable_logs)
+    for candidate in sessions:
+        if candidate.principal_id != session.principal_id:
+            continue
+        owner = quote(candidate.replica_id, safe="-_.!~*'()")
+        for log_id, access in candidate.grants.items():
+            parts = log_id.split("/")
+            if (
+                access == "append"
+                and len(parts) == 4
+                and parts[0] == "draft"
+                and parts[2] == "revision"
+                and parts[3] == owner
+                and session.grants.get(f"draft/{parts[1]}/decision") == "read"
+            ):
+                readable.add(log_id)
+    return frozenset(readable)
+
+
+def permits_principal_log(
+    session: PrincipalSession,
+    sessions: Iterable[PrincipalSession],
+    log_id: str,
+    action: str,
+    method: str,
+) -> bool:
+    if session.permits(log_id, action, method):
+        return True
+    return (
+        method in ("GET", "HEAD")
+        and action in ("head", "has", "records")
+        and log_id in readable_principal_logs(session, sessions)
+    )

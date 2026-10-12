@@ -27,6 +27,7 @@ from apps.server.protocol import (  # noqa: E402
     PROTOCOL_VERSION,
     ReplicaHttpServer,
 )
+from apps.server.authorization import PrincipalSession  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
@@ -34,9 +35,13 @@ def _start_server(
     tmp: Path,
     token: str = "secret",
     bindings: list[tuple[str, str]] | None = None,
+    principal_sessions: tuple[PrincipalSession, ...] = (),
 ) -> tuple[ReplicaHttpServer, str]:
     store = FileReplicaLogStore(tmp / "replica")
-    server = ReplicaHttpServer(("127.0.0.1", 0), store, token, bindings=bindings)
+    server = ReplicaHttpServer(
+        ("127.0.0.1", 0), store, token, bindings=bindings,
+        principal_sessions=principal_sessions,
+    )
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -215,6 +220,82 @@ def _append_and_broadcast(tmp: Path) -> None:
         _stop(server)
 
 
+def _principal_revision_access(tmp: Path) -> None:
+    from picopg.api import record_id_of, ReplicatedRecord
+
+    b_revision = "draft/lesson/revision/B"
+    b_request = "draft/lesson/request/B"
+    sessions = (
+        PrincipalSession.create("user", "A", "token-a", {
+            "draft/lesson/revision/A": "append",
+            "draft/lesson/request/A": "append",
+            "draft/lesson/decision": "read",
+        }),
+        PrincipalSession.create("user", "B", "token-b", {
+            b_revision: "append",
+            b_request: "append",
+            "draft/lesson/decision": "read",
+        }),
+        PrincipalSession.create("another-user", "C", "token-c", {
+            "draft/lesson/revision/C": "append",
+            "draft/lesson/request/C": "append",
+            "draft/lesson/decision": "read",
+        }),
+    )
+    server, base_url = _start_server(tmp, principal_sessions=sessions)
+    host, port = server.server_address
+    auth = {"Authorization": "Bearer token-a"}
+    stream_conn = HTTPConnection(host, port, timeout=5)
+    try:
+        status, _, _ = _get(
+            f"{base_url}/api/v1/replica/logs/draft%2Flesson%2Frevision%2FB/records",
+            headers=auth,
+        )
+        _expect(status == 200, f"same-Principal Revision read returned {status}")
+        status, _, _ = _get(
+            f"{base_url}/api/v1/replica/logs/draft%2Flesson%2Frequest%2FB/records",
+            headers=auth,
+        )
+        _expect(status == 403, f"another Replica Request Log returned {status}")
+        status, _, _ = _get(
+            f"{base_url}/api/v1/replica/logs/draft%2Flesson%2Frevision%2FC/records",
+            headers=auth,
+        )
+        _expect(status == 403, f"another Principal Revision Log returned {status}")
+
+        stream_conn.request("GET", "/api/v1/replica/events", headers=auth)
+        stream_response = stream_conn.getresponse()
+        _expect(stream_response.status == 200, f"principal events returned {stream_response.status}")
+        _read_sse(stream_response, _monotonic() + 1)
+        record = ReplicatedRecord(
+            id=record_id_of(b_revision, None, (), {"value": "B"}),
+            log_id=b_revision,
+            parent=None,
+            requires=(),
+            data={"value": "B"},
+        )
+        result = server.append_and_broadcast(b_revision, None, (record,))
+        _expect(result.kind == "accepted", f"B Revision append returned {result.kind}")
+        event = _read_sse(stream_response, _monotonic() + 2)
+        _expect(b_revision in event, f"same-Principal Revision event missing in {event!r}")
+        stream_response.close()
+
+        conn = HTTPConnection(host, port, timeout=2)
+        conn.request(
+            "POST",
+            "/api/v1/replica/logs/draft%2Flesson%2Frevision%2FB/records",
+            body=b'{"expectedHead":null,"records":[]}',
+            headers={**auth, "Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        _expect(response.status == 403, f"another Replica Revision append returned {response.status}")
+        conn.close()
+    finally:
+        stream_conn.close()
+        _stop(server)
+
+
 def _push_channel(tmp: Path) -> None:
     server, base_url = _start_server(
         tmp, bindings=[("owned", "read"), ("mirror", "append")]
@@ -296,7 +377,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as raw_dir:
         _append_and_broadcast(Path(raw_dir))
 
-    print("server handshake, public endpoint, binding enforcement, push events and append_and_broadcast passed")
+    with tempfile.TemporaryDirectory() as raw_dir:
+        _principal_revision_access(Path(raw_dir))
+
+    print("server handshake, binding enforcement, Principal Revision sharing, push events and append_and_broadcast passed")
     return 0
 
 

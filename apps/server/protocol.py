@@ -20,7 +20,11 @@ from picopg.api import (
     ReplicatedRecord,
     UnknownPosition,
 )
-from apps.server.authorization import PrincipalSession
+from apps.server.authorization import (
+    PrincipalSession,
+    permits_principal_log,
+    readable_principal_logs,
+)
 
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -76,6 +80,8 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         }
         if len(self.principal_sessions) != len(sessions):
             raise ValueError("principal session tokens must be unique")
+        if len({session.replica_id for session in sessions}) != len(sessions):
+            raise ValueError("principal session Replica IDs must be unique")
         self._subscriber_lock = threading.Lock()
         self._subscribers: list[tuple[queue.Queue[str], frozenset[str]]] = []
         super().__init__(address, handler_class or ReplicaRequestHandler)
@@ -285,7 +291,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             return
         session = self._principal_session()
         readable_logs = (
-            session.readable_logs
+            readable_principal_logs(session, self.server.principal_sessions.values())
             if session is not None
             else frozenset(log_id for log_id, access in self.server.bindings.items() if access == "read")
         )
@@ -347,7 +353,9 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     ) -> tuple[int, str, str] | None:
         session = self._principal_session()
         if session is not None:
-            if session.permits(log_id, action, method):
+            if permits_principal_log(
+                session, self.server.principal_sessions.values(), log_id, action, method
+            ):
                 return None
             if log_id not in session.grants:
                 return (403, "log.not_exposed", f"Log {log_id} is not exposed")
