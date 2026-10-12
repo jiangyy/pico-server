@@ -171,7 +171,7 @@ class DraftRequestConsumer:
                 if result.kind != "missingDependency":
                     self._processed.add(key)
                 outcomes.append((record.position, result))
-                if result.kind == "accepted" and result.decision is not None:
+                if result.decision is not None:
                     self._on_decision(result.decision.log_id, result.decision)
         return tuple(outcomes)
 
@@ -228,6 +228,13 @@ def submission_request_logs(bindings: Mapping[str, str]) -> tuple[str, ...]:
         log_id for log_id, access in bindings.items()
         if access == "append" and _is_submission_request_log(log_id)
     ))
+
+
+def submission_result_log(request_log: str) -> str:
+    parts = request_log.split("/")
+    if len(parts) != 3 or parts[0] != "submission" or not parts[1] or parts[2] != "requests":
+        raise ValueError("request_log is not a Submission Request Log")
+    return f"submission/{parts[1]}/results"
 
 
 def _is_draft_request_log(log_id: str) -> bool:

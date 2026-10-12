@@ -22,6 +22,7 @@ from apps.server.workers import (
     SubmissionTagWriter,
     draft_request_logs,
     submission_request_logs,
+    submission_result_log,
 )
 from picopg.api import ReplicaLogStore
 
@@ -82,11 +83,11 @@ class PicoPGHttpServer(ReplicaHttpServer):
             ))
         if submission_tag_writer is not None:
             submission_logs = submission_request_logs(worker_bindings)
-            if submission_logs:
+            for submission_log in submission_logs:
                 consumers.append(LogWorker(
                     self.store,
-                    submission_logs,
-                    "submission/results",
+                    (submission_log,),
+                    submission_result_log(submission_log),
                     SubmissionHandler(self.store, submission_tag_writer),
                     lambda log_id, head: self.broadcast(log_id, head),
                 ))

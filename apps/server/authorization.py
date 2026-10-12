@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
+from urllib.parse import quote
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,10 @@ class PrincipalSession:
             raise ValueError("grant Log IDs must be non-empty")
         if any(access not in ("read", "append") for access in copied.values()):
             raise ValueError("grant access must be 'read' or 'append'")
+        owner = quote(replica_id, safe="-_.!~*'()")
+        for log_id, access in copied.items():
+            if access == "append" and _replica_owner(log_id) not in (None, owner):
+                raise ValueError(f"append grant {log_id!r} belongs to another Replica")
         return cls(principal_id, replica_id, token, MappingProxyType(copied))
 
     def permits(self, log_id: str, action: str, method: str) -> bool:
@@ -50,3 +55,12 @@ class PrincipalSession:
     def readable_logs(self) -> frozenset[str]:
         # Append-only clients still need head invalidation events for their own Logs.
         return frozenset(self.grants)
+
+
+def _replica_owner(log_id: str) -> str | None:
+    parts = log_id.split("/")
+    if len(parts) == 4 and parts[0] == "draft" and parts[2] in ("revision", "request"):
+        return parts[3]
+    if len(parts) == 3 and parts[0] == "submission" and parts[2] == "requests":
+        return parts[1]
+    return None
