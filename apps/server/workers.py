@@ -47,6 +47,16 @@ class SubmissionHandler:
         self._tags = tags
 
     def __call__(self, record: ReplicatedRecord, request: Position) -> WorkerResult:
+        try:
+            return self._complete(record, request)
+        except ValueError as error:
+            return WorkerResult({
+                "type": "submission.failed",
+                "request": request.to_value(),
+                "message": str(error) or "Submission is invalid",
+            })
+
+    def _complete(self, record: ReplicatedRecord, request: Position) -> WorkerResult:
         data = record.data
         if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
             raise ValueError("request is not a Submission")

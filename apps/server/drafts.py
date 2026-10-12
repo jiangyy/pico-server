@@ -213,7 +213,10 @@ class DraftAuthority:
                     return DraftResult(prior_kind, prior_ref, prior_decision)
                 expected_epoch = command.get("expectedEpoch")
                 if type(expected_epoch) is not int or expected_epoch < 0:
-                    raise ValueError("command.expectedEpoch must be non-negative")
+                    rejected = self._reject(decisions, request_position, command_id, "invalid", ref)
+                    if rejected is None:
+                        continue
+                    return DraftResult("invalid", ref, rejected, "command.expectedEpoch must be non-negative")
                 if kind == "draft.beginEditing":
                     if ref.writer is not None and ref.writer != replica_id:
                         rejected = self._reject(decisions, request_position, command_id, "activeElsewhere", ref)
@@ -243,7 +246,10 @@ class DraftAuthority:
                         return DraftResult("changed", ref, rejected)
                     if kind == "draft.takeover":
                         if revision["replicaId"] != replica_id:
-                            raise ValueError("takeover Revision belongs to another Replica")
+                            rejected = self._reject(decisions, request_position, command_id, "invalid", ref)
+                            if rejected is None:
+                                continue
+                            return DraftResult("invalid", ref, rejected, "takeover Revision belongs to another Replica")
                         data = {"type": "draft.takenOver", "draftId": draft_id, "commandId": command_id,
                                 "request": request_position.to_value(), "head": required[1].to_value(),
                                 "writer": replica_id, "epoch": ref.epoch + 1}
@@ -254,7 +260,10 @@ class DraftAuthority:
                                 continue
                             return DraftResult("changed", ref, rejected)
                         if revision["base"] != required[0]:
-                            raise ValueError("Revision was not edited from expectedHead")
+                            rejected = self._reject(decisions, request_position, command_id, "invalid", ref)
+                            if rejected is None:
+                                continue
+                            return DraftResult("invalid", ref, rejected, "Revision was not edited from expectedHead")
                         data = {"type": "draft.advanced", "draftId": draft_id, "commandId": command_id,
                                 "request": request_position.to_value(), "head": required[1].to_value(),
                                 "writer": replica_id, "epoch": expected_epoch}

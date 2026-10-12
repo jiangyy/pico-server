@@ -47,16 +47,18 @@ def draft_rejections_are_durable(root: Path) -> None:
         "source": "print(0)", "base": None,
     }))
     requests: list[str] = []
+    request_heads: dict[str, Position] = {}
     for replica_id in ("A", "B"):
         log_id = request_log_id(draft_id, replica_id)
         requests.append(log_id)
-        append(store, record(log_id, None, (initial,), {
+        request_heads[replica_id] = append(store, record(log_id, None, (initial,), {
             "type": "draft.beginEditing", "commandId": f"begin-{replica_id}",
             "draftId": draft_id, "replicaId": replica_id,
             "expectedHead": initial.to_value(), "expectedEpoch": 0,
         }))
 
-    outcomes = DraftRequestConsumer(store, tuple(requests)).run_once()
+    consumer = DraftRequestConsumer(store, tuple(requests))
+    outcomes = consumer.run_once()
     assert [result.kind for _, result in outcomes] == ["accepted", "activeElsewhere"]
     decisions = store.read(decision_log_id(draft_id), None, 10).records
     assert [decision.data["type"] for decision in decisions] == [
@@ -64,9 +66,24 @@ def draft_rejections_are_durable(root: Path) -> None:
     ]
     assert decisions[-1].data["reason"] == "activeElsewhere"
 
+    b_revision = append(store, record(revision_log_id(draft_id, "B"), None, (initial,), {
+        "type": "draft.revised", "draftId": draft_id, "replicaId": "B",
+        "source": "print('B')", "base": initial.to_value(),
+    }))
+    append(store, record(request_log_id(draft_id, "A"), request_heads["A"], (initial, b_revision), {
+        "type": "draft.takeover", "commandId": "foreign-target",
+        "draftId": draft_id, "replicaId": "A", "expectedHead": initial.to_value(),
+        "expectedEpoch": 1, "targetHead": b_revision.to_value(),
+    }))
+    invalid = consumer.run_once()
+    assert len(invalid) == 1 and invalid[0][1].kind == "invalid"
+    decisions = store.read(decision_log_id(draft_id), None, 10).records
+    assert decisions[-1].data["type"] == "draft.rejected"
+    assert decisions[-1].data["reason"] == "invalid"
+
     head = store.head(decision_log_id(draft_id))
     replayed = DraftRequestConsumer(store, tuple(requests)).run_once()
-    assert [result.kind for _, result in replayed] == ["current", "activeElsewhere"]
+    assert [result.kind for _, result in replayed] == ["current", "invalid", "activeElsewhere"]
     assert store.head(decision_log_id(draft_id)) == head
 
 
@@ -101,7 +118,11 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
         "source": "print('branch')", "base": None,
     }))
     request_log = "submission/A/requests"
-    request = append(store, record(request_log, None, (revision,), {
+    invalid = append(store, record(request_log, None, (revision,), {
+        "type": "submission.requested", "submissionId": "broken",
+        "playgroundId": "lesson", "revision": "not-a-position",
+    }))
+    request = append(store, record(request_log, invalid, (revision,), {
         "type": "submission.requested", "submissionId": "one",
         "playgroundId": "lesson", "revision": revision.to_value(),
     }))
@@ -112,10 +133,13 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
         submission_result_log(request_log),
         SubmissionHandler(store, tags),
     )
-    assert worker.run_once() == 1
+    assert worker.run_once() == 2
     assert worker.run_once() == 0
     assert tags.calls == 1
-    result = store.read("submission/A/results", None, 10).records[0]
+    results = store.read("submission/A/results", None, 10).records
+    assert results[0].data["type"] == "submission.failed"
+    assert results[0].data["request"] == invalid.to_value()
+    result = results[1]
     assert result.data["type"] == "submission.completed"
     assert result.data["request"] == request.to_value()
     assert result.requires == (request, revision)
