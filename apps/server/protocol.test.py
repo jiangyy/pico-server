@@ -224,23 +224,10 @@ def _principal_revision_access(tmp: Path) -> None:
     from picopg.api import record_id_of, ReplicatedRecord
 
     b_revision = "draft/lesson/revision/B"
-    b_request = "draft/lesson/request/B"
     sessions = (
-        PrincipalSession.create("user", "A", "token-a", {
-            "draft/lesson/revision/A": "append",
-            "draft/lesson/request/A": "append",
-            "draft/lesson/decision": "read",
-        }),
-        PrincipalSession.create("user", "B", "token-b", {
-            b_revision: "append",
-            b_request: "append",
-            "draft/lesson/decision": "read",
-        }),
-        PrincipalSession.create("another-user", "C", "token-c", {
-            "draft/lesson/revision/C": "append",
-            "draft/lesson/request/C": "append",
-            "draft/lesson/decision": "read",
-        }),
+        PrincipalSession.create("user", "A", "token-a", {}, ["drafts"]),
+        PrincipalSession.create("user", "B", "token-b", {}, ["drafts"]),
+        PrincipalSession.create("another-user", "C", "token-c", {}, ["drafts"]),
     )
     server, base_url = _start_server(tmp, principal_sessions=sessions)
     host, port = server.server_address

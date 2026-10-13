@@ -44,7 +44,7 @@ def build_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--principal-config",
         type=Path,
-        help="JSON array of {principalId, replicaId, token, grants:[[logId, access], ...]}.",
+        help="JSON array of principal sessions with grants and/or semantic capabilities.",
     )
     parser.add_argument(
         "--submission-repositories",
@@ -103,9 +103,11 @@ def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
         raise ValueError("principal config must be a JSON array")
     sessions: list[PrincipalSession] = []
     for item in raw:
-        if not isinstance(item, dict) or set(item) != {"principalId", "replicaId", "token", "grants"}:
-            raise ValueError("principal entry must contain principalId, replicaId, token and grants")
-        grants = item["grants"]
+        required = {"principalId", "replicaId", "token"}
+        allowed = required | {"grants", "capabilities"}
+        if not isinstance(item, dict) or not required.issubset(item) or not set(item).issubset(allowed):
+            raise ValueError("principal entry must contain principalId, replicaId and token")
+        grants = item.get("grants", [])
         if not isinstance(grants, list):
             raise ValueError("principal grants must be an array")
         mapped: dict[str, str] = {}
@@ -117,8 +119,11 @@ def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
             if grant[0] in mapped:
                 raise ValueError(f"duplicate principal grant for {grant[0]!r}")
             mapped[grant[0]] = grant[1]
+        capabilities = item.get("capabilities", [])
+        if not isinstance(capabilities, list) or any(not isinstance(value, str) for value in capabilities):
+            raise ValueError("principal capabilities must be an array of strings")
         sessions.append(PrincipalSession.create(
-            item["principalId"], item["replicaId"], item["token"], mapped,
+            item["principalId"], item["replicaId"], item["token"], mapped, capabilities,
         ))
     if len({session.token for session in sessions}) != len(sessions):
         raise ValueError("principal tokens must be unique")

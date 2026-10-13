@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from apps.server.authorization import PrincipalSession
 from apps.server.comments import CommentError, CommentPublisher
@@ -22,6 +22,7 @@ from apps.server.workers import (
     SubmissionHandler,
     SubmissionTagWriter,
     draft_request_logs,
+    is_draft_request_log,
     submission_request_logs,
     submission_result_log,
 )
@@ -75,14 +76,18 @@ class PicoPGHttpServer(ReplicaHttpServer):
             for log_id, access in session.grants.items():
                 if access == "append":
                     worker_bindings[log_id] = "append"
-        request_logs = draft_request_logs(worker_bindings)
-        consumers = []
-        if request_logs:
-            consumers.append(DraftRequestConsumer(
-                self.store,
-                request_logs,
-                lambda log_id, head: self.broadcast(log_id, head),
-            ))
+            if "submissions" in session.capabilities:
+                owner = quote(session.replica_id, safe="-_.!~*'()")
+                worker_bindings[f"submission/{owner}/requests"] = "append"
+        request_logs = tuple(sorted(set(draft_request_logs(worker_bindings)) | {
+            log_id for log_id in self.store.log_ids() if is_draft_request_log(log_id)
+        }))
+        self.draft_consumer = DraftRequestConsumer(
+            self.store,
+            request_logs,
+            lambda log_id, head: self.broadcast(log_id, head),
+        )
+        consumers = [self.draft_consumer]
         if submission_tag_writer is not None:
             submission_logs = submission_request_logs(worker_bindings)
             for submission_log in submission_logs:
@@ -100,6 +105,8 @@ class PicoPGHttpServer(ReplicaHttpServer):
     def append_and_broadcast(self, log_id, expected_head, records):
         result = super().append_and_broadcast(log_id, expected_head, records)
         if result.kind == "accepted" and self.workers is not None:
+            if is_draft_request_log(log_id):
+                self.draft_consumer.add_request_log(log_id)
             self.workers.notify_append(log_id)
         return result
 
@@ -124,10 +131,14 @@ class PicoRequestHandler(ReplicaRequestHandler):
             return
         try:
             action, playground_id, version_id = route
-            authenticated = (
-                self._admin_authorized()
-                if action == "publish"
-                else self._authorized() or self._admin_authorized()
+            session = self._principal_session()
+            authenticated = self._admin_authorized() or (
+                action != "publish"
+                and session is not None
+                and (
+                    "playgrounds" in session.capabilities
+                    or session.grants.get(PLAYGROUND_RELEASES_LOG_ID) == "read"
+                )
             )
             if not authenticated:
                 self._error(401, "auth.required", "valid bearer token required")

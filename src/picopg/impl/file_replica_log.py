@@ -35,6 +35,10 @@ class FileReplicaLogStore(ReplicaLogStore):
         self._lock = RLock()
         self._logs = self._load()
 
+    def log_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._logs))
+
     def head(self, log_id: str) -> Position | None:
         _log_id(log_id)
         with self._lock:

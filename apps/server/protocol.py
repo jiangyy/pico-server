@@ -5,7 +5,7 @@ import json
 import logging
 import queue
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -23,7 +23,7 @@ from picopg.api import (
 from apps.server.authorization import (
     PrincipalSession,
     permits_principal_log,
-    readable_principal_logs,
+    principal_observes_log,
 )
 
 
@@ -83,7 +83,7 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         if len({session.replica_id for session in sessions}) != len(sessions):
             raise ValueError("principal session Replica IDs must be unique")
         self._subscriber_lock = threading.Lock()
-        self._subscribers: list[tuple[queue.Queue[str], frozenset[str]]] = []
+        self._subscribers: list[tuple[queue.Queue[str], Callable[[str], bool]]] = []
         super().__init__(address, handler_class or ReplicaRequestHandler)
 
     def broadcast(self, log_id: str, head: "Position | None") -> None:
@@ -98,8 +98,8 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         )
         with self._subscriber_lock:
             queues = list(self._subscribers)
-        for subscriber, readable_logs in queues:
-            if log_id not in readable_logs:
+        for subscriber, observes in queues:
+            if not observes(log_id):
                 continue
             try:
                 subscriber.put_nowait(event)
@@ -290,17 +290,20 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             self._error(401, "auth.required", "valid bearer token required")
             return
         session = self._principal_session()
-        readable_logs = (
-            readable_principal_logs(session, self.server.principal_sessions.values())
-            if session is not None
-            else frozenset(log_id for log_id, access in self.server.bindings.items() if access == "read")
-        )
-        if not readable_logs:
+        if session is not None:
+            sessions = tuple(self.server.principal_sessions.values())
+            observes = lambda log_id: principal_observes_log(session, sessions, log_id)
+            has_access = bool(session.grants or session.capabilities)
+        else:
+            readable_logs = frozenset(log_id for log_id, access in self.server.bindings.items() if access == "read")
+            observes = readable_logs.__contains__
+            has_access = bool(readable_logs)
+        if not has_access:
             self._error(403, "log.not_exposed", "no readable Logs available")
             return
         subscriber: queue.Queue[str] = queue.Queue(maxsize=64)
         with self.server._subscriber_lock:
-            self.server._subscribers.append((subscriber, readable_logs))
+            self.server._subscribers.append((subscriber, observes))
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
