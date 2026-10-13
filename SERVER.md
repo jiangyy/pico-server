@@ -19,3 +19,5 @@ Server 目前有四个彼此分开的部分。
 第四部分是 Playground 发布层。它负责包格式校验、包文件存储和发布事实生成，但不改变 Replica Log 的通用语义。
 
 当前 ZIP v1 adapter 要求 `picopg.json` 声明 `schemaVersion: 1`、`runtime: "python"` 和包内 `module` 路径；`course/index.html` 与该 JavaScript 模块都必须真实存在。HTTP 发布层只依赖 `PackageAdapter` 返回的检查结果，未来替换包格式不需要修改 Log、权限或发布事实。
+
+Principal 会话可以声明 `playgrounds`、`drafts`、`submissions` 语义能力。授权层根据 Principal 与 Replica 身份派生实际 Log 权限：设备只能追加自己的 Revision、Draft Request 和 Submission Request，同一 Principal 的其他设备只能读取 Revision，Server 拥有的 Decision、Comment 和 Submission Result 只读。动态 Draft Request Log 会被 worker 挂载；重启时从持久存储枚举并恢复，避免配置不再逐 Log 列举后漏处理请求。
