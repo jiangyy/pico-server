@@ -34,10 +34,16 @@ def _package(title: str, course: str = "course") -> bytes:
         archive.writestr(
             "picopg.json",
             json.dumps(
-                {"schemaVersion": 1, "runtime": "python", "title": title}
+                {
+                    "schemaVersion": 1,
+                    "runtime": "python",
+                    "module": "course/demo.js",
+                    "title": title,
+                }
             ),
         )
         archive.writestr("course/index.html", course)
+        archive.writestr("course/demo.js", "export const starter = ''; export const Root = () => null;")
         archive.writestr("starter/main.py", "print('hello')\n")
     return output.getvalue()
 

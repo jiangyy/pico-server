@@ -152,7 +152,7 @@ class ZipPackageAdapter:
             raise PackageError("package is missing picopg.json")
         if "course/index.html" not in seen:
             raise PackageError("package is missing course/index.html")
-        return PackageInfo(ZIP_MEDIA_TYPE, _manifest_title(manifest_bytes))
+        return PackageInfo(ZIP_MEDIA_TYPE, _manifest_title(manifest_bytes, seen))
 
 
 class FilePackageStore:
@@ -326,7 +326,7 @@ def _package_path(raw: str) -> str:
     raise PackageError(f"unexpected package path: {name}")
 
 
-def _manifest_title(payload: bytes) -> str | None:
+def _manifest_title(payload: bytes, paths: set[str]) -> str | None:
     try:
         value = json.loads(payload.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -337,6 +337,12 @@ def _manifest_title(payload: bytes) -> str | None:
         raise PackageError("picopg.json schemaVersion must be 1")
     if value.get("runtime") != "python":
         raise PackageError("picopg.json runtime must be python")
+    module = value.get("module")
+    if not isinstance(module, str) or not module.endswith(".js"):
+        raise PackageError("picopg.json module must be a JavaScript package path")
+    module = _package_path(module)
+    if not module.startswith("course/") or module not in paths:
+        raise PackageError("picopg.json module is missing from the package")
     title = value.get("title")
     if title is not None and (not isinstance(title, str) or not title.strip()):
         raise PackageError("picopg.json title must be a non-empty string")
