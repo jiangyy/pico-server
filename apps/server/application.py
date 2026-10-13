@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from apps.server.authorization import PrincipalSession
+from apps.server.comments import CommentError, CommentPublisher
 from apps.server.playgrounds import (
     PLAYGROUND_RELEASES_LOG_ID,
     FilePackageStore,
@@ -24,7 +25,7 @@ from apps.server.workers import (
     submission_request_logs,
     submission_result_log,
 )
-from picopg.api import ReplicaLogStore
+from picopg.api import InvalidReplicaData, ReplicaLogStore
 
 
 class PicoPGHttpServer(ReplicaHttpServer):
@@ -68,6 +69,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
         )
+        self.comments = CommentPublisher(self)
         worker_bindings = dict(self.bindings)
         for session in self.principal_sessions.values():
             for log_id, access in session.grants.items():
@@ -111,7 +113,12 @@ class PicoRequestHandler(ReplicaRequestHandler):
     server: PicoPGHttpServer
 
     def _dispatch(self) -> None:
-        route = _playground_route(urlsplit(self.path).path)
+        path = urlsplit(self.path).path
+        draft_id = _comment_route(path)
+        if draft_id is not None:
+            self._dispatch_comment(draft_id)
+            return
+        route = _playground_route(path)
         if route is None:
             super()._dispatch()
             return
@@ -174,6 +181,30 @@ class PicoRequestHandler(ReplicaRequestHandler):
             logger.exception("playground request failed")
             self._error(500, "server.failure", "server failure")
 
+    def _dispatch_comment(self, draft_id: str) -> None:
+        """Operator-only: append a fact to the Draft's server-owned comment Log."""
+        try:
+            if not self._admin_authorized():
+                self._error(401, "auth.required", "valid operator token required")
+                return
+            if self.command != "POST":
+                self._error(405, "method.not_allowed", "method not allowed")
+                return
+            body = self._read_json()
+            if not isinstance(body, dict) or set(body) != {"author", "text"}:
+                raise CommentError("comment body must contain author and text")
+            position = self.server.comments.add(draft_id, body["author"], body["text"])
+            self._send_json(201, {"position": position.to_value()})
+        except (CommentError, InvalidReplicaData) as error:
+            self._error(400, "comment.invalid", str(error))
+        except _ResponseSent:
+            pass
+        except Exception:
+            from apps.server.protocol import logger
+
+            logger.exception("comment request failed")
+            self._error(500, "server.failure", "server failure")
+
     def _read_package(self) -> bytes:
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
@@ -195,6 +226,14 @@ class PicoRequestHandler(ReplicaRequestHandler):
 
 class _PackageResponseSent(Exception):
     pass
+
+
+def _comment_route(path: str) -> str | None:
+    parts = path.split("/")
+    if parts[:4] != ["", "api", "v1", "drafts"] or len(parts) != 6 or parts[5] != "comments":
+        return None
+    draft_id = unquote(parts[4])
+    return draft_id or None
 
 
 def _playground_route(path: str) -> tuple[str, str, str] | None:
