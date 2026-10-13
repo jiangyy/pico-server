@@ -17,3 +17,5 @@ Server 目前有四个彼此分开的部分。
 第三部分是远程协议层。它把 Replica Log 操作提供给 Client，负责握手、认证、Log 权限和 SSE 通知。
 
 第四部分是 Playground 发布层。它负责包格式校验、包文件存储和发布事实生成，但不改变 Replica Log 的通用语义。
+
+当前 ZIP v1 adapter 要求 `picopg.json` 声明 `schemaVersion: 1`、`runtime: "python"` 和包内 `module` 路径；`course/index.html` 与该 JavaScript 模块都必须真实存在。HTTP 发布层只依赖 `PackageAdapter` 返回的检查结果，未来替换包格式不需要修改 Log、权限或发布事实。
