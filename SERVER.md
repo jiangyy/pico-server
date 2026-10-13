@@ -1,23 +1,35 @@
-# PicoPG Server 机制
+# PicoPG Server
 
-PicoPG Server 负责保存可复制的事实、接收允许由 Client 写入的事实、发布由 Server 拥有的事实，并在事实发生变化后通知在线 Client。
+PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定的结果。它不解释源码语义，也不负责 Client 的 Workspace 或界面状态。
 
-Server 还负责 Playground 包的接收、校验、持久化、版本发布和下载。
+## 已经实现
 
-Server 不负责解释所有业务。
+- 文件型 Replica Log 持久化、记录校验、条件追加和重启恢复。
+- HTTP 握手、head/has/read/append、分页边界、请求体限制与 SSE 通知。
+- Bearer token、`PrincipalSession`，以及 `playgrounds`、`drafts`、`submissions` 语义能力。
+- 按 Principal 与 Replica 动态派生 Log 权限；设备只能追加自己的 Log，同一用户的设备可以互读 Revision。
+- Draft begin/advance/takeover 判定、epoch fencing、拒绝结果持久化与幂等重放。
+- Submission Request 消费、精确 Revision 读取、Git tag 写入和 Result Log 回传。
+- Playground ZIP v1 校验、内容寻址存储、发布冲突检查、Catalog 和精确版本下载。
+- Server-owned Comment Log 与 operator 写入接口。
+- worker 启动时枚举已有 Request Log，运行时也能发现动态 Draft Request Log。
+- protocol、application、worker、comment 测试，以及真实 Client/Server 端到端测试。
 
-## Server 内部的分层
+## 还没有完全完成
 
-Server 目前有四个彼此分开的部分。
+- 正式 Auth：当前 token 和 Principal 来自静态配置；没有登录、Session 刷新/撤销、Replica 注册、课程/班级授权或角色管理。
+- 生产存储：Replica Log、Package 仍使用本机文件；没有 PostgreSQL adapter、Object Storage、migration 和完整备份恢复流程。
+- 部署能力：当前适合单实例；缺少 TLS/反向代理配置、Secret 管理、结构化监控、告警、速率限制和生产 runbook。
+- 横向扩容：worker 与 HTTP Server 同进程；多实例前需要共享 Store、worker lease/竞争控制和唯一结果写入保障。
+- 数据管理：Git repository 映射仍是静态配置；没有 Submission 查询索引、历史管理、保留策略和自动评测编排。
+- Comment 模型：Comment 当前属于 Draft，尚未绑定某次 Revision 或 Submission。
+- 部署后验证：已有本地 HTTP 测试，但还没有真实 HTTPS、代理、断网、重启、备份恢复和容量测试。
 
-第一部分是 Replica Log 契约。它只定义查询 head、判断一个位置是否存在、分页读取和条件追加，不知道 HTTP、Playground 或 ZIP。
+## 下一步
 
-第二部分是文件持久化实现。它把 Log 保存到磁盘，负责校验父子链、Record 身份和跨 Log 依赖，并保证成功响应之前数据已经完成持久化。
+1. 在 HTTP 入口接入正式 Auth，把外部凭据转换为现有 Principal/Replica 权限上下文，不修改 Draft 协议。
+2. 明确每类数据的唯一权威，再接 PostgreSQL、Object Storage 和 Git 管理；避免同一事实多处双写。
+3. 先完成可恢复的单实例部署，再做 staging HTTP、鉴权、重启和故障测试。
+4. 只有真实负载证明需要时，才拆 worker、共享 Store 和横向扩容。
 
-第三部分是远程协议层。它把 Replica Log 操作提供给 Client，负责握手、认证、Log 权限和 SSE 通知。
-
-第四部分是 Playground 发布层。它负责包格式校验、包文件存储和发布事实生成，但不改变 Replica Log 的通用语义。
-
-当前 ZIP v1 adapter 要求 `picopg.json` 声明 `schemaVersion: 1`、`runtime: "python"` 和包内 `module` 路径；`course/index.html` 与该 JavaScript 模块都必须真实存在。HTTP 发布层只依赖 `PackageAdapter` 返回的检查结果，未来替换包格式不需要修改 Log、权限或发布事实。
-
-Principal 会话可以声明 `playgrounds`、`drafts`、`submissions` 语义能力。授权层根据 Principal 与 Replica 身份派生实际 Log 权限：设备只能追加自己的 Revision、Draft Request 和 Submission Request，同一 Principal 的其他设备只能读取 Revision，Server 拥有的 Decision、Comment 和 Submission Result 只读。动态 Draft Request Log 会被 worker 挂载；重启时从持久存储枚举并恢复，避免配置不再逐 Log 列举后漏处理请求。
+无论底层存储和部署方式怎样变化，都必须保持：单写者、精确 Revision 引用、结果可重放、通知不承载事实、Server 不合并源码。
