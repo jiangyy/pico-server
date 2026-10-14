@@ -223,11 +223,11 @@ def _append_and_broadcast(tmp: Path) -> None:
 def _principal_revision_access(tmp: Path) -> None:
     from picopg.api import record_id_of, ReplicatedRecord
 
-    b_revision = "draft/lesson/revision/B"
+    b_revision = "principal/user/draft/lesson/revision/B"
     sessions = (
         PrincipalSession.create("user", "A", "token-a", {}, ["drafts"]),
         PrincipalSession.create("user", "B", "token-b", {}, ["drafts"]),
-        PrincipalSession.create("another-user", "C", "token-c", {}, ["drafts"]),
+        PrincipalSession.create("another-user", "A", "token-c", {}, ["drafts"]),
     )
     server, base_url = _start_server(tmp, principal_sessions=sessions)
     host, port = server.server_address
@@ -235,17 +235,17 @@ def _principal_revision_access(tmp: Path) -> None:
     stream_conn = HTTPConnection(host, port, timeout=5)
     try:
         status, _, _ = _get(
-            f"{base_url}/api/v1/replica/logs/draft%2Flesson%2Frevision%2FB/records",
+            f"{base_url}/api/v1/replica/logs/principal%2Fuser%2Fdraft%2Flesson%2Frevision%2FB/records",
             headers=auth,
         )
         _expect(status == 200, f"same-Principal Revision read returned {status}")
         status, _, _ = _get(
-            f"{base_url}/api/v1/replica/logs/draft%2Flesson%2Frequest%2FB/records",
+            f"{base_url}/api/v1/replica/logs/principal%2Fuser%2Fdraft%2Flesson%2Frequest%2FB/records",
             headers=auth,
         )
         _expect(status == 403, f"another Replica Request Log returned {status}")
         status, _, _ = _get(
-            f"{base_url}/api/v1/replica/logs/draft%2Flesson%2Frevision%2FC/records",
+            f"{base_url}/api/v1/replica/logs/principal%2Fanother-user%2Fdraft%2Flesson%2Frevision%2FA/records",
             headers=auth,
         )
         _expect(status == 403, f"another Principal Revision Log returned {status}")
@@ -270,7 +270,7 @@ def _principal_revision_access(tmp: Path) -> None:
         conn = HTTPConnection(host, port, timeout=2)
         conn.request(
             "POST",
-            "/api/v1/replica/logs/draft%2Flesson%2Frevision%2FB/records",
+            "/api/v1/replica/logs/principal%2Fuser%2Fdraft%2Flesson%2Frevision%2FB/records",
             body=b'{"expectedHead":null,"records":[]}',
             headers={**auth, "Content-Type": "application/json"},
         )

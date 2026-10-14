@@ -34,7 +34,7 @@ def _start(tmp: Path) -> tuple[PicoPGHttpServer, str]:
         FileReplicaLogStore(tmp / "replica"),
         "operator-token",
         tmp / "packages",
-        bindings=[(comment_log_id("lesson"), "read")],
+        bindings=[(comment_log_id("user", "lesson"), "read")],
     )
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -74,11 +74,11 @@ def _call(
 
 
 def _comments(base_url: str) -> None:
-    log_id = comment_log_id("lesson")
+    log_id = comment_log_id("user", "lesson")
     route = quote(log_id, safe="")
 
     status, created = _call(
-        f"{base_url}/api/v1/drafts/lesson/comments",
+        f"{base_url}/api/v1/principals/user/drafts/lesson/comments",
         method="POST",
         body={"author": "teacher", "text": "try a loop here"},
     )
@@ -87,7 +87,7 @@ def _comments(base_url: str) -> None:
     _expect(first["logId"] == log_id, f"comment landed in {first['logId']}")
 
     status, _ = _call(
-        f"{base_url}/api/v1/drafts/lesson/comments",
+        f"{base_url}/api/v1/principals/user/drafts/lesson/comments",
         method="POST",
         body={"author": "teacher", "text": "second"},
     )
@@ -103,14 +103,14 @@ def _comments(base_url: str) -> None:
     _expect(records[0]["requires"] == [], "comments must not depend on Replica Logs")
 
     status, _ = _call(
-        f"{base_url}/api/v1/drafts/lesson/comments",
+        f"{base_url}/api/v1/principals/user/drafts/lesson/comments",
         method="POST",
         body={"author": "teacher", "text": "   "},
     )
     _expect(status == 400, f"empty text returned {status}")
 
     status, _ = _call(
-        f"{base_url}/api/v1/drafts/lesson/comments",
+        f"{base_url}/api/v1/principals/user/drafts/lesson/comments",
         method="POST",
         body={"author": "teacher", "text": "nope"},
         token="client-token",

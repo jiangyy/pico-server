@@ -6,13 +6,13 @@ PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定�
 
 - 文件型 Replica Log 持久化、记录校验、条件追加和重启恢复。
 - HTTP 握手、head/has/read/append、分页边界、请求体限制与 SSE 通知。
-- Bearer token、`PrincipalSession`，以及 `playgrounds`、`drafts`、`submissions` 语义能力。
-- 按 Principal 与 Replica 动态派生 Log 权限；设备只能追加自己的 Log，同一用户的设备可以互读 Revision。
+- `Authenticator`、`AuthenticatedReplica`、`ReplicaDirectory` 与 `LogAuthorization` 分层；静态 token 配置只存在于 composition root。
+- 日志使用 `principal/{principalId}/...` 命名空间；设备只能追加自己的 Log，同一用户的设备可以互读 Revision，不同用户即使 Draft ID 相同也完全隔离。
 - Draft begin/advance/takeover 判定、epoch fencing、拒绝结果持久化与幂等重放。
 - Submission Request 消费、精确 Revision 读取、Git tag 写入和 Result Log 回传。
 - Playground ZIP v1 校验、内容寻址存储、发布冲突检查、Catalog 和精确版本下载。
 - Server-owned Comment Log 与 operator 写入接口。
-- worker 启动时枚举已有 Request Log，运行时也能发现动态 Draft Request Log。
+- worker 启动时枚举已有 Request Log，运行时动态发现 Draft 与 Submission Request Log，不依赖认证配置推导任务。
 - protocol、application、worker、comment 测试，以及真实 Client/Server 端到端测试。
 
 ## 还没有完全完成
@@ -27,7 +27,7 @@ PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定�
 
 ## 下一步
 
-1. 在 HTTP 入口接入正式 Auth，把外部凭据转换为现有 Principal/Replica 权限上下文，不修改 Draft 协议。
+1. 用正式登录/Session 实现替换静态 `Authenticator`，继续输出相同的 `AuthenticatedReplica`，不修改 Draft 协议。
 2. 明确每类数据的唯一权威，再接 PostgreSQL、Object Storage 和 Git 管理；避免同一事实多处双写。
 3. 先完成可恢复的单实例部署，再做 staging HTTP、鉴权、重启和故障测试。
 4. 只有真实负载证明需要时，才拆 worker、共享 Store 和横向扩容。

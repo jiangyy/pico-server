@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
 from typing import Protocol
+from urllib.parse import quote, unquote
 
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
@@ -57,6 +58,7 @@ class SubmissionHandler:
             })
 
     def _complete(self, record: ReplicatedRecord, request: Position) -> WorkerResult:
+        request_principal, _ = submission_request_scope(request.log_id)
         data = record.data
         if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
             raise ValueError("request is not a Submission")
@@ -70,7 +72,10 @@ class SubmissionHandler:
             raise ValueError("Submission Revision is missing")
         from apps.server.drafts import _decode_revision
 
-        source = _decode_revision(revision_record)["source"]
+        decoded = _decode_revision(revision_record)
+        if decoded["principalId"] != request_principal:
+            raise ValueError("Submission Revision belongs to another Principal")
+        source = decoded["source"]
         tag = self._tags.create(
             idempotency_key=f"{request.log_id}:{request.record_id}",
             submission_id=submission_id,
@@ -195,6 +200,47 @@ class DraftRequestConsumer:
             self._request_logs.add(log_id)
 
 
+class SubmissionRequestConsumer:
+    """Discovers principal-scoped Submission Request Logs independently of auth config."""
+
+    def __init__(
+        self,
+        store: ReplicaLogStore,
+        request_logs: tuple[str, ...],
+        tags: SubmissionTagWriter,
+        on_result: Callable[[str, Position], None] | None = None,
+    ) -> None:
+        if len(set(request_logs)) != len(request_logs):
+            raise ValueError("request_logs must be unique")
+        if any(not is_submission_request_log(log_id) for log_id in request_logs):
+            raise ValueError("request_logs must contain only Submission Request Logs")
+        self._store = store
+        self._request_logs = set(request_logs)
+        self._lock = Lock()
+        self._handler = SubmissionHandler(store, tags)
+        self._on_result = on_result
+
+    def run_once(self) -> int:
+        with self._lock:
+            request_logs = tuple(sorted(self._request_logs))
+        return sum(
+            LogWorker(
+                self._store,
+                (request_log,),
+                submission_result_log(request_log),
+                self._handler,
+                self._on_result,
+            ).run_once()
+            for request_log in request_logs
+        )
+
+    def add_request_log(self, log_id: str) -> None:
+        if not is_submission_request_log(log_id):
+            raise ValueError("log_id is not a Submission Request Log")
+        with self._lock:
+            self._request_logs.add(log_id)
+
+
 class ServerWorkerThread:
     """Wakes log consumers after appends; scans configured request Logs on startup."""
 
@@ -245,25 +291,46 @@ def draft_request_logs(bindings: Mapping[str, str]) -> tuple[str, ...]:
 def submission_request_logs(bindings: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(sorted(
         log_id for log_id, access in bindings.items()
-        if access == "append" and _is_submission_request_log(log_id)
+        if access == "append" and is_submission_request_log(log_id)
     ))
 
 
 def submission_result_log(request_log: str) -> str:
-    parts = request_log.split("/")
-    if len(parts) != 3 or parts[0] != "submission" or not parts[1] or parts[2] != "requests":
-        raise ValueError("request_log is not a Submission Request Log")
-    return f"submission/{parts[1]}/results"
+    principal, replica = submission_request_scope(request_log)
+    safe = "-_.!~*'()"
+    return f"principal/{quote(principal, safe=safe)}/submission/{quote(replica, safe=safe)}/results"
 
 
 def is_draft_request_log(log_id: str) -> bool:
     parts = log_id.split("/")
-    return len(parts) == 4 and parts[0] == "draft" and bool(parts[1]) and parts[2] == "request" and bool(parts[3])
+    return (
+        len(parts) == 6
+        and parts[0] == "principal"
+        and bool(parts[1])
+        and parts[2] == "draft"
+        and bool(parts[3])
+        and parts[4] == "request"
+        and bool(parts[5])
+    )
 
 
-def _is_submission_request_log(log_id: str) -> bool:
+def is_submission_request_log(log_id: str) -> bool:
     parts = log_id.split("/")
-    return len(parts) == 3 and parts[0] == "submission" and bool(parts[1]) and parts[2] == "requests"
+    return (
+        len(parts) == 5
+        and parts[0] == "principal"
+        and bool(parts[1])
+        and parts[2] == "submission"
+        and bool(parts[3])
+        and parts[4] == "requests"
+    )
+
+
+def submission_request_scope(log_id: str) -> tuple[str, str]:
+    if not is_submission_request_log(log_id):
+        raise ValueError("request_log is not a Submission Request Log")
+    parts = log_id.split("/")
+    return unquote(parts[1]), unquote(parts[3])
 
 
 def _records(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:

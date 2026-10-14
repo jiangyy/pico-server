@@ -40,8 +40,9 @@ def append(store: FileReplicaLogStore, value: ReplicatedRecord) -> Position:
 
 def draft_rejections_are_durable(root: Path) -> None:
     store = FileReplicaLogStore(root)
+    principal_id = "user"
     draft_id = "lesson"
-    origin_log = revision_log_id(draft_id, "origin")
+    origin_log = revision_log_id(principal_id, draft_id, "origin")
     initial = append(store, record(origin_log, None, (), {
         "type": "draft.revised", "draftId": draft_id, "replicaId": "origin",
         "source": "print(0)", "base": None,
@@ -49,7 +50,7 @@ def draft_rejections_are_durable(root: Path) -> None:
     requests: list[str] = []
     request_heads: dict[str, Position] = {}
     for replica_id in ("A", "B"):
-        log_id = request_log_id(draft_id, replica_id)
+        log_id = request_log_id(principal_id, draft_id, replica_id)
         requests.append(log_id)
         request_heads[replica_id] = append(store, record(log_id, None, (initial,), {
             "type": "draft.beginEditing", "commandId": f"begin-{replica_id}",
@@ -60,42 +61,42 @@ def draft_rejections_are_durable(root: Path) -> None:
     consumer = DraftRequestConsumer(store, tuple(requests))
     outcomes = consumer.run_once()
     assert [result.kind for _, result in outcomes] == ["accepted", "activeElsewhere"]
-    decisions = store.read(decision_log_id(draft_id), None, 10).records
+    decisions = store.read(decision_log_id(principal_id, draft_id), None, 10).records
     assert [decision.data["type"] for decision in decisions] == [
         "draft.started", "draft.editingStarted", "draft.rejected",
     ]
     assert decisions[-1].data["reason"] == "activeElsewhere"
 
-    b_revision = append(store, record(revision_log_id(draft_id, "B"), None, (initial,), {
+    b_revision = append(store, record(revision_log_id(principal_id, draft_id, "B"), None, (initial,), {
         "type": "draft.revised", "draftId": draft_id, "replicaId": "B",
         "source": "print('B')", "base": initial.to_value(),
     }))
-    append(store, record(request_log_id(draft_id, "A"), request_heads["A"], (initial, b_revision), {
+    append(store, record(request_log_id(principal_id, draft_id, "A"), request_heads["A"], (initial, b_revision), {
         "type": "draft.takeover", "commandId": "foreign-target",
         "draftId": draft_id, "replicaId": "A", "expectedHead": initial.to_value(),
         "expectedEpoch": 1, "targetHead": b_revision.to_value(),
     }))
     invalid = consumer.run_once()
     assert len(invalid) == 1 and invalid[0][1].kind == "invalid"
-    decisions = store.read(decision_log_id(draft_id), None, 10).records
+    decisions = store.read(decision_log_id(principal_id, draft_id), None, 10).records
     assert decisions[-1].data["type"] == "draft.rejected"
     assert decisions[-1].data["reason"] == "invalid"
 
-    head = store.head(decision_log_id(draft_id))
+    head = store.head(decision_log_id(principal_id, draft_id))
     replayed = DraftRequestConsumer(store, tuple(requests)).run_once()
     assert [result.kind for _, result in replayed] == ["current", "invalid", "activeElsewhere"]
-    assert store.head(decision_log_id(draft_id)) == head
+    assert store.head(decision_log_id(principal_id, draft_id)) == head
 
 
 def replica_grants_are_fenced() -> None:
     PrincipalSession.create("user", "A", "token", {
-        "draft/lesson/revision/A": "append",
-        "draft/lesson/request/A": "append",
-        "submission/A/requests": "append",
-        "submission/A/results": "read",
+        "principal/user/draft/lesson/revision/A": "append",
+        "principal/user/draft/lesson/request/A": "append",
+        "principal/user/submission/A/requests": "append",
+        "principal/user/submission/A/results": "read",
     })
     try:
-        PrincipalSession.create("user", "A", "token", {"draft/lesson/request/B": "append"})
+        PrincipalSession.create("user", "A", "token", {"principal/user/draft/lesson/request/B": "append"})
     except ValueError:
         pass
     else:
@@ -113,11 +114,11 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
             return "picopg/submissions/branch"
 
     store = FileReplicaLogStore(root)
-    revision = append(store, record("draft/lesson/revision/A", None, (), {
+    revision = append(store, record("principal/user/draft/lesson/revision/A", None, (), {
         "type": "draft.revised", "draftId": "lesson", "replicaId": "A",
         "source": "print('branch')", "base": None,
     }))
-    request_log = "submission/A/requests"
+    request_log = "principal/user/submission/A/requests"
     invalid = append(store, record(request_log, None, (revision,), {
         "type": "submission.requested", "submissionId": "broken",
         "playgroundId": "lesson", "revision": "not-a-position",
@@ -136,7 +137,7 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
     assert worker.run_once() == 2
     assert worker.run_once() == 0
     assert tags.calls == 1
-    results = store.read("submission/A/results", None, 10).records
+    results = store.read("principal/user/submission/A/results", None, 10).records
     assert results[0].data["type"] == "submission.failed"
     assert results[0].data["request"] == invalid.to_value()
     result = results[1]
@@ -151,7 +152,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as raw:
         branch_revisions_can_be_submitted(Path(raw))
     replica_grants_are_fenced()
-    assert submission_result_log("submission/A/requests") == "submission/A/results"
+    assert submission_result_log("principal/user/submission/A/requests") == "principal/user/submission/A/results"
     print("durable Draft rejection, replica fencing and Submission result routing passed")
     return 0
 

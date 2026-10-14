@@ -24,8 +24,9 @@ class CommentError(ValueError):
     """Raised when a comment cannot be accepted as a fact."""
 
 
-def comment_log_id(draft_id: str) -> str:
-    return f"draft/{quote(draft_id, safe='-_.!~*()')}/comment"
+def comment_log_id(principal_id: str, draft_id: str) -> str:
+    safe = "-_.!~*()"
+    return f"principal/{quote(principal_id, safe=safe)}/draft/{quote(draft_id, safe=safe)}/comment"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,11 +66,12 @@ class CommentPublisher:
         self._store = server.store
         self._lock = threading.Lock()
 
-    def add(self, draft_id: str, author: str, text: str) -> Position:
+    def add(self, principal_id: str, draft_id: str, author: str, text: str) -> Position:
+        principal_id = _text(principal_id, "principalId")
         draft_id = _draft_id(draft_id)
         author = _text(author, "author")
         text = _text(text, "text")
-        log_id = comment_log_id(draft_id)
+        log_id = comment_log_id(principal_id, draft_id)
         data: dict[str, JsonValue] = {
             "type": COMMENT_KIND,
             "draftId": draft_id,
@@ -90,17 +92,18 @@ class CommentPublisher:
                 raise RuntimeError("comment Log changed during a locked append")
             return record.position
 
-    def comments(self, draft_id: str) -> tuple[Comment, ...]:
+    def comments(self, principal_id: str, draft_id: str) -> tuple[Comment, ...]:
         """Reads the Draft's comments in Log order."""
+        principal_id = _text(principal_id, "principalId")
         draft_id = _draft_id(draft_id)
-        log_id = comment_log_id(draft_id)
+        log_id = comment_log_id(principal_id, draft_id)
         comments: list[Comment] = []
         after: Position | None = None
         while True:
             page = self._store.read(log_id, after, 128)
             for record in page.records:
                 comments.append(_decode(record, draft_id))
-            if not page.hasMore:
+            if not page.has_more:
                 return tuple(comments)
             if not page.records:
                 raise RuntimeError("comment Log returned an empty continuation page")

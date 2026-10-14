@@ -127,8 +127,8 @@ def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
         ))
     if len({session.token for session in sessions}) != len(sessions):
         raise ValueError("principal tokens must be unique")
-    if len({session.replica_id for session in sessions}) != len(sessions):
-        raise ValueError("principal Replica IDs must be unique")
+    if len({(session.principal_id, session.replica_id) for session in sessions}) != len(sessions):
+        raise ValueError("principal Replica identities must be unique")
     return sessions
 
 

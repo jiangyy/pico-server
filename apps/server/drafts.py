@@ -4,23 +4,45 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 PAGE_SIZE = 128
 
 
-def revision_log_id(draft_id: str, replica_id: str) -> str:
-    return f"draft/{_component(draft_id, 'draftId')}/revision/{_component(replica_id, 'replicaId')}"
+def revision_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
+    return (
+        f"principal/{_component(principal_id, 'principalId')}"
+        f"/draft/{_component(draft_id, 'draftId')}/revision/{_component(replica_id, 'replicaId')}"
+    )
 
 
-def request_log_id(draft_id: str, replica_id: str) -> str:
-    return f"draft/{_component(draft_id, 'draftId')}/request/{_component(replica_id, 'replicaId')}"
+def request_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
+    return (
+        f"principal/{_component(principal_id, 'principalId')}"
+        f"/draft/{_component(draft_id, 'draftId')}/request/{_component(replica_id, 'replicaId')}"
+    )
 
 
-def decision_log_id(draft_id: str) -> str:
-    return f"draft/{_component(draft_id, 'draftId')}/decision"
+def decision_log_id(principal_id: str, draft_id: str) -> str:
+    return f"principal/{_component(principal_id, 'principalId')}/draft/{_component(draft_id, 'draftId')}/decision"
+
+
+def _draft_scope(log_id: str, kind: str) -> tuple[str, str, str | None]:
+    parts = log_id.split("/")
+    expected = 5 if kind == "decision" else 6
+    if (
+        len(parts) != expected
+        or parts[0] != "principal"
+        or not parts[1]
+        or parts[2] != "draft"
+        or not parts[3]
+        or parts[4] != kind
+        or (expected == 6 and not parts[5])
+    ):
+        raise ValueError(f"Log is not a Draft {kind} Log")
+    return unquote(parts[1]), unquote(parts[3]), None if expected == 5 else unquote(parts[5])
 
 
 def _component(value: str, label: str) -> str:
@@ -94,8 +116,11 @@ def project_draft(records: tuple[ReplicatedRecord, ...]) -> DraftRef:
     first = records[0].data
     if not isinstance(first, Mapping) or first.get("type") != "draft.started":
         raise ValueError("decision Log must start with draft.started")
+    principal_id, scoped_draft_id, _ = _draft_scope(records[0].log_id, "decision")
     draft_id = _text(first.get("draftId"), "decision.draftId")
-    log_id = decision_log_id(draft_id)
+    if draft_id != scoped_draft_id:
+        raise ValueError("decision belongs to another Draft")
+    log_id = decision_log_id(principal_id, draft_id)
     head = _position(first.get("head"), "decision.head")
     ref = DraftRef(head, None, 0)
     commands: set[str] = set()
@@ -148,25 +173,29 @@ class DraftAuthority:
     def __init__(self, store: ReplicaLogStore) -> None:
         self._store = store
 
-    def initialize(self, draft_id: str, initial_head: Position) -> DraftResult:
+    def initialize(self, principal_id: str, draft_id: str, initial_head: Position) -> DraftResult:
         try:
+            principal_id = _text(principal_id, "principalId")
             draft_id = _text(draft_id, "draftId")
             revision = _at(self._store, initial_head)
             if revision is None:
                 raise ValueError("initial Revision is not available")
-            if _decode_revision(revision)["base"] is not None:
+            decoded = _decode_revision(revision)
+            if decoded["principalId"] != principal_id or decoded["draftId"] != draft_id:
+                raise ValueError("initial Revision belongs to another Principal or Draft")
+            if decoded["base"] is not None:
                 raise ValueError("initial Revision must have a null base")
-            existing = _records(self._store, decision_log_id(draft_id))
+            existing = _records(self._store, decision_log_id(principal_id, draft_id))
             if existing:
                 ref = project_draft(existing)
                 if ref.head != initial_head:
                     raise ValueError("Draft was initialized with another Revision")
                 return DraftResult("current", ref, existing[-1].position)
             data = {"type": "draft.started", "draftId": draft_id, "head": initial_head.to_value()}
-            record = _record(decision_log_id(draft_id), None, (), data)
+            record = _record(decision_log_id(principal_id, draft_id), None, (), data)
             result = self._store.append(record.log_id, None, (record,))
             if result.kind != "accepted":
-                return self.initialize(draft_id, initial_head)
+                return self.initialize(principal_id, draft_id, initial_head)
             return DraftResult("accepted", DraftRef(initial_head, None, 0), record.position)
         except (TypeError, ValueError) as error:
             return DraftResult("invalid", None, message=str(error))
@@ -181,12 +210,17 @@ class DraftAuthority:
             if not isinstance(command, Mapping):
                 raise ValueError("command must be an object")
             kind = command.get("type")
+            principal_id, request_draft_id, request_replica_id = _draft_scope(
+                request.log_id, "request"
+            )
             draft_id = _text(command.get("draftId"), "command.draftId")
             replica_id = _text(command.get("replicaId"), "command.replicaId")
             command_id = _text(command.get("commandId"), "command.commandId")
-            if request.log_id != request_log_id(draft_id, replica_id):
+            if draft_id != request_draft_id or replica_id != request_replica_id:
                 raise ValueError("command is stored in the wrong Request Log")
-            decision_log = decision_log_id(draft_id)
+            if request.log_id != request_log_id(principal_id, draft_id, replica_id):
+                raise ValueError("command is stored in the wrong Request Log")
+            decision_log = decision_log_id(principal_id, draft_id)
             required = [_position(command.get("expectedHead"), "command.expectedHead")]
             if kind in ("draft.takeover", "draft.advance"):
                 required.append(_position(command.get("targetHead"), "command.targetHead"))
@@ -200,7 +234,7 @@ class DraftAuthority:
                 if not decisions:
                     if kind != "draft.beginEditing":
                         raise ValueError("Draft is not initialized")
-                    initialized = self.initialize(draft_id, required[0])
+                    initialized = self.initialize(principal_id, draft_id, required[0])
                     if initialized.kind not in ("accepted", "current"):
                         raise ValueError(initialized.message or "Draft could not be initialized")
                     continue
@@ -237,8 +271,8 @@ class DraftAuthority:
                     if target is None:
                         return DraftResult("missingDependency", ref, message="referenced Revision is not available")
                     revision = _decode_revision(target)
-                    if revision["draftId"] != draft_id:
-                        raise ValueError("Revision belongs to another Draft")
+                    if revision["principalId"] != principal_id or revision["draftId"] != draft_id:
+                        raise ValueError("Revision belongs to another Principal or Draft")
                     if required[0] != ref.head or expected_epoch != ref.epoch:
                         rejected = self._reject(decisions, request_position, command_id, "changed", ref)
                         if rejected is None:
@@ -307,13 +341,22 @@ def _decode_revision(record: ReplicatedRecord) -> dict[str, object]:
         raise ValueError("record is not a Draft Revision")
     draft_id = _text(data.get("draftId"), "revision.draftId")
     replica_id = _text(data.get("replicaId"), "revision.replicaId")
-    if record.log_id != revision_log_id(draft_id, replica_id):
+    principal_id, scoped_draft_id, scoped_replica_id = _draft_scope(record.log_id, "revision")
+    if draft_id != scoped_draft_id or replica_id != scoped_replica_id:
+        raise ValueError("Revision is stored in the wrong Log")
+    if record.log_id != revision_log_id(principal_id, draft_id, replica_id):
         raise ValueError("Revision is stored in the wrong Log")
     source = data.get("source")
     if not isinstance(source, str):
         raise ValueError("revision.source must be a string")
     base = None if data.get("base") is None else _position(data.get("base"), "revision.base")
-    return {"draftId": draft_id, "replicaId": replica_id, "source": source, "base": base}
+    return {
+        "principalId": principal_id,
+        "draftId": draft_id,
+        "replicaId": replica_id,
+        "source": source,
+        "base": base,
+    }
 
 
 def _replayed_command(

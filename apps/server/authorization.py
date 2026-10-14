@@ -1,11 +1,12 @@
-"""Principal-scoped Log permissions for replica sessions."""
+"""Authentication and principal-scoped Log authorization."""
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Protocol
 from urllib.parse import quote
 
 
@@ -13,7 +14,29 @@ PRINCIPAL_CAPABILITIES = frozenset(("playgrounds", "drafts", "submissions"))
 
 
 @dataclass(frozen=True, slots=True)
+class AuthenticatedReplica:
+    principal_id: str
+    replica_id: str
+
+
+class Authenticator(Protocol):
+    def authenticate(self, token: str) -> AuthenticatedReplica | None: ...
+
+
+class ReplicaDirectory(Protocol):
+    def replicas(self, principal_id: str) -> frozenset[str]: ...
+
+
+class LogAuthorization(Protocol):
+    def access(self, identity: AuthenticatedReplica, log_id: str) -> str | None: ...
+
+    def has_access(self, identity: AuthenticatedReplica) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
 class PrincipalSession:
+    """Static composition-root configuration; request handlers never receive it."""
+
     principal_id: str
     replica_id: str
     token: str
@@ -37,9 +60,10 @@ class PrincipalSession:
             raise ValueError("grant Log IDs must be non-empty")
         if any(access not in ("read", "append") for access in copied.values()):
             raise ValueError("grant access must be 'read' or 'append'")
-        owner = quote(replica_id, safe="-_.!~*'()")
+        identity = AuthenticatedReplica(principal_id, replica_id)
         for log_id, access in copied.items():
-            if access == "append" and _replica_owner(log_id) not in (None, owner):
+            owner = _replica_owner(log_id)
+            if access == "append" and owner is not None and owner != _encoded_identity(identity):
                 raise ValueError(f"append grant {log_id!r} belongs to another Replica")
         enabled = frozenset(capabilities)
         unknown = enabled - PRINCIPAL_CAPABILITIES
@@ -47,71 +71,112 @@ class PrincipalSession:
             raise ValueError(f"unknown principal capabilities: {', '.join(sorted(unknown))}")
         return cls(principal_id, replica_id, token, MappingProxyType(copied), enabled)
 
-    def permits(self, log_id: str, action: str, method: str) -> bool:
-        access = self.grants.get(log_id)
-        if access is None:
-            return False
-        if method == "POST":
-            return action == "records" and access == "append"
-        if method in ("GET", "HEAD"):
-            if action not in ("head", "has", "records"):
-                return False
-            if access == "read":
-                return True
-            return action in ("head", "has")
-        return False
 
-    @property
-    def readable_logs(self) -> frozenset[str]:
-        # Append-only clients still need head invalidation events for their own Logs.
-        return frozenset(self.grants)
+class StaticAuthenticator:
+    def __init__(self, sessions: Iterable[PrincipalSession]) -> None:
+        entries = tuple(sessions)
+        if len({entry.token for entry in entries}) != len(entries):
+            raise ValueError("principal session tokens must be unique")
+        self._entries = tuple(
+            (entry.token, AuthenticatedReplica(entry.principal_id, entry.replica_id))
+            for entry in entries
+        )
 
-
-def _replica_owner(log_id: str) -> str | None:
-    parts = log_id.split("/")
-    if len(parts) == 4 and parts[0] == "draft" and parts[2] in ("revision", "request"):
-        return parts[3]
-    if len(parts) == 3 and parts[0] == "submission" and parts[2] == "requests":
-        return parts[1]
-    return None
+    def authenticate(self, token: str) -> AuthenticatedReplica | None:
+        matched = None
+        for known, identity in self._entries:
+            if hmac.compare_digest(token, known):
+                matched = identity
+        return matched
 
 
-def _dynamic_access(
-    session: PrincipalSession,
-    sessions: Iterable[PrincipalSession],
-    log_id: str,
-) -> str | None:
-    if "playgrounds" in session.capabilities and log_id == "playground-releases":
-        return "read"
-    parts = log_id.split("/")
-    owner = quote(session.replica_id, safe="-_.!~*'()")
-    if "drafts" in session.capabilities and len(parts) >= 3 and parts[0] == "draft" and parts[1]:
-        if len(parts) == 3 and parts[2] in ("decision", "comment"):
-            return "read"
-        if len(parts) == 4 and parts[3]:
-            if parts[2] == "request":
-                return "append" if parts[3] == owner else None
-            if parts[2] == "revision":
-                if parts[3] == owner:
-                    return "append"
-                principal_replicas = {
-                    quote(candidate.replica_id, safe="-_.!~*'()")
-                    for candidate in sessions
-                    if candidate.principal_id == session.principal_id
-                    and "drafts" in candidate.capabilities
-                }
-                return "read" if parts[3] in principal_replicas else None
-    if "submissions" in session.capabilities and len(parts) == 3 and parts[0] == "submission":
-        if parts[1] != owner:
+class StaticReplicaDirectory:
+    def __init__(self, sessions: Iterable[PrincipalSession]) -> None:
+        by_principal: dict[str, set[str]] = {}
+        identities: set[tuple[str, str]] = set()
+        for session in sessions:
+            key = (session.principal_id, session.replica_id)
+            if key in identities:
+                raise ValueError("principal session identities must be unique")
+            identities.add(key)
+            by_principal.setdefault(session.principal_id, set()).add(session.replica_id)
+        self._by_principal = {
+            principal_id: frozenset(replicas)
+            for principal_id, replicas in by_principal.items()
+        }
+
+    def replicas(self, principal_id: str) -> frozenset[str]:
+        return self._by_principal.get(principal_id, frozenset())
+
+
+class PrincipalLogAuthorization:
+    def __init__(
+        self,
+        sessions: Iterable[PrincipalSession],
+        directory: ReplicaDirectory,
+    ) -> None:
+        self._directory = directory
+        self._grants: dict[AuthenticatedReplica, Mapping[str, str]] = {}
+        self._capabilities: dict[AuthenticatedReplica, frozenset[str]] = {}
+        for session in sessions:
+            identity = AuthenticatedReplica(session.principal_id, session.replica_id)
+            if identity in self._grants:
+                raise ValueError("principal session identities must be unique")
+            self._grants[identity] = session.grants
+            self._capabilities[identity] = session.capabilities
+
+    def access(self, identity: AuthenticatedReplica, log_id: str) -> str | None:
+        grants = self._grants.get(identity)
+        if grants is None:
             return None
-        if parts[2] == "requests":
-            return "append"
-        if parts[2] == "results":
+        explicit = grants.get(log_id)
+        if explicit is not None:
+            return explicit
+        capabilities = self._capabilities[identity]
+        if "playgrounds" in capabilities and log_id == "playground-releases":
             return "read"
-    return None
+        parts = log_id.split("/")
+        principal, replica = _encoded_identity(identity)
+        if (
+            "drafts" in capabilities
+            and len(parts) >= 5
+            and parts[0] == "principal"
+            and parts[1] == principal
+            and parts[2] == "draft"
+            and parts[3]
+        ):
+            if len(parts) == 5 and parts[4] in ("decision", "comment"):
+                return "read"
+            if len(parts) == 6 and parts[5]:
+                if parts[4] == "request":
+                    return "append" if parts[5] == replica else None
+                if parts[4] == "revision":
+                    if parts[5] == replica:
+                        return "append"
+                    known = {
+                        quote(value, safe="-_.!~*'()")
+                        for value in self._directory.replicas(identity.principal_id)
+                    }
+                    return "read" if parts[5] in known else None
+        if (
+            "submissions" in capabilities
+            and len(parts) == 5
+            and parts[0] == "principal"
+            and parts[1] == principal
+            and parts[2] == "submission"
+            and parts[3] == replica
+        ):
+            if parts[4] == "requests":
+                return "append"
+            if parts[4] == "results":
+                return "read"
+        return None
+
+    def has_access(self, identity: AuthenticatedReplica) -> bool:
+        return bool(self._grants.get(identity) or self._capabilities.get(identity))
 
 
-def _permits(access: str | None, action: str, method: str) -> bool:
+def permits_log(access: str | None, action: str, method: str) -> bool:
     if access is None:
         return False
     if method == "POST":
@@ -121,50 +186,25 @@ def _permits(access: str | None, action: str, method: str) -> bool:
     return False
 
 
-def readable_principal_logs(
-    session: PrincipalSession, sessions: Iterable[PrincipalSession]
-) -> frozenset[str]:
-    readable = set(session.readable_logs)
-    for candidate in sessions:
-        if candidate.principal_id != session.principal_id:
-            continue
-        owner = quote(candidate.replica_id, safe="-_.!~*'()")
-        for log_id, access in candidate.grants.items():
-            parts = log_id.split("/")
-            if (
-                access == "append"
-                and len(parts) == 4
-                and parts[0] == "draft"
-                and parts[2] == "revision"
-                and parts[3] == owner
-                and session.grants.get(f"draft/{parts[1]}/decision") == "read"
-            ):
-                readable.add(log_id)
-    return frozenset(readable)
+def _encoded_identity(identity: AuthenticatedReplica) -> tuple[str, str]:
+    safe = "-_.!~*'()"
+    return quote(identity.principal_id, safe=safe), quote(identity.replica_id, safe=safe)
 
 
-def permits_principal_log(
-    session: PrincipalSession,
-    sessions: Iterable[PrincipalSession],
-    log_id: str,
-    action: str,
-    method: str,
-) -> bool:
-    known = tuple(sessions)
-    if session.permits(log_id, action, method) or _permits(
-        _dynamic_access(session, known, log_id), action, method
+def _replica_owner(log_id: str) -> tuple[str, str] | None:
+    parts = log_id.split("/")
+    if (
+        len(parts) == 6
+        and parts[0] == "principal"
+        and parts[2] == "draft"
+        and parts[4] in ("revision", "request")
     ):
-        return True
-    return (
-        method in ("GET", "HEAD")
-        and action in ("head", "has", "records")
-        and log_id in readable_principal_logs(session, known)
-    )
-
-
-def principal_observes_log(
-    session: PrincipalSession,
-    sessions: Iterable[PrincipalSession],
-    log_id: str,
-) -> bool:
-    return permits_principal_log(session, sessions, log_id, "head", "HEAD")
+        return parts[1], parts[5]
+    if (
+        len(parts) == 5
+        and parts[0] == "principal"
+        and parts[2] == "submission"
+        and parts[4] == "requests"
+    ):
+        return parts[1], parts[3]
+    return None

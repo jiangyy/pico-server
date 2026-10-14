@@ -21,9 +21,13 @@ from picopg.api import (
     UnknownPosition,
 )
 from apps.server.authorization import (
+    AuthenticatedReplica,
+    LogAuthorization,
     PrincipalSession,
-    permits_principal_log,
-    principal_observes_log,
+    PrincipalLogAuthorization,
+    StaticAuthenticator,
+    StaticReplicaDirectory,
+    permits_log,
 )
 
 
@@ -75,13 +79,11 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         self.replica_token = token
         self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
         sessions = tuple(principal_sessions)
-        self.principal_sessions: Mapping[str, PrincipalSession] = {
-            session.token: session for session in sessions
-        }
-        if len(self.principal_sessions) != len(sessions):
-            raise ValueError("principal session tokens must be unique")
-        if len({session.replica_id for session in sessions}) != len(sessions):
-            raise ValueError("principal session Replica IDs must be unique")
+        self.authenticator = StaticAuthenticator(sessions) if sessions else None
+        directory = StaticReplicaDirectory(sessions)
+        self.log_authorization: LogAuthorization | None = (
+            PrincipalLogAuthorization(sessions, directory) if sessions else None
+        )
         self._subscriber_lock = threading.Lock()
         self._subscribers: list[tuple[queue.Queue[str], Callable[[str], bool]]] = []
         super().__init__(address, handler_class or ReplicaRequestHandler)
@@ -289,11 +291,11 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._error(401, "auth.required", "valid bearer token required")
             return
-        session = self._principal_session()
-        if session is not None:
-            sessions = tuple(self.server.principal_sessions.values())
-            observes = lambda log_id: principal_observes_log(session, sessions, log_id)
-            has_access = bool(session.grants or session.capabilities)
+        identity = self._authenticated_replica()
+        authorization = self.server.log_authorization
+        if identity is not None and authorization is not None:
+            observes = lambda log_id: authorization.access(identity, log_id) is not None
+            has_access = authorization.has_access(identity)
         else:
             readable_logs = frozenset(log_id for log_id, access in self.server.bindings.items() if access == "read")
             observes = readable_logs.__contains__
@@ -331,19 +333,17 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                 if entry is not None:
                     self.server._subscribers.remove(entry)
 
-    def _principal_session(self) -> PrincipalSession | None:
-        if not self.server.principal_sessions:
+    def _authenticated_replica(self) -> AuthenticatedReplica | None:
+        if self.server.authenticator is None:
             return None
         actual = self.headers.get("Authorization", "")
         if not actual.startswith("Bearer "):
             return None
-        token = actual[7:]
-        return next((session for known, session in self.server.principal_sessions.items()
-                     if hmac.compare_digest(token, known)), None)
+        return self.server.authenticator.authenticate(actual[7:])
 
     def _authorized(self) -> bool:
-        if self.server.principal_sessions:
-            return self._principal_session() is not None
+        if self.server.authenticator is not None:
+            return self._authenticated_replica() is not None
         return self._admin_authorized()
 
     def _admin_authorized(self) -> bool:
@@ -354,13 +354,13 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     def _authorize(
         self, log_id: str, action: str, method: str
     ) -> tuple[int, str, str] | None:
-        session = self._principal_session()
-        if session is not None:
-            if permits_principal_log(
-                session, self.server.principal_sessions.values(), log_id, action, method
-            ):
+        identity = self._authenticated_replica()
+        authorization = self.server.log_authorization
+        if identity is not None and authorization is not None:
+            access = authorization.access(identity, log_id)
+            if permits_log(access, action, method):
                 return None
-            if log_id not in session.grants:
+            if access is None:
                 return (403, "log.not_exposed", f"Log {log_id} is not exposed")
             return (403, "capability.denied", f"Log {log_id} does not permit this operation")
         access = self.server.bindings.get(log_id)
