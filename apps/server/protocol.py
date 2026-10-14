@@ -151,6 +151,19 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if url.path == "/api/v1/replica/identity":
+                if self.command != "GET":
+                    self._error(405, "method.not_allowed", "method not allowed")
+                    return
+                identity = self._authenticated_replica()
+                if identity is None:
+                    self._error(401, "auth.required", "valid bearer token required")
+                    return
+                self._send_json(200, {
+                    "principalId": identity.principal_id,
+                    "replicaId": identity.replica_id,
+                })
+                return
             if url.path == "/api/v1/replica/events":
                 if self.command != "GET":
                     self._error(405, "method.not_allowed", "method not allowed")

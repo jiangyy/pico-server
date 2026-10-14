@@ -5,7 +5,7 @@ PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定�
 ## 已经实现
 
 - 文件型 Replica Log 持久化、记录校验、条件追加和重启恢复。
-- HTTP 握手、head/has/read/append、分页边界、请求体限制与 SSE 通知。
+- HTTP 握手、认证身份读取、head/has/read/append、分页边界、请求体限制与 SSE 通知。
 - `Authenticator`、`AuthenticatedReplica`、`ReplicaDirectory` 与 `LogAuthorization` 分层；静态 token 配置只存在于 composition root。
 - 日志使用 `principal/{principalId}/...` 命名空间；设备只能追加自己的 Log，同一用户的设备可以互读 Revision，不同用户即使 Draft ID 相同也完全隔离。
 - Draft begin/advance/takeover 判定、epoch fencing、拒绝结果持久化与幂等重放。

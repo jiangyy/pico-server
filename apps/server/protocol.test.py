@@ -234,6 +234,18 @@ def _principal_revision_access(tmp: Path) -> None:
     auth = {"Authorization": "Bearer token-a"}
     stream_conn = HTTPConnection(host, port, timeout=5)
     try:
+        status, _, body = _get(
+            f"{base_url}/api/v1/replica/identity",
+            headers=auth,
+        )
+        _expect(status == 200, f"authenticated identity returned {status}")
+        _expect(
+            json.loads(body) == {"principalId": "user", "replicaId": "A"},
+            f"authenticated identity was {body!r}",
+        )
+        status, _, _ = _get(f"{base_url}/api/v1/replica/identity")
+        _expect(status == 401, f"anonymous identity request returned {status}")
+
         status, _, _ = _get(
             f"{base_url}/api/v1/replica/logs/principal%2Fuser%2Fdraft%2Flesson%2Frevision%2FB/records",
             headers=auth,
