@@ -12,24 +12,25 @@ PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定�
 - Submission Request 消费、精确 Revision 读取、Git tag 写入和 Result Log 回传。
 - Playground ZIP v1 校验、内容寻址存储、发布冲突检查、Catalog 和精确版本下载。
 - Server-owned Comment Log 与 operator 写入接口。
+- 持久 Browser Session、Device handle 与 Principal-local Replica 注册；退出不删除历史 Replica 归属。
+- 独立 operator Session，以及从 Submission/Revision Log 派生的提交列表、精确源码详情和 targeted Comment API。
 - worker 启动时枚举已有 Request Log，运行时动态发现 Draft 与 Submission Request Log，不依赖认证配置推导任务。
-- protocol、application、worker、comment 测试，以及真实 Client/Server 端到端测试。
+- nginx HTTPS/SSE 配置、systemd 单实例配置、原子备份/空目录恢复工具和部署 smoke。
+- protocol、application、worker、comment、session、submission、backup 与 smoke 测试，以及真实 Client/Server 端到端测试。
 
 ## 还没有完全完成
 
-- 正式 Auth：当前 token、Principal 与 Replica 来自静态配置；没有 Session 生命周期或动态 Replica 注册。Profile、班级、选课和角色明确不属于认证模型。
-- 生产存储：Replica Log、Package 仍使用本机文件；没有 PostgreSQL adapter、Object Storage、migration 和完整备份恢复流程。
-- 部署能力：已有 nginx HTTPS 与 systemd 样例，但尚未把 Principal 配置、Submission repository、SSE buffering、Secret、备份恢复和 smoke test 连成可执行 runbook。
+- 完整账号系统：当前是受控发放的 access code 和固定 30 天 Browser Session；没有密码找回、OAuth、教师角色或凭据分发系统。Profile、班级、选课明确不属于认证模型。
+- 生产存储：Replica Log、Package 与 Session registry 仍使用本机文件；已有一致性优先的停机备份恢复，但没有 PostgreSQL adapter、Object Storage、在线备份或 migration framework。
 - 横向扩容：worker 与 HTTP Server 同进程；多实例前需要共享 Store、worker lease/竞争控制和唯一结果写入保障。
-- 数据管理：Git repository 映射仍是静态配置；没有 Submission 查询索引、历史管理、保留策略和自动评测编排。
-- Comment 模型：Comment 当前属于 Draft，尚未绑定某次 Revision 或 Submission。
-- 部署后验证：已有本地 HTTP 测试，但还没有真实 HTTPS、代理、断网、重启、备份恢复和容量测试。
+- 数据管理：Git repository 映射仍是静态配置；Submission 查询当前直接扫描 Log，没有历史筛选、保留策略和自动评测编排。
+- 部署后验证：仓库内已有 HTTP、Session、SSE 与备份恢复 smoke；真实证书、nginx、systemd restart、离机恢复和容量测试必须在 Linux staging 执行。
 
 ## 下一步
 
-1. 加入最小 Session 与动态 Replica 注册，继续输出相同的 `AuthenticatedReplica`，不修改 Draft 协议，也不引入 Profile 或班级。
-2. 把生产 Client、IndexedDB、operator 工作台和部署配置接成一个可恢复的单实例交付物。
-3. 在 staging 验证 HTTPS、SSE、鉴权、重启、断网和备份恢复。
-4. 只有真实负载证明需要时，才引入 PostgreSQL、Object Storage、拆分 worker 或横向扩容。
+1. 在 staging 按 `deploy/README.md` 验证 HTTPS、SSE、鉴权、systemd 重启和离机备份恢复。
+2. 用少量真实用户验证 access code 分发、离线恢复、分叉选择和教师评语流程。
+3. 课堂试用确认后，在独立业务层设计 Profile、Class、Enrollment 与 Assignment；不改变 Log identity。
+4. 只有真实负载证明需要时，才引入 PostgreSQL、Object Storage、查询索引、拆分 worker 或横向扩容。
 
 无论底层存储和部署方式怎样变化，都必须保持：单写者、精确 Revision 引用、结果可重放、通知不承载事实、Server 不合并源码。
