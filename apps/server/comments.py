@@ -35,6 +35,9 @@ class Comment:
     draft_id: str
     author: str
     text: str
+    submission_id: str | None = None
+    submission_request: Position | None = None
+    revision: Position | None = None
 
 
 class CommentServer(Protocol):
@@ -67,6 +70,39 @@ class CommentPublisher:
         self._lock = threading.Lock()
 
     def add(self, principal_id: str, draft_id: str, author: str, text: str) -> Position:
+        return self._add(principal_id, draft_id, author, text)
+
+    def add_submission(
+        self,
+        principal_id: str,
+        draft_id: str,
+        author: str,
+        text: str,
+        submission_id: str,
+        submission_request: Position,
+        revision: Position,
+    ) -> Position:
+        return self._add(
+            principal_id,
+            draft_id,
+            author,
+            text,
+            submission_id=_text(submission_id, "submissionId"),
+            submission_request=submission_request,
+            revision=revision,
+        )
+
+    def _add(
+        self,
+        principal_id: str,
+        draft_id: str,
+        author: str,
+        text: str,
+        *,
+        submission_id: str | None = None,
+        submission_request: Position | None = None,
+        revision: Position | None = None,
+    ) -> Position:
         principal_id = _text(principal_id, "principalId")
         draft_id = _draft_id(draft_id)
         author = _text(author, "author")
@@ -78,6 +114,16 @@ class CommentPublisher:
             "author": author,
             "text": text,
         }
+        targets = (submission_id, submission_request, revision)
+        if any(target is not None for target in targets):
+            if any(target is None for target in targets):
+                raise CommentError("submission target must be complete")
+            assert submission_request is not None and revision is not None
+            data.update({
+                "submissionId": submission_id,
+                "submissionRequest": submission_request.to_value(),
+                "revision": revision.to_value(),
+            })
         with self._lock:
             parent = self._store.head(log_id)
             record = ReplicatedRecord(
@@ -116,9 +162,32 @@ def _decode(record: ReplicatedRecord, draft_id: str) -> Comment:
         raise CommentError("record is not a comment")
     if data.get("draftId") != draft_id:
         raise CommentError("comment belongs to another Draft")
+    target_keys = {"submissionId", "submissionRequest", "revision"}
+    present = target_keys.intersection(data)
+    if present and present != target_keys:
+        raise CommentError("submission target is incomplete")
+    submission_id = None
+    submission_request = None
+    revision = None
+    if present:
+        submission_id = _text(data.get("submissionId"), "submissionId")
+        submission_request = _position(data.get("submissionRequest"), "submissionRequest")
+        revision = _position(data.get("revision"), "revision")
     return Comment(
         record.position,
         draft_id,
         _text(data.get("author"), "author"),
         _text(data.get("text"), "text"),
+        submission_id,
+        submission_request,
+        revision,
+    )
+
+
+def _position(value: object, label: str) -> Position:
+    if not isinstance(value, Mapping) or set(value) != {"logId", "recordId"}:
+        raise CommentError(f"{label} must contain logId and recordId")
+    return Position(
+        _text(value["logId"], f"{label}.logId"),
+        _text(value["recordId"], f"{label}.recordId"),
     )

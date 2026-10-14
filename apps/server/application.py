@@ -30,6 +30,7 @@ from apps.server.protocol import (
     _ResponseSent,
 )
 from apps.server.sessions import FileSessionRegistry
+from apps.server.submissions import SubmissionError, SubmissionNotFound, SubmissionReader
 from apps.server.workers import (
     DraftRequestConsumer,
     ServerWorkerThread,
@@ -108,6 +109,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
             self, FilePackageStore(package_root), package_adapter
         )
         self.comments = CommentPublisher(self)
+        self.submissions = SubmissionReader(self.store, self.comments)
         worker_bindings = dict(self.bindings)
         request_logs = tuple(sorted(set(draft_request_logs(worker_bindings)) | {
             log_id for log_id in self.store.log_ids() if is_draft_request_log(log_id)
@@ -160,6 +162,10 @@ class PicoRequestHandler(ReplicaRequestHandler):
             return
         if path == "/api/v1/operator/session":
             self._dispatch_operator_session()
+            return
+        submission_route = _submission_route(path)
+        if submission_route is not None:
+            self._dispatch_submission(*submission_route)
             return
         comment_scope = _comment_route(path)
         if comment_scope is not None:
@@ -370,6 +376,55 @@ class PicoRequestHandler(ReplicaRequestHandler):
             logger.exception("comment request failed")
             self._error(500, "server.failure", "server failure")
 
+    def _dispatch_submission(self, action: str, request_record_id: str) -> None:
+        try:
+            if not self._admin_authorized():
+                self._error(401, "auth.required", "valid operator token required")
+                return
+            if action == "list" and self.command == "GET":
+                self._send_json(200, {
+                    "submissions": [
+                        submission.summary_value()
+                        for submission in self.server.submissions.list()
+                    ]
+                }, (("Cache-Control", "no-store"),))
+                return
+            if action == "detail" and self.command == "GET":
+                self._send_json(
+                    200,
+                    self.server.submissions.detail_value(request_record_id),
+                    (("Cache-Control", "no-store"),),
+                )
+                return
+            if action == "comment" and self.command == "POST":
+                body = self._read_json()
+                if not isinstance(body, dict) or set(body) != {"author", "text"}:
+                    raise CommentError("comment body must contain author and text")
+                submission = self.server.submissions.get(request_record_id)
+                position = self.server.comments.add_submission(
+                    submission.principal_id,
+                    submission.playground_id,
+                    body["author"],
+                    body["text"],
+                    submission.submission_id,
+                    submission.request,
+                    submission.revision,
+                )
+                self._send_json(201, {"position": position.to_value()})
+                return
+            self._error(405, "method.not_allowed", "method not allowed")
+        except SubmissionNotFound as error:
+            self._error(404, "submission.not_found", str(error))
+        except (CommentError, SubmissionError, InvalidReplicaData) as error:
+            self._error(400, "submission.invalid", str(error))
+        except _ResponseSent:
+            pass
+        except Exception:
+            from apps.server.protocol import logger
+
+            logger.exception("submission request failed")
+            self._error(500, "server.failure", "server failure")
+
     def _read_package(self) -> bytes:
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
@@ -405,6 +460,21 @@ def _comment_route(path: str) -> tuple[str, str] | None:
     principal_id = unquote(parts[4])
     draft_id = unquote(parts[6])
     return (principal_id, draft_id) if principal_id and draft_id else None
+
+
+def _submission_route(path: str) -> tuple[str, str] | None:
+    if path == "/api/v1/operator/submissions":
+        return "list", ""
+    parts = path.split("/")
+    if parts[:5] != ["", "api", "v1", "operator", "submissions"]:
+        return None
+    if len(parts) == 6:
+        request_record_id = unquote(parts[5])
+        return None if not request_record_id else ("detail", request_record_id)
+    if len(parts) == 7 and parts[6] == "comments":
+        request_record_id = unquote(parts[5])
+        return None if not request_record_id else ("comment", request_record_id)
+    return None
 
 
 def _playground_route(path: str) -> tuple[str, str, str] | None:
