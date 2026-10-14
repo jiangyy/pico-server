@@ -34,6 +34,29 @@ class LogAuthorization(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class PrincipalAccount:
+    principal_id: str
+    access_code: str
+    capabilities: frozenset[str]
+
+    @classmethod
+    def create(
+        cls,
+        principal_id: str,
+        access_code: str,
+        capabilities: Iterable[str] = (),
+    ) -> "PrincipalAccount":
+        for value, label in ((principal_id, "principalId"), (access_code, "accessCode")):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{label} must be non-empty")
+        enabled = frozenset(capabilities)
+        unknown = enabled - PRINCIPAL_CAPABILITIES
+        if unknown:
+            raise ValueError(f"unknown principal capabilities: {', '.join(sorted(unknown))}")
+        return cls(principal_id, access_code, enabled)
+
+
+@dataclass(frozen=True, slots=True)
 class PrincipalSession:
     """Static composition-root configuration; request handlers never receive it."""
 
@@ -109,11 +132,36 @@ class StaticReplicaDirectory:
         return self._by_principal.get(principal_id, frozenset())
 
 
+class CompositeAuthenticator:
+    def __init__(self, authenticators: Iterable[Authenticator]) -> None:
+        self._authenticators = tuple(authenticators)
+
+    def authenticate(self, token: str) -> AuthenticatedReplica | None:
+        for authenticator in self._authenticators:
+            identity = authenticator.authenticate(token)
+            if identity is not None:
+                return identity
+        return None
+
+
+class CompositeReplicaDirectory:
+    def __init__(self, directories: Iterable[ReplicaDirectory]) -> None:
+        self._directories = tuple(directories)
+
+    def replicas(self, principal_id: str) -> frozenset[str]:
+        return frozenset(
+            replica
+            for directory in self._directories
+            for replica in directory.replicas(principal_id)
+        )
+
+
 class PrincipalLogAuthorization:
     def __init__(
         self,
         sessions: Iterable[PrincipalSession],
         directory: ReplicaDirectory,
+        accounts: Iterable[PrincipalAccount] = (),
     ) -> None:
         self._directory = directory
         self._grants: dict[AuthenticatedReplica, Mapping[str, str]] = {}
@@ -124,15 +172,22 @@ class PrincipalLogAuthorization:
                 raise ValueError("principal session identities must be unique")
             self._grants[identity] = session.grants
             self._capabilities[identity] = session.capabilities
+        self._principal_capabilities: dict[str, frozenset[str]] = {}
+        for account in accounts:
+            if account.principal_id in self._principal_capabilities:
+                raise ValueError("principal accounts must be unique")
+            self._principal_capabilities[account.principal_id] = account.capabilities
 
     def access(self, identity: AuthenticatedReplica, log_id: str) -> str | None:
-        grants = self._grants.get(identity)
-        if grants is None:
+        grants = self._grants.get(identity, {})
+        capabilities = self._capabilities.get(identity)
+        if capabilities is None:
+            capabilities = self._principal_capabilities.get(identity.principal_id)
+        if capabilities is None or identity.replica_id not in self._directory.replicas(identity.principal_id):
             return None
         explicit = grants.get(log_id)
         if explicit is not None:
             return explicit
-        capabilities = self._capabilities[identity]
         if "playgrounds" in capabilities and log_id == "playground-releases":
             return "read"
         parts = log_id.split("/")
@@ -173,7 +228,13 @@ class PrincipalLogAuthorization:
         return None
 
     def has_access(self, identity: AuthenticatedReplica) -> bool:
-        return bool(self._grants.get(identity) or self._capabilities.get(identity))
+        if identity.replica_id not in self._directory.replicas(identity.principal_id):
+            return False
+        return bool(
+            self._grants.get(identity)
+            or self._capabilities.get(identity)
+            or self._principal_capabilities.get(identity.principal_id)
+        )
 
 
 def permits_log(access: str | None, action: str, method: str) -> bool:
