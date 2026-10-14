@@ -27,7 +27,7 @@ from apps.server.protocol import (  # noqa: E402
     PROTOCOL_VERSION,
     ReplicaHttpServer,
 )
-from apps.server.authorization import PrincipalSession  # noqa: E402
+from apps.server.authentication.model import PrincipalSession  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 

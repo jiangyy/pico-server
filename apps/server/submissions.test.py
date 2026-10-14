@@ -19,8 +19,8 @@ for _entry in (_ROOT, _SRC):
         sys.path.insert(0, str(_entry))
 
 from apps.server.application import PicoPGHttpServer  # noqa: E402
-from apps.server.drafts import revision_log_id  # noqa: E402
-from apps.server.workers import submission_result_log  # noqa: E402
+from apps.server.draft.protocol import revision_log_id  # noqa: E402
+from apps.server.submission.logs import result_log as submission_result_log  # noqa: E402
 from picopg.api import ReplicatedRecord, record_id_of  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 

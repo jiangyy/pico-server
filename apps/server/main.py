@@ -14,10 +14,10 @@ for _entry in (_ROOT, _SRC):
         sys.path.insert(0, str(_entry))
 
 from apps.server.application import PicoPGHttpServer  # noqa: E402
-from apps.server.authorization import PrincipalAccount, PrincipalSession  # noqa: E402
-from apps.server.git_submissions import GitSubmissionTagWriter  # noqa: E402
-from apps.server.workers import SubmissionTagWriter  # noqa: E402
-from apps.server.sessions import FileSessionRegistry  # noqa: E402
+from apps.server.authentication.model import PrincipalAccount, PrincipalSession  # noqa: E402
+from apps.server.submission.git_tags import GitSubmissionTagWriter  # noqa: E402
+from apps.server.submission.worker import SubmissionTagWriter  # noqa: E402
+from apps.server.authentication.registry import FileSessionRegistry  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 

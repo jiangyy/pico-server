@@ -12,7 +12,7 @@ for _entry in (_ROOT, _SRC):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
-from apps.server.authorization import PrincipalAccount  # noqa: E402
+from apps.server.authentication.model import PrincipalAccount  # noqa: E402
 from apps.server.main import build_server  # noqa: E402
 from smoke import run  # noqa: E402
 

@@ -3,66 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from urllib.parse import quote, unquote
 
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
+from apps.server.draft.protocol import (
+    DraftRef,
+    DraftResult,
+    decision_log_id,
+    decode_revision,
+    draft_scope,
+    position,
+    project_draft,
+    replayed_command,
+    request_log_id,
+    revision_log_id,
+    text,
+)
+
 PAGE_SIZE = 128
-
-
-def revision_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
-    return (
-        f"principal/{_component(principal_id, 'principalId')}"
-        f"/draft/{_component(draft_id, 'draftId')}/revision/{_component(replica_id, 'replicaId')}"
-    )
-
-
-def request_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
-    return (
-        f"principal/{_component(principal_id, 'principalId')}"
-        f"/draft/{_component(draft_id, 'draftId')}/request/{_component(replica_id, 'replicaId')}"
-    )
-
-
-def decision_log_id(principal_id: str, draft_id: str) -> str:
-    return f"principal/{_component(principal_id, 'principalId')}/draft/{_component(draft_id, 'draftId')}/decision"
-
-
-def _draft_scope(log_id: str, kind: str) -> tuple[str, str, str | None]:
-    parts = log_id.split("/")
-    expected = 5 if kind == "decision" else 6
-    if (
-        len(parts) != expected
-        or parts[0] != "principal"
-        or not parts[1]
-        or parts[2] != "draft"
-        or not parts[3]
-        or parts[4] != kind
-        or (expected == 6 and not parts[5])
-    ):
-        raise ValueError(f"Log is not a Draft {kind} Log")
-    return unquote(parts[1]), unquote(parts[3]), None if expected == 5 else unquote(parts[5])
-
-
-def _component(value: str, label: str) -> str:
-    return quote(_text(value, label), safe="-_.!~*'()")
-
-
-def _text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be non-empty")
-    return value
-
-
-def _position(value: object, label: str = "position") -> Position:
-    if not isinstance(value, Mapping) or set(value) != {"logId", "recordId"}:
-        raise ValueError(f"{label} must contain logId and recordId")
-    return Position(_text(value["logId"], f"{label}.logId"), _text(value["recordId"], f"{label}.recordId"))
-
-
-def _same(left: Position | None, right: Position | None) -> bool:
-    return left == right
 
 
 def _records(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:
@@ -95,78 +53,6 @@ def _record(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class DraftRef:
-    head: Position
-    writer: str | None
-    epoch: int
-
-
-@dataclass(frozen=True, slots=True)
-class DraftResult:
-    kind: str
-    ref: DraftRef | None
-    decision: Position | None = None
-    message: str | None = None
-
-
-def project_draft(records: tuple[ReplicatedRecord, ...]) -> DraftRef:
-    if not records:
-        raise ValueError("decision Log is empty")
-    first = records[0].data
-    if not isinstance(first, Mapping) or first.get("type") != "draft.started":
-        raise ValueError("decision Log must start with draft.started")
-    principal_id, scoped_draft_id, _ = _draft_scope(records[0].log_id, "decision")
-    draft_id = _text(first.get("draftId"), "decision.draftId")
-    if draft_id != scoped_draft_id:
-        raise ValueError("decision belongs to another Draft")
-    log_id = decision_log_id(principal_id, draft_id)
-    head = _position(first.get("head"), "decision.head")
-    ref = DraftRef(head, None, 0)
-    commands: set[str] = set()
-    parent: Position | None = None
-    for index, record in enumerate(records):
-        if record.log_id != log_id or record.parent != parent or record.requires:
-            raise ValueError("decision Log chain is invalid")
-        data = record.data
-        if not isinstance(data, Mapping) or data.get("draftId") != draft_id:
-            raise ValueError("decision belongs to another Draft")
-        if index:
-            kind = data.get("type")
-            command_id = _text(data.get("commandId"), "decision.commandId")
-            if command_id in commands:
-                raise ValueError("commandId appears more than once")
-            commands.add(command_id)
-            epoch = data.get("epoch")
-            if type(epoch) is not int or epoch < 0:
-                raise ValueError("decision.epoch must be non-negative")
-            if kind == "draft.rejected":
-                _text(data.get("reason"), "decision.reason")
-                head = _position(data.get("head"), "decision.head")
-                writer_value = data.get("writer")
-                writer = None if writer_value is None else _text(writer_value, "decision.writer")
-                if head != ref.head or writer != ref.writer or epoch != ref.epoch:
-                    raise ValueError("rejection does not describe the current DraftRef")
-            elif kind == "draft.editingStarted":
-                writer = _text(data.get("writer"), "decision.writer")
-                if ref.writer is not None or epoch != ref.epoch + 1:
-                    raise ValueError("editing transition is invalid")
-                ref = DraftRef(ref.head, writer, epoch)
-            elif kind in ("draft.takenOver", "draft.advanced"):
-                writer = _text(data.get("writer"), "decision.writer")
-                new_head = _position(data.get("head"), "decision.head")
-                if kind == "draft.takenOver":
-                    if epoch != ref.epoch + 1:
-                        raise ValueError("takeover epoch is invalid")
-                elif writer != ref.writer or epoch != ref.epoch:
-                    raise ValueError("advance fence is invalid")
-                ref = DraftRef(new_head, writer, epoch)
-            else:
-                raise ValueError("decision type is invalid")
-        parent = record.position
-    return ref
-
-
 class DraftAuthority:
     """Consumes one request Position and conditionally appends a Draft decision."""
 
@@ -175,12 +61,12 @@ class DraftAuthority:
 
     def initialize(self, principal_id: str, draft_id: str, initial_head: Position) -> DraftResult:
         try:
-            principal_id = _text(principal_id, "principalId")
-            draft_id = _text(draft_id, "draftId")
+            principal_id = text(principal_id, "principalId")
+            draft_id = text(draft_id, "draftId")
             revision = _at(self._store, initial_head)
             if revision is None:
                 raise ValueError("initial Revision is not available")
-            decoded = _decode_revision(revision)
+            decoded = decode_revision(revision)
             if decoded["principalId"] != principal_id or decoded["draftId"] != draft_id:
                 raise ValueError("initial Revision belongs to another Principal or Draft")
             if decoded["base"] is not None:
@@ -210,24 +96,24 @@ class DraftAuthority:
             if not isinstance(command, Mapping):
                 raise ValueError("command must be an object")
             kind = command.get("type")
-            principal_id, request_draft_id, request_replica_id = _draft_scope(
+            principal_id, request_draft_id, request_replica_id = draft_scope(
                 request.log_id, "request"
             )
-            draft_id = _text(command.get("draftId"), "command.draftId")
-            replica_id = _text(command.get("replicaId"), "command.replicaId")
-            command_id = _text(command.get("commandId"), "command.commandId")
+            draft_id = text(command.get("draftId"), "command.draftId")
+            replica_id = text(command.get("replicaId"), "command.replicaId")
+            command_id = text(command.get("commandId"), "command.commandId")
             if draft_id != request_draft_id or replica_id != request_replica_id:
                 raise ValueError("command is stored in the wrong Request Log")
             if request.log_id != request_log_id(principal_id, draft_id, replica_id):
                 raise ValueError("command is stored in the wrong Request Log")
             decision_log = decision_log_id(principal_id, draft_id)
-            required = [_position(command.get("expectedHead"), "command.expectedHead")]
+            required = [position(command.get("expectedHead"), "command.expectedHead")]
             if kind in ("draft.takeover", "draft.advance"):
-                required.append(_position(command.get("targetHead"), "command.targetHead"))
+                required.append(position(command.get("targetHead"), "command.targetHead"))
             elif kind != "draft.beginEditing":
                 raise ValueError("command type is invalid")
-            for position in required:
-                if position not in request.requires:
+            for required_position in required:
+                if required_position not in request.requires:
                     raise ValueError("command does not declare all referenced Revisions in requires")
             while True:
                 decisions = _records(self._store, decision_log)
@@ -239,7 +125,7 @@ class DraftAuthority:
                         raise ValueError(initialized.message or "Draft could not be initialized")
                     continue
                 ref = project_draft(decisions)
-                revision_match = _replayed_command(decisions, command_id)
+                revision_match = replayed_command(decisions, command_id)
                 if revision_match is not None:
                     prior_request, prior_decision, prior_ref, prior_kind = revision_match
                     if prior_request != request_position:
@@ -270,7 +156,7 @@ class DraftAuthority:
                     target = _at(self._store, required[1])
                     if target is None:
                         return DraftResult("missingDependency", ref, message="referenced Revision is not available")
-                    revision = _decode_revision(target)
+                    revision = decode_revision(target)
                     if revision["principalId"] != principal_id or revision["draftId"] != draft_id:
                         raise ValueError("Revision belongs to another Principal or Draft")
                     if required[0] != ref.head or expected_epoch != ref.epoch:
@@ -322,7 +208,7 @@ class DraftAuthority:
             raise ValueError("decision Log is invalid")
         data = {
             "type": "draft.rejected",
-            "draftId": _text(first.get("draftId"), "decision.draftId"),
+            "draftId": text(first.get("draftId"), "decision.draftId"),
             "commandId": command_id,
             "request": request.to_value(),
             "reason": reason,
@@ -333,43 +219,3 @@ class DraftAuthority:
         record = _record(decisions[-1].log_id, decisions[-1].position, (), data)
         appended = self._store.append(record.log_id, decisions[-1].position, (record,))
         return record.position if appended.kind == "accepted" else None
-
-
-def _decode_revision(record: ReplicatedRecord) -> dict[str, object]:
-    data = record.data
-    if not isinstance(data, Mapping) or data.get("type") != "draft.revised":
-        raise ValueError("record is not a Draft Revision")
-    draft_id = _text(data.get("draftId"), "revision.draftId")
-    replica_id = _text(data.get("replicaId"), "revision.replicaId")
-    principal_id, scoped_draft_id, scoped_replica_id = _draft_scope(record.log_id, "revision")
-    if draft_id != scoped_draft_id or replica_id != scoped_replica_id:
-        raise ValueError("Revision is stored in the wrong Log")
-    if record.log_id != revision_log_id(principal_id, draft_id, replica_id):
-        raise ValueError("Revision is stored in the wrong Log")
-    source = data.get("source")
-    if not isinstance(source, str):
-        raise ValueError("revision.source must be a string")
-    base = None if data.get("base") is None else _position(data.get("base"), "revision.base")
-    return {
-        "principalId": principal_id,
-        "draftId": draft_id,
-        "replicaId": replica_id,
-        "source": source,
-        "base": base,
-    }
-
-
-def _replayed_command(
-    decisions: tuple[ReplicatedRecord, ...], command_id: str
-    ) -> tuple[Position, Position, DraftRef, str] | None:
-    for index, decision in enumerate(decisions[1:], start=1):
-        data = decision.data
-        if isinstance(data, Mapping) and data.get("commandId") == command_id:
-            return (
-                _position(data.get("request"), "decision.request"),
-                decision.position,
-                project_draft(decisions[: index + 1]),
-                _text(data.get("reason"), "decision.reason")
-                if data.get("type") == "draft.rejected" else "current",
-            )
-    return None

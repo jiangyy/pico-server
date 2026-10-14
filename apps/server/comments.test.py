@@ -24,7 +24,7 @@ for _entry in (_ROOT, _SRC):
         sys.path.insert(0, str(_entry))
 
 from apps.server.application import PicoPGHttpServer  # noqa: E402
-from apps.server.comments import comment_log_id  # noqa: E402
+from apps.server.review.comments import comment_log_id  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 

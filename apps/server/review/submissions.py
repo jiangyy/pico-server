@@ -5,13 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from apps.server.comments import CommentPublisher
-from apps.server.drafts import _decode_revision
-from apps.server.workers import (
-    is_submission_request_log,
-    submission_request_scope,
-    submission_result_log,
-)
+from apps.server.review.comments import CommentPublisher
+from apps.server.draft.protocol import decode_revision
+from apps.server.submission.logs import is_request_log, request_scope, result_log
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord
 
 
@@ -61,7 +57,7 @@ class SubmissionReader:
         submissions: list[Submission] = []
         record_ids: set[str] = set()
         for log_id in sorted(self._store.log_ids()):
-            if not is_submission_request_log(log_id):
+            if not is_request_log(log_id):
                 continue
             results = self._results(log_id)
             for request in _records(self._store, log_id):
@@ -84,7 +80,7 @@ class SubmissionReader:
         revision_record = _at(self._store, submission.revision)
         if revision_record is None:
             raise SubmissionError("Submission Revision is missing")
-        decoded = _decode_revision(revision_record)
+        decoded = decode_revision(revision_record)
         if decoded["principalId"] != submission.principal_id:
             raise SubmissionError("Submission Revision belongs to another Principal")
         if decoded["draftId"] != submission.playground_id:
@@ -107,7 +103,7 @@ class SubmissionReader:
 
     def _results(self, request_log: str) -> dict[Position, ReplicatedRecord]:
         results: dict[Position, ReplicatedRecord] = {}
-        for record in _records(self._store, submission_result_log(request_log)):
+        for record in _records(self._store, result_log(request_log)):
             request = _result_request(record)
             if request.log_id != request_log:
                 raise SubmissionError("Submission result belongs to another Request Log")
@@ -119,7 +115,7 @@ class SubmissionReader:
     def _submission(
         self, request: ReplicatedRecord, result: ReplicatedRecord | None
     ) -> Submission:
-        principal_id, replica_id = submission_request_scope(request.log_id)
+        principal_id, replica_id = request_scope(request.log_id)
         data = request.data
         if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
             raise SubmissionError("request is not a Submission")

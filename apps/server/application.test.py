@@ -21,10 +21,8 @@ for _entry in (_ROOT, _SRC):
 
 from apps.server.main import build_server  # noqa: E402
 from apps.server.application import PicoPGHttpServer  # noqa: E402
-from apps.server.playgrounds import (  # noqa: E402
-    PLAYGROUND_RELEASES_LOG_ID,
-    PackageInfo,
-)
+from apps.server.playground.catalog import PLAYGROUND_RELEASES_LOG_ID  # noqa: E402
+from apps.server.playground.package import PackageInfo  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 

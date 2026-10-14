@@ -21,7 +21,7 @@ from picopg.api import (
     ReplicatedRecord,
     UnknownPosition,
 )
-from apps.server.authorization import (
+from apps.server.authentication.model import (
     AuthenticatedReplica,
     Authenticator,
     LogAuthorization,

@@ -11,7 +11,7 @@ for entry in (ROOT, SRC):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from apps.server.sessions import FileSessionRegistry  # noqa: E402
+from apps.server.authentication.registry import FileSessionRegistry  # noqa: E402
 
 
 def _tokens(*values: str):

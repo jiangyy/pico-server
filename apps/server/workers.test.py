@@ -11,14 +11,11 @@ for entry in (ROOT, SRC):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from apps.server.authorization import PrincipalSession  # noqa: E402
-from apps.server.drafts import decision_log_id, request_log_id, revision_log_id  # noqa: E402
-from apps.server.workers import (  # noqa: E402
-    DraftRequestConsumer,
-    LogWorker,
-    SubmissionHandler,
-    submission_result_log,
-)
+from apps.server.authentication.model import PrincipalSession  # noqa: E402
+from apps.server.draft.protocol import decision_log_id, request_log_id, revision_log_id  # noqa: E402
+from apps.server.draft.worker import DraftRequestConsumer  # noqa: E402
+from apps.server.submission.logs import result_log as submission_result_log  # noqa: E402
+from apps.server.submission.worker import SubmissionRequestConsumer  # noqa: E402
 from picopg.api import Position, ReplicatedRecord, record_id_of  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
@@ -128,12 +125,7 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
         "playgroundId": "lesson", "revision": revision.to_value(),
     }))
     tags = Tags()
-    worker = LogWorker(
-        store,
-        (request_log,),
-        submission_result_log(request_log),
-        SubmissionHandler(store, tags),
-    )
+    worker = SubmissionRequestConsumer(store, (request_log,), tags)
     assert worker.run_once() == 2
     assert worker.run_once() == 0
     assert tags.calls == 1

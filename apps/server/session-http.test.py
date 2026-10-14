@@ -14,7 +14,7 @@ for entry in (ROOT, SRC):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from apps.server.authorization import PrincipalAccount  # noqa: E402
+from apps.server.authentication.model import PrincipalAccount  # noqa: E402
 from apps.server.main import build_server  # noqa: E402
 
 

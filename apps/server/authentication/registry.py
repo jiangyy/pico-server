@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from apps.server.authorization import AuthenticatedReplica
+from apps.server.authentication.model import AuthenticatedReplica
 
 
 SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -69,6 +69,10 @@ class FileSessionRegistry:
         self._sessions: dict[str, tuple[AuthenticatedReplica, int]] = {}
         self._operators: dict[str, int] = {}
         self._load()
+
+    @property
+    def ttl_seconds(self) -> int:
+        return self._ttl
 
     def bootstrap(self, principal_id: str, device_token: str | None) -> BrowserSession:
         principal_id = _non_empty(principal_id, "principalId")
