@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 from collections.abc import Callable, Iterable, Mapping
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -22,6 +23,7 @@ from picopg.api import (
 )
 from apps.server.authorization import (
     AuthenticatedReplica,
+    Authenticator,
     LogAuthorization,
     PrincipalSession,
     PrincipalLogAuthorization,
@@ -35,6 +37,8 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGE_RECORDS = 128
 PROTOCOL_VERSION = 1
 HANDSHAKE_CAPABILITIES = ("replicate",)
+SESSION_COOKIE = "picopg_session"
+OPERATOR_SESSION_COOKIE = "picopg_operator_session"
 logger = logging.getLogger("picopg.server")
 
 LogAccess = str
@@ -72,6 +76,9 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         bindings: Iterable[LogBinding] | None = None,
         handler_class: type[BaseHTTPRequestHandler] | None = None,
         principal_sessions: Iterable[PrincipalSession] = (),
+        authenticator: Authenticator | None = None,
+        log_authorization: LogAuthorization | None = None,
+        operator_authenticator: Callable[[str], bool] | None = None,
     ) -> None:
         if not token:
             raise ValueError("replica token must be non-empty")
@@ -79,11 +86,14 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         self.replica_token = token
         self.bindings: Mapping[str, LogAccess] = self._compile_bindings(bindings)
         sessions = tuple(principal_sessions)
-        self.authenticator = StaticAuthenticator(sessions) if sessions else None
+        if sessions and (authenticator is not None or log_authorization is not None):
+            raise ValueError("principal_sessions cannot be combined with explicit authentication")
+        self.authenticator = authenticator or (StaticAuthenticator(sessions) if sessions else None)
         directory = StaticReplicaDirectory(sessions)
-        self.log_authorization: LogAuthorization | None = (
+        self.log_authorization = log_authorization or (
             PrincipalLogAuthorization(sessions, directory) if sessions else None
         )
+        self.operator_authenticator = operator_authenticator
         self._subscriber_lock = threading.Lock()
         self._subscribers: list[tuple[queue.Queue[str], Callable[[str], bool]]] = []
         super().__init__(address, handler_class or ReplicaRequestHandler)
@@ -130,6 +140,9 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         self._dispatch()
 
     def do_POST(self) -> None:
+        self._dispatch()
+
+    def do_DELETE(self) -> None:
         self._dispatch()
 
     def _dispatch(self) -> None:
@@ -349,10 +362,10 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     def _authenticated_replica(self) -> AuthenticatedReplica | None:
         if self.server.authenticator is None:
             return None
-        actual = self.headers.get("Authorization", "")
-        if not actual.startswith("Bearer "):
+        token = self._bearer_token() or self._cookie(SESSION_COOKIE)
+        if token is None:
             return None
-        return self.server.authenticator.authenticate(actual[7:])
+        return self.server.authenticator.authenticate(token)
 
     def _authorized(self) -> bool:
         if self.server.authenticator is not None:
@@ -362,7 +375,30 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     def _admin_authorized(self) -> bool:
         expected = f"Bearer {self.server.replica_token}"
         actual = self.headers.get("Authorization", "")
-        return hmac.compare_digest(actual, expected)
+        if hmac.compare_digest(actual, expected):
+            return True
+        token = self._cookie(OPERATOR_SESSION_COOKIE)
+        return (
+            token is not None
+            and self.server.operator_authenticator is not None
+            and self.server.operator_authenticator(token)
+        )
+
+    def _bearer_token(self) -> str | None:
+        actual = self.headers.get("Authorization", "")
+        return actual[7:] if actual.startswith("Bearer ") and len(actual) > 7 else None
+
+    def _cookie(self, name: str) -> str | None:
+        source = self.headers.get("Cookie")
+        if source is None:
+            return None
+        cookies = SimpleCookie()
+        try:
+            cookies.load(source)
+        except CookieError:
+            return None
+        value = cookies.get(name)
+        return None if value is None or not value.value else value.value
 
     def _authorize(
         self, log_id: str, action: str, method: str
@@ -399,7 +435,12 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             return None
         return (405, "method.not_allowed", "method not allowed")
 
-    def _send_json(self, status: int, value: object) -> None:
+    def _send_json(
+        self,
+        status: int,
+        value: object,
+        headers: Iterable[tuple[str, str]] = (),
+    ) -> None:
         body = json.dumps(
             value,
             ensure_ascii=False,
@@ -409,6 +450,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, header_value in headers:
+            self.send_header(name, header_value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

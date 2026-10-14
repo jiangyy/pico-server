@@ -14,9 +14,10 @@ for _entry in (_ROOT, _SRC):
         sys.path.insert(0, str(_entry))
 
 from apps.server.application import PicoPGHttpServer  # noqa: E402
-from apps.server.authorization import PrincipalSession  # noqa: E402
+from apps.server.authorization import PrincipalAccount, PrincipalSession  # noqa: E402
 from apps.server.git_submissions import GitSubmissionTagWriter  # noqa: E402
 from apps.server.workers import SubmissionTagWriter  # noqa: E402
+from apps.server.sessions import FileSessionRegistry  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
@@ -50,6 +51,11 @@ def build_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--submission-repositories",
         type=Path,
         help="JSON object mapping playground IDs to Git repository paths.",
+    )
+    parser.add_argument(
+        "--insecure-cookies",
+        action="store_true",
+        help="Allow browser Session cookies over local HTTP; never use in production.",
     )
     return parser.parse_args(argv)
 
@@ -94,18 +100,33 @@ def load_bindings(
     return bindings
 
 
-def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
+def load_principals(path: Path | None) -> tuple[list[PrincipalSession], list[PrincipalAccount]]:
     if path is None:
-        return []
+        return [], []
     import json
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError("principal config must be a JSON array")
     sessions: list[PrincipalSession] = []
+    accounts: list[PrincipalAccount] = []
     for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("principal entry must be an object")
+        if "accessCode" in item:
+            required = {"principalId", "accessCode"}
+            allowed = required | {"capabilities"}
+            if not required.issubset(item) or not set(item).issubset(allowed):
+                raise ValueError("account entry must contain principalId and accessCode")
+            capabilities = item.get("capabilities", [])
+            if not isinstance(capabilities, list) or any(not isinstance(value, str) for value in capabilities):
+                raise ValueError("principal capabilities must be an array of strings")
+            accounts.append(PrincipalAccount.create(
+                item["principalId"], item["accessCode"], capabilities,
+            ))
+            continue
         required = {"principalId", "replicaId", "token"}
         allowed = required | {"grants", "capabilities"}
-        if not isinstance(item, dict) or not required.issubset(item) or not set(item).issubset(allowed):
+        if not required.issubset(item) or not set(item).issubset(allowed):
             raise ValueError("principal entry must contain principalId, replicaId and token")
         grants = item.get("grants", [])
         if not isinstance(grants, list):
@@ -129,6 +150,17 @@ def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
         raise ValueError("principal tokens must be unique")
     if len({(session.principal_id, session.replica_id) for session in sessions}) != len(sessions):
         raise ValueError("principal Replica identities must be unique")
+    if len({account.principal_id for account in accounts}) != len(accounts):
+        raise ValueError("principal accounts must be unique")
+    if len({account.access_code for account in accounts}) != len(accounts):
+        raise ValueError("principal access codes must be unique")
+    return sessions, accounts
+
+
+def load_principal_sessions(path: Path | None) -> list[PrincipalSession]:
+    sessions, accounts = load_principals(path)
+    if accounts:
+        raise ValueError("principal config contains bootstrap accounts")
     return sessions
 
 
@@ -183,6 +215,8 @@ def build_server(
     token: str,
     bindings: list[tuple[str, str]] | None = None,
     principal_sessions: list[PrincipalSession] | None = None,
+    principal_accounts: list[PrincipalAccount] | None = None,
+    secure_cookies: bool = True,
     submission_tag_writer: SubmissionTagWriter | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
@@ -193,6 +227,9 @@ def build_server(
         data_dir / "packages",
         bindings=bindings,
         principal_sessions=principal_sessions or (),
+        principal_accounts=principal_accounts or (),
+        session_registry=FileSessionRegistry(data_dir / "auth" / "sessions.json"),
+        secure_cookies=secure_cookies,
         submission_tag_writer=submission_tag_writer,
     )
 
@@ -206,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     token = load_token(arguments.data, arguments.token)
     try:
         bindings = load_bindings(arguments.binding, arguments.binding_config)
-        principal_sessions = load_principal_sessions(arguments.principal_config)
+        principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
     except ValueError as error:
         logger.error("invalid binding configuration: %s", error)
@@ -218,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         token=token,
         bindings=bindings,
         principal_sessions=principal_sessions,
+        principal_accounts=principal_accounts,
+        secure_cookies=not arguments.insecure_cookies,
         submission_tag_writer=submission_tag_writer,
     )
     host, port = server.server_address

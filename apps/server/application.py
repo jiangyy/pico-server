@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import hmac
 from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from apps.server.authorization import PrincipalSession
+from apps.server.authorization import (
+    CompositeAuthenticator,
+    CompositeReplicaDirectory,
+    PrincipalAccount,
+    PrincipalLogAuthorization,
+    PrincipalSession,
+    StaticAuthenticator,
+    StaticReplicaDirectory,
+)
 from apps.server.comments import CommentError, CommentPublisher
 from apps.server.playgrounds import (
     PLAYGROUND_RELEASES_LOG_ID,
@@ -14,7 +23,13 @@ from apps.server.playgrounds import (
     PackageNotFound,
     PlaygroundPublisher,
 )
-from apps.server.protocol import LogBinding, ReplicaHttpServer, ReplicaRequestHandler
+from apps.server.protocol import (
+    LogBinding,
+    ReplicaHttpServer,
+    ReplicaRequestHandler,
+    _ResponseSent,
+)
+from apps.server.sessions import FileSessionRegistry
 from apps.server.workers import (
     DraftRequestConsumer,
     ServerWorkerThread,
@@ -38,9 +53,15 @@ class PicoPGHttpServer(ReplicaHttpServer):
         bindings: Iterable[LogBinding] | None = None,
         package_adapter: PackageAdapter | None = None,
         principal_sessions: Iterable[PrincipalSession] = (),
+        principal_accounts: Iterable[PrincipalAccount] = (),
+        session_registry: FileSessionRegistry | None = None,
+        secure_cookies: bool = True,
         submission_tag_writer: SubmissionTagWriter | None = None,
     ) -> None:
         sessions = tuple(principal_sessions)
+        accounts = tuple(principal_accounts)
+        if accounts and session_registry is None:
+            raise ValueError("principal accounts require a Session registry")
         if any(session.grants.get(PLAYGROUND_RELEASES_LOG_ID) == "append" for session in sessions):
             raise ValueError(f"{PLAYGROUND_RELEASES_LOG_ID!r} is server-owned and read-only")
         exposed = list(bindings or ())
@@ -58,14 +79,31 @@ class PicoPGHttpServer(ReplicaHttpServer):
             raise ValueError(
                 f"{PLAYGROUND_RELEASES_LOG_ID!r} is server-owned and must be read-only"
             )
+        authenticators = ([StaticAuthenticator(sessions)] if sessions else []) + (
+            [session_registry] if session_registry is not None else []
+        )
+        directories = ([StaticReplicaDirectory(sessions)] if sessions else []) + (
+            [session_registry] if session_registry is not None else []
+        )
+        authenticator = CompositeAuthenticator(authenticators) if authenticators else None
+        directory = CompositeReplicaDirectory(directories)
+        authorization = PrincipalLogAuthorization(sessions, directory, accounts) if authenticators else None
         super().__init__(
             address,
             store,
             token,
             bindings=exposed,
             handler_class=PicoRequestHandler,
-            principal_sessions=sessions,
+            authenticator=authenticator,
+            log_authorization=authorization,
+            operator_authenticator=(
+                session_registry.authenticate_operator
+                if session_registry is not None else None
+            ),
         )
+        self.principal_accounts = accounts
+        self.session_registry = session_registry
+        self.secure_cookies = secure_cookies
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
         )
@@ -117,6 +155,12 @@ class PicoRequestHandler(ReplicaRequestHandler):
 
     def _dispatch(self) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/v1/session":
+            self._dispatch_session()
+            return
+        if path == "/api/v1/operator/session":
+            self._dispatch_operator_session()
+            return
         comment_scope = _comment_route(path)
         if comment_scope is not None:
             self._dispatch_comment(*comment_scope)
@@ -185,6 +229,122 @@ class PicoRequestHandler(ReplicaRequestHandler):
 
             logger.exception("playground request failed")
             self._error(500, "server.failure", "server failure")
+
+    def _dispatch_session(self) -> None:
+        try:
+            self._dispatch_session_request()
+        except (InvalidReplicaData, ValueError) as error:
+            self._error(400, "session.invalid", str(error))
+        except _ResponseSent:
+            pass
+        except Exception:
+            from apps.server.protocol import logger
+
+            logger.exception("Session request failed")
+            self._error(500, "server.failure", "server failure")
+
+    def _dispatch_session_request(self) -> None:
+        registry = self.server.session_registry
+        if registry is None:
+            self._error(404, "route.not_found", "route not found")
+            return
+        if self.command == "GET":
+            identity = self._authenticated_replica()
+            if identity is None:
+                self._error(401, "auth.required", "valid Session required")
+                return
+            self._send_json(200, {
+                "principalId": identity.principal_id,
+                "replicaId": identity.replica_id,
+            }, (("Cache-Control", "no-store"),))
+            return
+        if self.command == "POST":
+            body = self._read_json()
+            if not isinstance(body, dict) or set(body) != {"accessCode"}:
+                self._error(400, "session.invalid", "body must contain accessCode")
+                return
+            access_code = body["accessCode"]
+            if not isinstance(access_code, str) or not access_code:
+                self._error(400, "session.invalid", "accessCode must be non-empty")
+                return
+            account = None
+            for candidate in self.server.principal_accounts:
+                if hmac.compare_digest(access_code, candidate.access_code):
+                    account = candidate
+            if account is None:
+                self._error(401, "auth.required", "valid access code required")
+                return
+            session = registry.bootstrap(account.principal_id, self._cookie("picopg_device"))
+            headers = (
+                ("Set-Cookie", self._session_cookie("picopg_session", session.session_token, 30 * 24 * 60 * 60)),
+                ("Set-Cookie", self._session_cookie("picopg_device", session.device_token, 365 * 24 * 60 * 60)),
+                ("Cache-Control", "no-store"),
+            )
+            self._send_json(201, {
+                "principalId": session.identity.principal_id,
+                "replicaId": session.identity.replica_id,
+            }, headers)
+            return
+        if self.command == "DELETE":
+            token = self._cookie("picopg_session")
+            if token is not None:
+                registry.revoke(token)
+            self._send_json(200, {"status": "signedOut"}, (
+                ("Set-Cookie", self._session_cookie("picopg_session", "", 0)),
+                ("Cache-Control", "no-store"),
+            ))
+            return
+        self._error(405, "method.not_allowed", "method not allowed")
+
+    def _dispatch_operator_session(self) -> None:
+        try:
+            self._dispatch_operator_session_request()
+        except (InvalidReplicaData, ValueError) as error:
+            self._error(400, "session.invalid", str(error))
+        except _ResponseSent:
+            pass
+        except Exception:
+            from apps.server.protocol import logger
+
+            logger.exception("operator Session request failed")
+            self._error(500, "server.failure", "server failure")
+
+    def _dispatch_operator_session_request(self) -> None:
+        registry = self.server.session_registry
+        if registry is None:
+            self._error(404, "route.not_found", "route not found")
+            return
+        if self.command == "POST":
+            body = self._read_json()
+            if not isinstance(body, dict) or set(body) != {"token"}:
+                self._error(400, "session.invalid", "body must contain token")
+                return
+            token = body["token"]
+            if not isinstance(token, str) or not hmac.compare_digest(token, self.server.replica_token):
+                self._error(401, "auth.required", "valid operator token required")
+                return
+            session = registry.create_operator()
+            self._send_json(201, {"status": "authenticated"}, (
+                ("Set-Cookie", self._session_cookie("picopg_operator_session", session.token, 30 * 24 * 60 * 60)),
+                ("Cache-Control", "no-store"),
+            ))
+            return
+        if self.command == "DELETE":
+            token = self._cookie("picopg_operator_session")
+            if token is not None:
+                registry.revoke_operator(token)
+            self._send_json(200, {"status": "signedOut"}, (
+                ("Set-Cookie", self._session_cookie("picopg_operator_session", "", 0)),
+                ("Cache-Control", "no-store"),
+            ))
+            return
+        self._error(405, "method.not_allowed", "method not allowed")
+
+    def _session_cookie(self, name: str, value: str, max_age: int) -> str:
+        parts = [f"{name}={value}", "Path=/", f"Max-Age={max_age}", "HttpOnly", "SameSite=Strict"]
+        if self.server.secure_cookies:
+            parts.append("Secure")
+        return "; ".join(parts)
 
     def _dispatch_comment(self, principal_id: str, draft_id: str) -> None:
         """Operator-only: append a fact to the Draft's server-owned comment Log."""
