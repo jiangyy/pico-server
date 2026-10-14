@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import http.cookiejar
 import json
+import os
 import ssl
 import urllib.error
 import urllib.request
@@ -123,11 +124,19 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--access-code", required=True)
-    parser.add_argument("--operator-token", required=True)
+    parser.add_argument(
+        "--access-code", default=os.environ.get("PICOPG_SMOKE_ACCESS_CODE")
+    )
+    parser.add_argument(
+        "--operator-token", default=os.environ.get("PICOPG_REPLICA_TOKEN")
+    )
     parser.add_argument("--allow-http", action="store_true")
     parser.add_argument("--skip-static", action="store_true")
     arguments = parser.parse_args(argv)
+    if not arguments.access_code:
+        parser.error("set PICOPG_SMOKE_ACCESS_CODE or pass --access-code")
+    if not arguments.operator_token:
+        parser.error("set PICOPG_REPLICA_TOKEN or pass --operator-token")
     result = run(
         arguments.base_url,
         arguments.access_code,

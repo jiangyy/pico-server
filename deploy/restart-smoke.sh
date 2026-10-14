@@ -18,6 +18,4 @@ until curl --fail --silent --show-error "${PICOPG_SMOKE_BASE_URL%/}/healthz" >/d
 done
 
 exec python3 deploy/smoke.py \
-    --base-url "$PICOPG_SMOKE_BASE_URL" \
-    --access-code "$PICOPG_SMOKE_ACCESS_CODE" \
-    --operator-token "$PICOPG_REPLICA_TOKEN"
+    --base-url "$PICOPG_SMOKE_BASE_URL"

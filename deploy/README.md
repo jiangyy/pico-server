@@ -15,7 +15,7 @@ The production service deliberately omits `--insecure-cookies`. Browser Sessions
 
 ## Verify HTTPS, SSE and restart
 
-Export the three smoke variables without putting secrets in shell history, then run:
+Export the three smoke variables without putting secrets in shell history, then run. The wrapper leaves both credentials in the environment instead of copying them into the child process command line:
 
 ```sh
 deploy/restart-smoke.sh
