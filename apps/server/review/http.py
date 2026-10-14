@@ -28,7 +28,11 @@ def dispatch_review(handler: PicoRequestHandler, path: str) -> bool:
     except SubmissionNotFound as error:
         handler._error(404, "submission.not_found", str(error))
     except (CommentError, SubmissionError, InvalidReplicaData) as error:
-        handler._error(400, "review.invalid", str(error))
+        handler._error(
+            400,
+            "submission.invalid" if submission is not None else "comment.invalid",
+            str(error),
+        )
     except _ResponseSent:
         pass
     except Exception:

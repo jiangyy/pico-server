@@ -102,12 +102,13 @@ def _comments(base_url: str) -> None:
     _expect(records[0]["data"]["draftId"] == "lesson", "comment lost its Draft")
     _expect(records[0]["requires"] == [], "comments must not depend on Replica Logs")
 
-    status, _ = _call(
+    status, invalid = _call(
         f"{base_url}/api/v1/principals/user/drafts/lesson/comments",
         method="POST",
         body={"author": "teacher", "text": "   "},
     )
     _expect(status == 400, f"empty text returned {status}")
+    _expect(invalid["error"]["code"] == "comment.invalid", "comment error code changed")
 
     status, _ = _call(
         f"{base_url}/api/v1/principals/user/drafts/lesson/comments",

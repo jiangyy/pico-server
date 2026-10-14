@@ -140,6 +140,14 @@ def main() -> int:
                 base_url, "/api/v1/operator/submissions/missing"
             )
             assert status == 404
+            status, invalid = _request(
+                base_url,
+                f"/api/v1/operator/submissions/{request_id}/comments",
+                method="POST",
+                body={"author": "teacher", "text": "   "},
+            )
+            assert status == 400
+            assert invalid["error"]["code"] == "submission.invalid"  # type: ignore[index]
         finally:
             server.shutdown()
             server.server_close()
