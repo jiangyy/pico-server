@@ -17,9 +17,9 @@ PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定�
 
 ## 还没有完全完成
 
-- 正式 Auth：当前 token 和 Principal 来自静态配置；没有登录、Session 刷新/撤销、Replica 注册、课程/班级授权或角色管理。
+- 正式 Auth：当前 token、Principal 与 Replica 来自静态配置；没有 Session 生命周期或动态 Replica 注册。Profile、班级、选课和角色明确不属于认证模型。
 - 生产存储：Replica Log、Package 仍使用本机文件；没有 PostgreSQL adapter、Object Storage、migration 和完整备份恢复流程。
-- 部署能力：当前适合单实例；缺少 TLS/反向代理配置、Secret 管理、结构化监控、告警、速率限制和生产 runbook。
+- 部署能力：已有 nginx HTTPS 与 systemd 样例，但尚未把 Principal 配置、Submission repository、SSE buffering、Secret、备份恢复和 smoke test 连成可执行 runbook。
 - 横向扩容：worker 与 HTTP Server 同进程；多实例前需要共享 Store、worker lease/竞争控制和唯一结果写入保障。
 - 数据管理：Git repository 映射仍是静态配置；没有 Submission 查询索引、历史管理、保留策略和自动评测编排。
 - Comment 模型：Comment 当前属于 Draft，尚未绑定某次 Revision 或 Submission。
@@ -27,9 +27,9 @@ PicoPG Server 保存和复制不可变事实，并处理只能由 Server 决定�
 
 ## 下一步
 
-1. 用正式登录/Session 实现替换静态 `Authenticator`，继续输出相同的 `AuthenticatedReplica`，不修改 Draft 协议。
-2. 明确每类数据的唯一权威，再接 PostgreSQL、Object Storage 和 Git 管理；避免同一事实多处双写。
-3. 先完成可恢复的单实例部署，再做 staging HTTP、鉴权、重启和故障测试。
-4. 只有真实负载证明需要时，才拆 worker、共享 Store 和横向扩容。
+1. 加入最小 Session 与动态 Replica 注册，继续输出相同的 `AuthenticatedReplica`，不修改 Draft 协议，也不引入 Profile 或班级。
+2. 把生产 Client、IndexedDB、operator 工作台和部署配置接成一个可恢复的单实例交付物。
+3. 在 staging 验证 HTTPS、SSE、鉴权、重启、断网和备份恢复。
+4. 只有真实负载证明需要时，才引入 PostgreSQL、Object Storage、拆分 worker 或横向扩容。
 
 无论底层存储和部署方式怎样变化，都必须保持：单写者、精确 Revision 引用、结果可重放、通知不承载事实、Server 不合并源码。
