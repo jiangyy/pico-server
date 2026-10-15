@@ -6,7 +6,6 @@ from apps.server.review.comments import CommentPublisher
 from apps.server.submission.read_model import (
     Submission,
     SubmissionError,
-    SubmissionReader,
 )
 from picopg.api import ReplicaLogStore
 
@@ -30,11 +29,9 @@ def summary_value(submission: Submission) -> dict[str, object]:
 
 def detail_value(
     store: ReplicaLogStore,
-    submissions: SubmissionReader,
     comments: CommentPublisher,
-    request_record_id: str,
+    submission: Submission,
 ) -> dict[str, object]:
-    submission = submissions.get(request_record_id)
     revision_record = find_record(store, submission.revision)
     if revision_record is None:
         raise SubmissionError("Submission Revision is missing")

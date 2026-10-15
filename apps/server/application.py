@@ -28,6 +28,8 @@ from apps.server.protocol import (
     ReplicaRequestHandler,
 )
 from apps.server.authentication.registry import FileSessionRegistry
+from apps.server.classroom.http import dispatch_classroom
+from apps.server.classroom.roster import ClassRosterRepository
 from apps.server.review.http import dispatch_review
 from apps.server.submission.read_model import SubmissionReader
 from apps.server.student.http import dispatch_student
@@ -39,6 +41,7 @@ from apps.server.submission.logs import (
     request_logs as submission_request_logs,
 )
 from apps.server.submission.worker import SubmissionRequestConsumer, SubmissionTagWriter
+from apps.server.teacher.http import dispatch_teacher
 from apps.server.worker_thread import ServerWorkerThread
 from picopg.api import ReplicaLogStore
 
@@ -120,6 +123,10 @@ class PicoPGHttpServer(ReplicaHttpServer):
         )
         self.comments = CommentPublisher(self)
         self.submissions = SubmissionReader(self.store)
+        self.class_rosters = ClassRosterRepository(
+            self,
+            (principal.principal_id for principal in (*sessions, *accounts)),
+        )
         worker_bindings = dict(self.bindings)
         request_logs = tuple(sorted(set(draft_request_logs(worker_bindings)) | {
             log_id for log_id in self.store.log_ids() if is_draft_request_log(log_id)
@@ -170,6 +177,10 @@ class PicoRequestHandler(ReplicaRequestHandler):
         if dispatch_session(self, path):
             return
         if dispatch_student(self, path):
+            return
+        if dispatch_classroom(self, path):
+            return
+        if dispatch_teacher(self, path):
             return
         if dispatch_review(self, path):
             return

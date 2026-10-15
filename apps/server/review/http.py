@@ -48,13 +48,13 @@ def _submission(handler: PicoRequestHandler, action: str, request_record_id: str
         }, (("Cache-Control", "no-store"),))
         return
     if action == "detail" and handler.command == "GET":
+        submission = handler.server.submissions.get(request_record_id)
         handler._send_json(
             200,
             detail_value(
                 handler.server.store,
-                handler.server.submissions,
                 handler.server.comments,
-                request_record_id,
+                submission,
             ),
             (("Cache-Control", "no-store"),),
         )

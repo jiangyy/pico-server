@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from apps.server.log_reads import PaginationStalled, read_all
@@ -45,12 +45,20 @@ class SubmissionReader:
         )
 
     def list_for(self, principal_id: str) -> tuple[Submission, ...]:
+        return self.list_for_principals((principal_id,))
+
+    def list_for_principals(
+        self, principal_ids: Iterable[str]
+    ) -> tuple[Submission, ...]:
+        owners = frozenset(principal_ids)
+        if not owners:
+            return ()
         try:
             request_logs = tuple(
                 log_id
                 for log_id in sorted(self._store.log_ids())
                 if is_request_log(log_id)
-                and request_scope(log_id)[0] == principal_id
+                and request_scope(log_id)[0] in owners
             )
         except ValueError as error:
             raise SubmissionError(str(error)) from error
@@ -69,7 +77,19 @@ class SubmissionReader:
         return tuple(submissions)
 
     def get(self, request_record_id: str) -> Submission:
-        matches = [item for item in self.list() if item.request.record_id == request_record_id]
+        return self._get(request_record_id, self.list())
+
+    def get_for(
+        self, request_record_id: str, principal_ids: Iterable[str]
+    ) -> Submission:
+        return self._get(request_record_id, self.list_for_principals(principal_ids))
+
+    def _get(
+        self, request_record_id: str, submissions: tuple[Submission, ...]
+    ) -> Submission:
+        matches = [
+            item for item in submissions if item.request.record_id == request_record_id
+        ]
         if not matches:
             raise SubmissionNotFound("submission not found")
         if len(matches) != 1:
