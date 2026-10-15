@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Mapping, Protocol, Union
 from urllib.parse import quote
 
+from apps.server.log_reads import PaginationStalled, read_all
+from apps.server.validation import require_non_blank_position, require_non_blank_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 
@@ -49,12 +51,6 @@ class CommentServer(Protocol):
     ) -> object: ...
 
 
-def _text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise CommentError(f"{label} must be non-empty")
-    return value
-
-
 def _draft_id(value: object) -> str:
     if not isinstance(value, str) or _ID.fullmatch(value) is None:
         raise CommentError("draftId is not a valid identifier")
@@ -87,7 +83,11 @@ class CommentPublisher:
             draft_id,
             author,
             text,
-            submission_id=_text(submission_id, "submissionId"),
+            submission_id=require_non_blank_text(
+                submission_id,
+                "submissionId",
+                error_type=CommentError,
+            ),
             submission_request=submission_request,
             revision=revision,
         )
@@ -103,10 +103,14 @@ class CommentPublisher:
         submission_request: Position | None = None,
         revision: Position | None = None,
     ) -> Position:
-        principal_id = _text(principal_id, "principalId")
+        principal_id = require_non_blank_text(
+            principal_id,
+            "principalId",
+            error_type=CommentError,
+        )
         draft_id = _draft_id(draft_id)
-        author = _text(author, "author")
-        text = _text(text, "text")
+        author = require_non_blank_text(author, "author", error_type=CommentError)
+        text = require_non_blank_text(text, "text", error_type=CommentError)
         log_id = comment_log_id(principal_id, draft_id)
         data: dict[str, JsonValue] = {
             "type": COMMENT_KIND,
@@ -140,20 +144,23 @@ class CommentPublisher:
 
     def comments(self, principal_id: str, draft_id: str) -> tuple[Comment, ...]:
         """Reads the Draft's comments in Log order."""
-        principal_id = _text(principal_id, "principalId")
+        principal_id = require_non_blank_text(
+            principal_id,
+            "principalId",
+            error_type=CommentError,
+        )
         draft_id = _draft_id(draft_id)
         log_id = comment_log_id(principal_id, draft_id)
         comments: list[Comment] = []
-        after: Position | None = None
-        while True:
-            page = self._store.read(log_id, after, 128)
-            for record in page.records:
-                comments.append(_decode(record, draft_id))
-            if not page.has_more:
-                return tuple(comments)
-            if not page.records:
-                raise RuntimeError("comment Log returned an empty continuation page")
-            after = page.records[-1].position
+        try:
+            records = read_all(self._store, log_id)
+        except PaginationStalled as error:
+            raise RuntimeError(
+                "comment Log returned an empty continuation page"
+            ) from error
+        for record in records:
+            comments.append(_decode(record, draft_id))
+        return tuple(comments)
 
 
 def _decode(record: ReplicatedRecord, draft_id: str) -> Comment:
@@ -170,24 +177,31 @@ def _decode(record: ReplicatedRecord, draft_id: str) -> Comment:
     submission_request = None
     revision = None
     if present:
-        submission_id = _text(data.get("submissionId"), "submissionId")
-        submission_request = _position(data.get("submissionRequest"), "submissionRequest")
-        revision = _position(data.get("revision"), "revision")
+        submission_id = require_non_blank_text(
+            data.get("submissionId"),
+            "submissionId",
+            error_type=CommentError,
+        )
+        submission_request = require_non_blank_position(
+            data.get("submissionRequest"),
+            "submissionRequest",
+            error_type=CommentError,
+        )
+        revision = require_non_blank_position(
+            data.get("revision"),
+            "revision",
+            error_type=CommentError,
+        )
     return Comment(
         record.position,
         draft_id,
-        _text(data.get("author"), "author"),
-        _text(data.get("text"), "text"),
+        require_non_blank_text(
+            data.get("author"), "author", error_type=CommentError
+        ),
+        require_non_blank_text(
+            data.get("text"), "text", error_type=CommentError
+        ),
         submission_id,
         submission_request,
         revision,
-    )
-
-
-def _position(value: object, label: str) -> Position:
-    if not isinstance(value, Mapping) or set(value) != {"logId", "recordId"}:
-        raise CommentError(f"{label} must contain logId and recordId")
-    return Position(
-        _text(value["logId"], f"{label}.logId"),
-        _text(value["recordId"], f"{label}.recordId"),
     )

@@ -9,6 +9,8 @@ from types import MappingProxyType
 from typing import Mapping, Protocol
 from urllib.parse import quote
 
+from apps.server.validation import require_text
+
 
 PRINCIPAL_CAPABILITIES = frozenset(("playgrounds", "drafts", "submissions"))
 
@@ -33,6 +35,20 @@ class LogAuthorization(Protocol):
     def has_access(self, identity: AuthenticatedReplica) -> bool: ...
 
 
+class PrincipalLogRule(Protocol):
+    capability: str
+
+    def access(
+        self,
+        principal_id: str,
+        replica_id: str,
+        replicas: frozenset[str],
+        log_id: str,
+    ) -> str | None: ...
+
+    def owner(self, log_id: str) -> tuple[str, str] | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class PrincipalAccount:
     principal_id: str
@@ -46,9 +62,8 @@ class PrincipalAccount:
         access_code: str,
         capabilities: Iterable[str] = (),
     ) -> "PrincipalAccount":
-        for value, label in ((principal_id, "principalId"), (access_code, "accessCode")):
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{label} must be non-empty")
+        require_text(principal_id, "principalId")
+        require_text(access_code, "accessCode")
         enabled = frozenset(capabilities)
         unknown = enabled - PRINCIPAL_CAPABILITIES
         if unknown:
@@ -75,19 +90,14 @@ class PrincipalSession:
         grants: Mapping[str, str],
         capabilities: Iterable[str] = (),
     ) -> "PrincipalSession":
-        for value, label in ((principal_id, "principalId"), (replica_id, "replicaId"), (token, "token")):
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{label} must be non-empty")
+        require_text(principal_id, "principalId")
+        require_text(replica_id, "replicaId")
+        require_text(token, "token")
         copied = dict(grants)
         if any(not isinstance(log_id, str) or not log_id for log_id in copied):
             raise ValueError("grant Log IDs must be non-empty")
         if any(access not in ("read", "append") for access in copied.values()):
             raise ValueError("grant access must be 'read' or 'append'")
-        identity = AuthenticatedReplica(principal_id, replica_id)
-        for log_id, access in copied.items():
-            owner = _replica_owner(log_id)
-            if access == "append" and owner is not None and owner != _encoded_identity(identity):
-                raise ValueError(f"append grant {log_id!r} belongs to another Replica")
         enabled = frozenset(capabilities)
         unknown = enabled - PRINCIPAL_CAPABILITIES
         if unknown:
@@ -162,14 +172,37 @@ class PrincipalLogAuthorization:
         sessions: Iterable[PrincipalSession],
         directory: ReplicaDirectory,
         accounts: Iterable[PrincipalAccount] = (),
+        rules: Iterable[PrincipalLogRule] = (),
     ) -> None:
+        sessions = tuple(sessions)
+        accounts = tuple(accounts)
         self._directory = directory
+        self._rules = tuple(rules)
+        configured = {rule.capability for rule in self._rules}
+        if len(configured) != len(self._rules):
+            raise ValueError("principal Log rule capabilities must be unique")
+        unknown = configured - PRINCIPAL_CAPABILITIES
+        if unknown:
+            raise ValueError(
+                f"unknown principal Log rule capabilities: {', '.join(sorted(unknown))}"
+            )
+        enabled = {
+            capability
+            for principal in (*sessions, *accounts)
+            for capability in principal.capabilities
+        }
+        missing = enabled - configured
+        if missing:
+            raise ValueError(
+                f"principal capabilities have no Log rules: {', '.join(sorted(missing))}"
+            )
         self._grants: dict[AuthenticatedReplica, Mapping[str, str]] = {}
         self._capabilities: dict[AuthenticatedReplica, frozenset[str]] = {}
         for session in sessions:
             identity = AuthenticatedReplica(session.principal_id, session.replica_id)
             if identity in self._grants:
                 raise ValueError("principal session identities must be unique")
+            self._validate_grants(identity, session.grants)
             self._grants[identity] = session.grants
             self._capabilities[identity] = session.capabilities
         self._principal_capabilities: dict[str, frozenset[str]] = {}
@@ -183,48 +216,23 @@ class PrincipalLogAuthorization:
         capabilities = self._capabilities.get(identity)
         if capabilities is None:
             capabilities = self._principal_capabilities.get(identity.principal_id)
-        if capabilities is None or identity.replica_id not in self._directory.replicas(identity.principal_id):
+        replicas = self._directory.replicas(identity.principal_id)
+        if capabilities is None or identity.replica_id not in replicas:
             return None
         explicit = grants.get(log_id)
         if explicit is not None:
             return explicit
-        if "playgrounds" in capabilities and log_id == "playground-releases":
-            return "read"
-        parts = log_id.split("/")
-        principal, replica = _encoded_identity(identity)
-        if (
-            "drafts" in capabilities
-            and len(parts) >= 5
-            and parts[0] == "principal"
-            and parts[1] == principal
-            and parts[2] == "draft"
-            and parts[3]
-        ):
-            if len(parts) == 5 and parts[4] in ("decision", "comment"):
-                return "read"
-            if len(parts) == 6 and parts[5]:
-                if parts[4] == "request":
-                    return "append" if parts[5] == replica else None
-                if parts[4] == "revision":
-                    if parts[5] == replica:
-                        return "append"
-                    known = {
-                        quote(value, safe="-_.!~*'()")
-                        for value in self._directory.replicas(identity.principal_id)
-                    }
-                    return "read" if parts[5] in known else None
-        if (
-            "submissions" in capabilities
-            and len(parts) == 5
-            and parts[0] == "principal"
-            and parts[1] == principal
-            and parts[2] == "submission"
-            and parts[3] == replica
-        ):
-            if parts[4] == "requests":
-                return "append"
-            if parts[4] == "results":
-                return "read"
+        for rule in self._rules:
+            if rule.capability not in capabilities:
+                continue
+            access = rule.access(
+                identity.principal_id,
+                identity.replica_id,
+                replicas,
+                log_id,
+            )
+            if access is not None:
+                return access
         return None
 
     def has_access(self, identity: AuthenticatedReplica) -> bool:
@@ -235,6 +243,26 @@ class PrincipalLogAuthorization:
             or self._capabilities.get(identity)
             or self._principal_capabilities.get(identity.principal_id)
         )
+
+    def _validate_grants(
+        self,
+        identity: AuthenticatedReplica,
+        grants: Mapping[str, str],
+    ) -> None:
+        encoded_identity = _encoded_identity(identity)
+        for log_id, access in grants.items():
+            if access != "append":
+                continue
+            owner = next(
+                (
+                    owner
+                    for rule in self._rules
+                    if (owner := rule.owner(log_id)) is not None
+                ),
+                None,
+            )
+            if owner is not None and owner != encoded_identity:
+                raise ValueError(f"append grant {log_id!r} belongs to another Replica")
 
 
 def permits_log(access: str | None, action: str, method: str) -> bool:
@@ -250,22 +278,3 @@ def permits_log(access: str | None, action: str, method: str) -> bool:
 def _encoded_identity(identity: AuthenticatedReplica) -> tuple[str, str]:
     safe = "-_.!~*'()"
     return quote(identity.principal_id, safe=safe), quote(identity.replica_id, safe=safe)
-
-
-def _replica_owner(log_id: str) -> tuple[str, str] | None:
-    parts = log_id.split("/")
-    if (
-        len(parts) == 6
-        and parts[0] == "principal"
-        and parts[2] == "draft"
-        and parts[4] in ("revision", "request")
-    ):
-        return parts[1], parts[5]
-    if (
-        len(parts) == 5
-        and parts[0] == "principal"
-        and parts[2] == "submission"
-        and parts[4] == "requests"
-    ):
-        return parts[1], parts[3]
-    return None

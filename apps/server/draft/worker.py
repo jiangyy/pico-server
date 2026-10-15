@@ -5,7 +5,8 @@ from threading import Lock
 
 from apps.server.draft.authority import DraftAuthority
 from apps.server.draft.protocol import DraftResult
-from picopg.api import Position, ReplicaLogStore, ReplicatedRecord
+from apps.server.log_reads import read_all
+from picopg.api import Position, ReplicaLogStore
 
 
 class DraftRequestConsumer:
@@ -29,7 +30,7 @@ class DraftRequestConsumer:
         with self._lock:
             request_logs = tuple(sorted(self._request_logs))
         for log_id in request_logs:
-            for record in _records(self._store, log_id):
+            for record in read_all(self._store, log_id):
                 key = (log_id, record.id)
                 if key in self._processed:
                     continue
@@ -66,16 +67,3 @@ def is_draft_request_log(log_id: str) -> bool:
         and parts[4] == "request"
         and bool(parts[5])
     )
-
-
-def _records(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:
-    values: list[ReplicatedRecord] = []
-    after: Position | None = None
-    while True:
-        page = store.read(log_id, after, 128)
-        values.extend(page.records)
-        if not page.has_more:
-            return tuple(values)
-        if not page.records:
-            raise ValueError(f"{log_id} returned an empty continuation page")
-        after = page.records[-1].position

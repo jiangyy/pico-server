@@ -14,6 +14,7 @@ from threading import RLock
 from uuid import uuid4
 
 from apps.server.authentication.model import AuthenticatedReplica
+from apps.server.validation import require_text
 
 
 SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -39,12 +40,6 @@ class OperatorSession:
 
 def _digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _non_empty(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be non-empty")
-    return value
 
 
 class FileSessionRegistry:
@@ -75,8 +70,8 @@ class FileSessionRegistry:
         return self._ttl
 
     def bootstrap(self, principal_id: str, device_token: str | None) -> BrowserSession:
-        principal_id = _non_empty(principal_id, "principalId")
-        raw_device = self._token(32) if device_token is None else _non_empty(device_token, "deviceToken")
+        principal_id = require_text(principal_id, "principalId")
+        raw_device = self._token(32) if device_token is None else require_text(device_token, "deviceToken")
         device_digest = _digest(raw_device)
         with self._lock:
             self._prune()
@@ -182,9 +177,9 @@ class FileSessionRegistry:
             for item in raw["replicas"]:
                 if not isinstance(item, dict) or set(item) != {"principalId", "deviceDigest", "replicaId"}:
                     raise ValueError("replica registration is invalid")
-                principal_id = _non_empty(item["principalId"], "principalId")
-                device_digest = _non_empty(item["deviceDigest"], "deviceDigest")
-                replica_id = _non_empty(item["replicaId"], "replicaId")
+                principal_id = require_text(item["principalId"], "principalId")
+                device_digest = require_text(item["deviceDigest"], "deviceDigest")
+                replica_id = require_text(item["replicaId"], "replicaId")
                 if len(device_digest) != 64:
                     raise ValueError("deviceDigest is invalid")
                 key = (principal_id, device_digest)
@@ -197,10 +192,10 @@ class FileSessionRegistry:
             for item in raw["sessions"]:
                 if not isinstance(item, dict) or set(item) != {"digest", "principalId", "replicaId", "expiresAt"}:
                     raise ValueError("session is invalid")
-                digest = _non_empty(item["digest"], "digest")
+                digest = require_text(item["digest"], "digest")
                 identity = AuthenticatedReplica(
-                    _non_empty(item["principalId"], "principalId"),
-                    _non_empty(item["replicaId"], "replicaId"),
+                    require_text(item["principalId"], "principalId"),
+                    require_text(item["replicaId"], "replicaId"),
                 )
                 expires_at = item["expiresAt"]
                 if len(digest) != 64 or type(expires_at) is not int:
@@ -217,7 +212,7 @@ class FileSessionRegistry:
             for item in raw["operators"]:
                 if not isinstance(item, dict) or set(item) != {"digest", "expiresAt"}:
                     raise ValueError("operator session is invalid")
-                digest = _non_empty(item["digest"], "digest")
+                digest = require_text(item["digest"], "digest")
                 expires_at = item["expiresAt"]
                 if len(digest) != 64 or type(expires_at) is not int or digest in operators:
                     raise ValueError("operator session is invalid")

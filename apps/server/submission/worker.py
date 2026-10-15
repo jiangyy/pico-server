@@ -5,7 +5,9 @@ from threading import Lock
 from typing import Protocol
 
 from apps.server.draft.protocol import decode_revision
+from apps.server.log_reads import find_record, read_all
 from apps.server.submission.logs import is_request_log, request_scope, result_log
+from apps.server.validation import require_position, require_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 
@@ -52,7 +54,7 @@ class SubmissionRequestConsumer:
 
     def _run_log(self, request_log: str) -> int:
         output_log = result_log(request_log)
-        results = _records(self._store, output_log)
+        results = read_all(self._store, output_log)
         completed = {
             (position.log_id, position.record_id)
             for record in results
@@ -61,7 +63,7 @@ class SubmissionRequestConsumer:
         }
         head = None if not results else results[-1].position
         handled = 0
-        for request in _records(self._store, request_log):
+        for request in read_all(self._store, request_log):
             if (request_log, request.id) in completed:
                 continue
             data, requires = self._result(request)
@@ -91,12 +93,12 @@ class SubmissionRequestConsumer:
         data = request.data
         if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
             raise ValueError("request is not a Submission")
-        submission_id = _non_empty(data.get("submissionId"), "submissionId")
-        playground_id = _non_empty(data.get("playgroundId"), "playgroundId")
-        revision = _position(data.get("revision"), "revision")
+        submission_id = require_text(data.get("submissionId"), "submissionId")
+        playground_id = require_text(data.get("playgroundId"), "playgroundId")
+        revision = require_position(data.get("revision"), "revision")
         if revision not in request.requires:
             raise ValueError("Submission does not require its Revision")
-        revision_record = _at(self._store, revision)
+        revision_record = find_record(self._store, revision)
         if revision_record is None:
             raise ValueError("Submission Revision is missing")
         decoded = decode_revision(revision_record)
@@ -109,8 +111,7 @@ class SubmissionRequestConsumer:
             revision=revision,
             source=decoded["source"],
         )
-        if not isinstance(tag, str) or not tag:
-            raise ValueError("tag must be non-empty")
+        tag = require_text(tag, "tag")
         return ({
             "type": "submission.completed",
             "submissionId": submission_id,
@@ -134,25 +135,6 @@ def _unique(positions: tuple[Position, ...], own_log: str) -> tuple[Position, ..
     return tuple(unique)
 
 
-def _records(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:
-    values: list[ReplicatedRecord] = []
-    after: Position | None = None
-    while True:
-        page = store.read(log_id, after, 128)
-        values.extend(page.records)
-        if not page.has_more:
-            return tuple(values)
-        if not page.records:
-            raise ValueError(f"{log_id} returned an empty continuation page")
-        after = page.records[-1].position
-
-
-def _at(store: ReplicaLogStore, position: Position) -> ReplicatedRecord | None:
-    if not store.has(position):
-        return None
-    return next((record for record in _records(store, position.log_id) if record.id == position.record_id), None)
-
-
 def _record(
     log_id: str,
     parent: Position | None,
@@ -160,15 +142,3 @@ def _record(
     data: Mapping[str, object],
 ) -> ReplicatedRecord:
     return ReplicatedRecord(record_id_of(log_id, parent, requires, data), log_id, parent, requires, data)
-
-
-def _position(value: object, label: str) -> Position:
-    if not isinstance(value, Mapping) or set(value) != {"logId", "recordId"}:
-        raise ValueError(f"{label} must contain logId and recordId")
-    return Position(_non_empty(value["logId"], f"{label}.logId"), _non_empty(value["recordId"], f"{label}.recordId"))
-
-
-def _non_empty(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be non-empty")
-    return value

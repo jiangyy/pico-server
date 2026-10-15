@@ -17,6 +17,7 @@ from apps.server.authentication.model import (
 from apps.server.review.comments import CommentPublisher
 from apps.server.playground.catalog import (
     PLAYGROUND_RELEASES_LOG_ID,
+    PlaygroundLogRule,
     PlaygroundPublisher,
 )
 from apps.server.playground.package import FilePackageStore, PackageAdapter
@@ -29,8 +30,13 @@ from apps.server.protocol import (
 from apps.server.authentication.registry import FileSessionRegistry
 from apps.server.review.http import dispatch_review
 from apps.server.review.submissions import SubmissionReader
+from apps.server.draft.protocol import DraftLogRule
 from apps.server.draft.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log
-from apps.server.submission.logs import is_request_log, request_logs as submission_request_logs
+from apps.server.submission.logs import (
+    SubmissionLogRule,
+    is_request_log,
+    request_logs as submission_request_logs,
+)
 from apps.server.submission.worker import SubmissionRequestConsumer, SubmissionTagWriter
 from apps.server.worker_thread import ServerWorkerThread
 from picopg.api import ReplicaLogStore
@@ -81,7 +87,17 @@ class PicoPGHttpServer(ReplicaHttpServer):
         )
         authenticator = CompositeAuthenticator(authenticators) if authenticators else None
         directory = CompositeReplicaDirectory(directories)
-        authorization = PrincipalLogAuthorization(sessions, directory, accounts) if authenticators else None
+        rules = (PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule())
+        authorization = (
+            PrincipalLogAuthorization(
+                sessions,
+                directory,
+                accounts,
+                rules,
+            )
+            if authenticators
+            else None
+        )
         super().__init__(
             address,
             store,

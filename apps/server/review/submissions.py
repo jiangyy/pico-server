@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from apps.server.review.comments import CommentPublisher
 from apps.server.draft.protocol import decode_revision
+from apps.server.log_reads import PaginationStalled, find_record, read_all
+from apps.server.review.comments import CommentPublisher
 from apps.server.submission.logs import is_request_log, request_scope, result_log
+from apps.server.validation import require_non_blank_position, require_non_blank_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord
 
 
@@ -60,7 +62,7 @@ class SubmissionReader:
             if not is_request_log(log_id):
                 continue
             results = self._results(log_id)
-            for request in _records(self._store, log_id):
+            for request in self._records(log_id):
                 if request.id in record_ids:
                     raise SubmissionError("submission request Record ID is not unique")
                 record_ids.add(request.id)
@@ -77,7 +79,7 @@ class SubmissionReader:
 
     def detail_value(self, request_record_id: str) -> dict[str, object]:
         submission = self.get(request_record_id)
-        revision_record = _at(self._store, submission.revision)
+        revision_record = find_record(self._store, submission.revision)
         if revision_record is None:
             raise SubmissionError("Submission Revision is missing")
         decoded = decode_revision(revision_record)
@@ -103,7 +105,7 @@ class SubmissionReader:
 
     def _results(self, request_log: str) -> dict[Position, ReplicatedRecord]:
         results: dict[Position, ReplicatedRecord] = {}
-        for record in _records(self._store, result_log(request_log)):
+        for record in self._records(result_log(request_log)):
             request = _result_request(record)
             if request.log_id != request_log:
                 raise SubmissionError("Submission result belongs to another Request Log")
@@ -112,6 +114,12 @@ class SubmissionReader:
             results[request] = record
         return results
 
+    def _records(self, log_id: str) -> tuple[ReplicatedRecord, ...]:
+        try:
+            return read_all(self._store, log_id)
+        except PaginationStalled as error:
+            raise SubmissionError(str(error)) from error
+
     def _submission(
         self, request: ReplicatedRecord, result: ReplicatedRecord | None
     ) -> Submission:
@@ -119,9 +127,21 @@ class SubmissionReader:
         data = request.data
         if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
             raise SubmissionError("request is not a Submission")
-        submission_id = _text(data.get("submissionId"), "submissionId")
-        playground_id = _text(data.get("playgroundId"), "playgroundId")
-        revision = _position(data.get("revision"), "revision")
+        submission_id = require_non_blank_text(
+            data.get("submissionId"),
+            "submissionId",
+            error_type=SubmissionError,
+        )
+        playground_id = require_non_blank_text(
+            data.get("playgroundId"),
+            "playgroundId",
+            error_type=SubmissionError,
+        )
+        revision = require_non_blank_position(
+            data.get("revision"),
+            "revision",
+            error_type=SubmissionError,
+        )
         if revision not in request.requires:
             raise SubmissionError("Submission does not require its Revision")
         if result is None:
@@ -137,7 +157,11 @@ class SubmissionReader:
             return Submission(
                 request.position, principal_id, replica_id, submission_id,
                 playground_id, revision, "failed",
-                message=_text(result_data.get("message"), "message"),
+                message=require_non_blank_text(
+                    result_data.get("message"),
+                    "message",
+                    error_type=SubmissionError,
+                ),
             )
         if kind != "submission.completed":
             raise SubmissionError("Submission result type is invalid")
@@ -145,12 +169,20 @@ class SubmissionReader:
             raise SubmissionError("Submission result names another Submission")
         if result_data.get("playgroundId") != playground_id:
             raise SubmissionError("Submission result names another Playground")
-        if _position(result_data.get("revision"), "revision") != revision:
+        if require_non_blank_position(
+            result_data.get("revision"),
+            "revision",
+            error_type=SubmissionError,
+        ) != revision:
             raise SubmissionError("Submission result names another Revision")
         return Submission(
             request.position, principal_id, replica_id, submission_id,
             playground_id, revision, "completed",
-            tag=_text(result_data.get("tag"), "tag"),
+            tag=require_non_blank_text(
+                result_data.get("tag"),
+                "tag",
+                error_type=SubmissionError,
+            ),
         )
 
 
@@ -158,44 +190,11 @@ def _result_request(record: ReplicatedRecord) -> Position:
     data = record.data
     if not isinstance(data, Mapping):
         raise SubmissionError("Submission result must be an object")
-    request = _position(data.get("request"), "request")
+    request = require_non_blank_position(
+        data.get("request"),
+        "request",
+        error_type=SubmissionError,
+    )
     if not record.requires or record.requires[0] != request:
         raise SubmissionError("Submission result does not require its Request")
     return request
-
-
-def _records(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:
-    values: list[ReplicatedRecord] = []
-    after: Position | None = None
-    while True:
-        page = store.read(log_id, after, 128)
-        values.extend(page.records)
-        if not page.has_more:
-            return tuple(values)
-        if not page.records:
-            raise SubmissionError(f"{log_id} returned an empty continuation page")
-        after = page.records[-1].position
-
-
-def _at(store: ReplicaLogStore, position: Position) -> ReplicatedRecord | None:
-    if not store.has(position):
-        return None
-    return next(
-        (record for record in _records(store, position.log_id) if record.id == position.record_id),
-        None,
-    )
-
-
-def _position(value: object, label: str) -> Position:
-    if not isinstance(value, Mapping) or set(value) != {"logId", "recordId"}:
-        raise SubmissionError(f"{label} must contain logId and recordId")
-    return Position(
-        _text(value["logId"], f"{label}.logId"),
-        _text(value["recordId"], f"{label}.recordId"),
-    )
-
-
-def _text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise SubmissionError(f"{label} must be non-empty")
-    return value

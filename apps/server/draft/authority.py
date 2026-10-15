@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
+from apps.server.log_reads import find_record, read_all
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 from apps.server.draft.protocol import (
@@ -16,30 +18,8 @@ from apps.server.draft.protocol import (
     project_draft,
     replayed_command,
     request_log_id,
-    revision_log_id,
     text,
 )
-
-PAGE_SIZE = 128
-
-
-def _records(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:
-    result: list[ReplicatedRecord] = []
-    after: Position | None = None
-    while True:
-        page = store.read(log_id, after, PAGE_SIZE)
-        result.extend(page.records)
-        if not page.has_more:
-            return tuple(result)
-        if not page.records:
-            raise ValueError(f"{log_id} returned an empty continuation page")
-        after = page.records[-1].position
-
-
-def _at(store: ReplicaLogStore, position: Position) -> ReplicatedRecord | None:
-    if not store.has(position):
-        return None
-    return next((record for record in _records(store, position.log_id) if record.id == position.record_id), None)
 
 
 def _record(
@@ -53,6 +33,26 @@ def _record(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _Command:
+    request: Position
+    kind: str
+    principal_id: str
+    draft_id: str
+    replica_id: str
+    command_id: str
+    expected_head: Position
+    target_head: Position | None
+    expected_epoch: object
+
+
+@dataclass(frozen=True, slots=True)
+class _Decision:
+    kind: str
+    data: Mapping[str, object] | None = None
+    message: str | None = None
+
+
 class DraftAuthority:
     """Consumes one request Position and conditionally appends a Draft decision."""
 
@@ -63,7 +63,7 @@ class DraftAuthority:
         try:
             principal_id = text(principal_id, "principalId")
             draft_id = text(draft_id, "draftId")
-            revision = _at(self._store, initial_head)
+            revision = find_record(self._store, initial_head)
             if revision is None:
                 raise ValueError("initial Revision is not available")
             decoded = decode_revision(revision)
@@ -71,7 +71,7 @@ class DraftAuthority:
                 raise ValueError("initial Revision belongs to another Principal or Draft")
             if decoded["base"] is not None:
                 raise ValueError("initial Revision must have a null base")
-            existing = _records(self._store, decision_log_id(principal_id, draft_id))
+            existing = read_all(self._store, decision_log_id(principal_id, draft_id))
             if existing:
                 ref = project_draft(existing)
                 if ref.head != initial_head:
@@ -87,113 +87,250 @@ class DraftAuthority:
             return DraftResult("invalid", None, message=str(error))
 
     def handle(self, request_position: Position) -> DraftResult:
-        ref: DraftRef | None = None
-        try:
-            request = _at(self._store, request_position)
-            if request is None:
-                return DraftResult("missingDependency", None, message="request is not available")
-            command = request.data
-            if not isinstance(command, Mapping):
-                raise ValueError("command must be an object")
-            kind = command.get("type")
-            principal_id, request_draft_id, request_replica_id = draft_scope(
-                request.log_id, "request"
+        request = find_record(self._store, request_position)
+        if request is None:
+            return DraftResult(
+                "missingDependency",
+                None,
+                message="request is not available",
             )
-            draft_id = text(command.get("draftId"), "command.draftId")
-            replica_id = text(command.get("replicaId"), "command.replicaId")
-            command_id = text(command.get("commandId"), "command.commandId")
-            if draft_id != request_draft_id or replica_id != request_replica_id:
-                raise ValueError("command is stored in the wrong Request Log")
-            if request.log_id != request_log_id(principal_id, draft_id, replica_id):
-                raise ValueError("command is stored in the wrong Request Log")
-            decision_log = decision_log_id(principal_id, draft_id)
-            required = [position(command.get("expectedHead"), "command.expectedHead")]
-            if kind in ("draft.takeover", "draft.advance"):
-                required.append(position(command.get("targetHead"), "command.targetHead"))
-            elif kind != "draft.beginEditing":
-                raise ValueError("command type is invalid")
-            for required_position in required:
-                if required_position not in request.requires:
-                    raise ValueError("command does not declare all referenced Revisions in requires")
-            while True:
-                decisions = _records(self._store, decision_log)
-                if not decisions:
-                    if kind != "draft.beginEditing":
-                        raise ValueError("Draft is not initialized")
-                    initialized = self.initialize(principal_id, draft_id, required[0])
-                    if initialized.kind not in ("accepted", "current"):
-                        raise ValueError(initialized.message or "Draft could not be initialized")
-                    continue
-                ref = project_draft(decisions)
-                revision_match = replayed_command(decisions, command_id)
-                if revision_match is not None:
-                    prior_request, prior_decision, prior_ref, prior_kind = revision_match
-                    if prior_request != request_position:
-                        raise ValueError("commandId was reused by another request")
-                    return DraftResult(prior_kind, prior_ref, prior_decision)
-                expected_epoch = command.get("expectedEpoch")
-                if type(expected_epoch) is not int or expected_epoch < 0:
-                    rejected = self._reject(decisions, request_position, command_id, "invalid", ref)
-                    if rejected is None:
-                        continue
-                    return DraftResult("invalid", ref, rejected, "command.expectedEpoch must be non-negative")
-                if kind == "draft.beginEditing":
-                    if ref.writer is not None and ref.writer != replica_id:
-                        rejected = self._reject(decisions, request_position, command_id, "activeElsewhere", ref)
-                        if rejected is None:
-                            continue
-                        return DraftResult("activeElsewhere", ref, rejected)
-                    if required[0] != ref.head or expected_epoch != ref.epoch:
-                        rejected = self._reject(decisions, request_position, command_id, "changed", ref)
-                        if rejected is None:
-                            continue
-                        return DraftResult("changed", ref, rejected)
-                    if ref.writer == replica_id:
-                        return DraftResult("current", ref)
-                    data = {"type": "draft.editingStarted", "draftId": draft_id, "commandId": command_id,
-                            "request": request_position.to_value(), "writer": replica_id, "epoch": ref.epoch + 1}
-                else:
-                    target = _at(self._store, required[1])
-                    if target is None:
-                        return DraftResult("missingDependency", ref, message="referenced Revision is not available")
-                    revision = decode_revision(target)
-                    if revision["principalId"] != principal_id or revision["draftId"] != draft_id:
-                        raise ValueError("Revision belongs to another Principal or Draft")
-                    if required[0] != ref.head or expected_epoch != ref.epoch:
-                        rejected = self._reject(decisions, request_position, command_id, "changed", ref)
-                        if rejected is None:
-                            continue
-                        return DraftResult("changed", ref, rejected)
-                    if kind == "draft.takeover":
-                        if revision["replicaId"] != replica_id:
-                            rejected = self._reject(decisions, request_position, command_id, "invalid", ref)
-                            if rejected is None:
-                                continue
-                            return DraftResult("invalid", ref, rejected, "takeover Revision belongs to another Replica")
-                        data = {"type": "draft.takenOver", "draftId": draft_id, "commandId": command_id,
-                                "request": request_position.to_value(), "head": required[1].to_value(),
-                                "writer": replica_id, "epoch": ref.epoch + 1}
-                    else:
-                        if ref.writer != replica_id or revision["replicaId"] != replica_id:
-                            rejected = self._reject(decisions, request_position, command_id, "changed", ref)
-                            if rejected is None:
-                                continue
-                            return DraftResult("changed", ref, rejected)
-                        if revision["base"] != required[0]:
-                            rejected = self._reject(decisions, request_position, command_id, "invalid", ref)
-                            if rejected is None:
-                                continue
-                            return DraftResult("invalid", ref, rejected, "Revision was not edited from expectedHead")
-                        data = {"type": "draft.advanced", "draftId": draft_id, "commandId": command_id,
-                                "request": request_position.to_value(), "head": required[1].to_value(),
-                                "writer": replica_id, "epoch": expected_epoch}
-                record = _record(decision_log, decisions[-1].position, (), data)
-                appended = self._store.append(decision_log, decisions[-1].position, (record,))
-                if appended.kind != "accepted":
-                    continue
-                return DraftResult("accepted", project_draft(_records(self._store, decision_log)), record.position)
+        try:
+            command = self._decode(request)
+        except (TypeError, ValueError) as error:
+            return DraftResult("invalid", None, message=str(error))
+        return self._run(command)
+
+    def _decode(self, request: ReplicatedRecord) -> _Command:
+        data = request.data
+        if not isinstance(data, Mapping):
+            raise ValueError("command must be an object")
+        kind = data.get("type")
+        principal_id, request_draft_id, request_replica_id = draft_scope(
+            request.log_id, "request"
+        )
+        draft_id = text(data.get("draftId"), "command.draftId")
+        replica_id = text(data.get("replicaId"), "command.replicaId")
+        command_id = text(data.get("commandId"), "command.commandId")
+        if draft_id != request_draft_id or replica_id != request_replica_id:
+            raise ValueError("command is stored in the wrong Request Log")
+        if request.log_id != request_log_id(principal_id, draft_id, replica_id):
+            raise ValueError("command is stored in the wrong Request Log")
+        expected_head = position(data.get("expectedHead"), "command.expectedHead")
+        target_head = None
+        if kind in ("draft.takeover", "draft.advance"):
+            target_head = position(data.get("targetHead"), "command.targetHead")
+        elif kind != "draft.beginEditing":
+            raise ValueError("command type is invalid")
+        required = (expected_head,) if target_head is None else (expected_head, target_head)
+        if any(item not in request.requires for item in required):
+            raise ValueError(
+                "command does not declare all referenced Revisions in requires"
+            )
+        return _Command(
+            request.position,
+            kind,
+            principal_id,
+            draft_id,
+            replica_id,
+            command_id,
+            expected_head,
+            target_head,
+            data.get("expectedEpoch"),
+        )
+
+    def _run(self, command: _Command) -> DraftResult:
+        decision_log = decision_log_id(command.principal_id, command.draft_id)
+        while True:
+            decisions = read_all(self._store, decision_log)
+            if not decisions:
+                if command.kind != "draft.beginEditing":
+                    return DraftResult(
+                        "invalid", None, message="Draft is not initialized"
+                    )
+                initialized = self.initialize(
+                    command.principal_id,
+                    command.draft_id,
+                    command.expected_head,
+                )
+                if initialized.kind not in ("accepted", "current"):
+                    return DraftResult(
+                        "invalid",
+                        None,
+                        message=initialized.message or "Draft could not be initialized",
+                    )
+                continue
+            ref = project_draft(decisions)
+            replayed = replayed_command(decisions, command.command_id)
+            if replayed is not None:
+                prior_request, prior_decision, prior_ref, prior_kind = replayed
+                if prior_request != command.request:
+                    return DraftResult(
+                        "invalid",
+                        ref,
+                        message="commandId was reused by another request",
+                    )
+                return DraftResult(prior_kind, prior_ref, prior_decision)
+            outcome = self._decide(command, ref)
+            if isinstance(outcome, DraftResult):
+                return outcome
+            result = self._commit(decisions, command, ref, outcome)
+            if result is not None:
+                return result
+
+    def _decide(
+        self,
+        command: _Command,
+        ref: DraftRef,
+    ) -> _Decision | DraftResult:
+        expected_epoch = command.expected_epoch
+        if type(expected_epoch) is not int or expected_epoch < 0:
+            return _Decision(
+                "invalid",
+                message="command.expectedEpoch must be non-negative",
+            )
+        if command.kind == "draft.beginEditing":
+            return self._begin_editing(command, ref, expected_epoch)
+        assert command.target_head is not None
+        target = find_record(self._store, command.target_head)
+        if target is None:
+            return DraftResult(
+                "missingDependency",
+                ref,
+                message="referenced Revision is not available",
+            )
+        try:
+            revision = decode_revision(target)
         except (TypeError, ValueError) as error:
             return DraftResult("invalid", ref, message=str(error))
+        if (
+            revision["principalId"] != command.principal_id
+            or revision["draftId"] != command.draft_id
+        ):
+            return DraftResult(
+                "invalid",
+                ref,
+                message="Revision belongs to another Principal or Draft",
+            )
+        if command.kind == "draft.takeover":
+            return self._takeover(command, ref, expected_epoch, revision)
+        return self._advance(command, ref, expected_epoch, revision)
+
+    def _begin_editing(
+        self,
+        command: _Command,
+        ref: DraftRef,
+        expected_epoch: int,
+    ) -> _Decision:
+        if ref.writer is not None and ref.writer != command.replica_id:
+            return _Decision("activeElsewhere")
+        if command.expected_head != ref.head or expected_epoch != ref.epoch:
+            return _Decision("changed")
+        if ref.writer == command.replica_id:
+            return _Decision("current")
+        return _Decision("accepted", {
+            "type": "draft.editingStarted",
+            "draftId": command.draft_id,
+            "commandId": command.command_id,
+            "request": command.request.to_value(),
+            "writer": command.replica_id,
+            "epoch": ref.epoch + 1,
+        })
+
+    def _takeover(
+        self,
+        command: _Command,
+        ref: DraftRef,
+        expected_epoch: int,
+        revision: Mapping[str, object],
+    ) -> _Decision:
+        if command.expected_head != ref.head or expected_epoch != ref.epoch:
+            return _Decision("changed")
+        if revision["replicaId"] != command.replica_id:
+            return _Decision(
+                "invalid",
+                message="takeover Revision belongs to another Replica",
+            )
+        assert command.target_head is not None
+        return _Decision("accepted", {
+            "type": "draft.takenOver",
+            "draftId": command.draft_id,
+            "commandId": command.command_id,
+            "request": command.request.to_value(),
+            "head": command.target_head.to_value(),
+            "writer": command.replica_id,
+            "epoch": ref.epoch + 1,
+        })
+
+    def _advance(
+        self,
+        command: _Command,
+        ref: DraftRef,
+        expected_epoch: int,
+        revision: Mapping[str, object],
+    ) -> _Decision:
+        if command.expected_head != ref.head or expected_epoch != ref.epoch:
+            return _Decision("changed")
+        if ref.writer != command.replica_id or revision["replicaId"] != command.replica_id:
+            return _Decision("changed")
+        if revision["base"] != command.expected_head:
+            return _Decision(
+                "invalid",
+                message="Revision was not edited from expectedHead",
+            )
+        assert command.target_head is not None
+        return _Decision("accepted", {
+            "type": "draft.advanced",
+            "draftId": command.draft_id,
+            "commandId": command.command_id,
+            "request": command.request.to_value(),
+            "head": command.target_head.to_value(),
+            "writer": command.replica_id,
+            "epoch": expected_epoch,
+        })
+
+    def _commit(
+        self,
+        decisions: tuple[ReplicatedRecord, ...],
+        command: _Command,
+        ref: DraftRef,
+        outcome: _Decision,
+    ) -> DraftResult | None:
+        if outcome.kind == "current":
+            return DraftResult("current", ref)
+        if outcome.data is None:
+            rejected = self._reject(
+                decisions,
+                command.request,
+                command.command_id,
+                outcome.kind,
+                ref,
+            )
+            if rejected is None:
+                return None
+            return DraftResult(
+                outcome.kind,
+                ref,
+                rejected,
+                outcome.message,
+            )
+        record = _record(
+            decisions[-1].log_id,
+            decisions[-1].position,
+            (),
+            outcome.data,
+        )
+        appended = self._store.append(
+            record.log_id,
+            decisions[-1].position,
+            (record,),
+        )
+        if appended.kind != "accepted":
+            return None
+        return DraftResult(
+            "accepted",
+            project_draft(read_all(self._store, record.log_id)),
+            record.position,
+        )
 
     def _reject(
         self,

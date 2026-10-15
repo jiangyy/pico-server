@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
+from picopg._json import strict_json_loads
 from picopg.api import (
     AppendResult,
     InvalidReplicaData,
@@ -151,11 +152,7 @@ class FileReplicaLogStore(ReplicaLogStore):
 
     def _load(self) -> dict[str, tuple[ReplicatedRecord, ...]]:
         try:
-            value = json.loads(
-                self._path.read_text(encoding="utf-8"),
-                object_pairs_hook=_unique_object,
-                parse_constant=_reject_constant,
-            )
+            value = strict_json_loads(self._path.read_text(encoding="utf-8"))
             logs = _decode_document(value)
         except FileNotFoundError:
             return {}
@@ -295,16 +292,3 @@ def _validate_document_dependencies(
                         f"missing dependency "
                         f"{required.log_id}:{required.record_id}"
                     )
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise InvalidReplicaData(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value: str) -> None:
-    raise InvalidReplicaData(f"invalid JSON number {value}")

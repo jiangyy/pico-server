@@ -28,6 +28,9 @@ from apps.server.protocol import (  # noqa: E402
     ReplicaHttpServer,
 )
 from apps.server.authentication.model import PrincipalSession  # noqa: E402
+from apps.server.draft.protocol import DraftLogRule  # noqa: E402
+from apps.server.playground.catalog import PlaygroundLogRule  # noqa: E402
+from apps.server.submission.logs import SubmissionLogRule  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
@@ -41,6 +44,7 @@ def _start_server(
     server = ReplicaHttpServer(
         ("127.0.0.1", 0), store, token, bindings=bindings,
         principal_sessions=principal_sessions,
+        principal_log_rules=(PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule()),
     )
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)

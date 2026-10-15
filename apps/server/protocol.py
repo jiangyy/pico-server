@@ -8,9 +8,9 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from picopg._json import strict_json_loads
 from picopg.api import (
     AppendResult,
     InvalidReplicaData,
@@ -25,6 +25,7 @@ from apps.server.authentication.model import (
     AuthenticatedReplica,
     Authenticator,
     LogAuthorization,
+    PrincipalLogRule,
     PrincipalSession,
     PrincipalLogAuthorization,
     StaticAuthenticator,
@@ -76,6 +77,7 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         bindings: Iterable[LogBinding] | None = None,
         handler_class: type[BaseHTTPRequestHandler] | None = None,
         principal_sessions: Iterable[PrincipalSession] = (),
+        principal_log_rules: Iterable[PrincipalLogRule] = (),
         authenticator: Authenticator | None = None,
         log_authorization: LogAuthorization | None = None,
         operator_authenticator: Callable[[str], bool] | None = None,
@@ -91,7 +93,13 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         self.authenticator = authenticator or (StaticAuthenticator(sessions) if sessions else None)
         directory = StaticReplicaDirectory(sessions)
         self.log_authorization = log_authorization or (
-            PrincipalLogAuthorization(sessions, directory) if sessions else None
+            PrincipalLogAuthorization(
+                sessions,
+                directory,
+                rules=principal_log_rules,
+            )
+            if sessions
+            else None
         )
         self.operator_authenticator = operator_authenticator
         self._subscriber_lock = threading.Lock()
@@ -305,11 +313,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if len(data) != length:
             raise InvalidReplicaData("request body ended early")
         try:
-            return json.loads(
-                data.decode("utf-8", errors="strict"),
-                object_pairs_hook=_unique_object,
-                parse_constant=_reject_constant,
-            )
+            return strict_json_loads(data.decode("utf-8", errors="strict"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise InvalidReplicaData("request body is invalid JSON") from error
 
@@ -320,7 +324,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         identity = self._authenticated_replica()
         authorization = self.server.log_authorization
         if identity is not None and authorization is not None:
-            observes = lambda log_id: authorization.access(identity, log_id) is not None
+            def observes(log_id: str) -> bool:
+                return authorization.access(identity, log_id) is not None
             has_access = authorization.has_access(identity)
         else:
             readable_logs = frozenset(log_id for log_id, access in self.server.bindings.items() if access == "read")
@@ -482,16 +487,3 @@ def _route(path: str) -> tuple[str, str, str] | None:
         record_id = unquote(parts[7])
         return None if not record_id else (log_id, "has", record_id)
     return None
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise InvalidReplicaData(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value: str) -> NoReturn:
-    raise InvalidReplicaData(f"invalid JSON number {value}")

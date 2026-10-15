@@ -6,7 +6,6 @@ import argparse
 import http.cookiejar
 import json
 import os
-import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass

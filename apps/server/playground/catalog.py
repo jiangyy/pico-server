@@ -15,10 +15,27 @@ from apps.server.playground.package import (
     validate_version_id,
     version_id,
 )
+from apps.server.log_reads import PaginationStalled, read_all
 from picopg.api import AppendResult, Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 
 PLAYGROUND_RELEASES_LOG_ID = "playground-releases"
+
+
+class PlaygroundLogRule:
+    capability = "playgrounds"
+
+    def access(
+        self,
+        principal_id: str,
+        replica_id: str,
+        replicas: frozenset[str],
+        log_id: str,
+    ) -> str | None:
+        return "read" if log_id == PLAYGROUND_RELEASES_LOG_ID else None
+
+    def owner(self, log_id: str) -> tuple[str, str] | None:
+        return None
 
 
 class PublishServer(Protocol):
@@ -140,18 +157,17 @@ class PlaygroundPublisher:
 
     def _releases(self) -> tuple[PlaygroundRelease, ...]:
         releases: list[PlaygroundRelease] = []
-        after: Position | None = None
-        while True:
-            page = self._store.read(PLAYGROUND_RELEASES_LOG_ID, after, 128)
-            for record in page.records:
-                release = _release(record.data)
-                if release is not None:
-                    releases.append(release)
-            if not page.has_more:
-                return tuple(releases)
-            if not page.records:
-                raise PackageError("release Log returned an empty continuation page")
-            after = page.records[-1].position
+        try:
+            records = read_all(self._store, PLAYGROUND_RELEASES_LOG_ID)
+        except PaginationStalled as error:
+            raise PackageError(
+                "release Log returned an empty continuation page"
+            ) from error
+        for record in records:
+            release = _release(record.data)
+            if release is not None:
+                releases.append(release)
+        return tuple(releases)
 
 
 def _release(data: object) -> PlaygroundRelease | None:

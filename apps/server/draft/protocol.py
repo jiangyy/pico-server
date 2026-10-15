@@ -4,7 +4,58 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import quote, unquote
 
+from apps.server.validation import require_position as position
+from apps.server.validation import require_text as text
 from picopg.api import Position, ReplicatedRecord
+
+
+class DraftLogRule:
+    capability = "drafts"
+
+    def access(
+        self,
+        principal_id: str,
+        replica_id: str,
+        replicas: frozenset[str],
+        log_id: str,
+    ) -> str | None:
+        parts = log_id.split("/")
+        principal = quote(principal_id, safe="-_.!~*'()")
+        replica = quote(replica_id, safe="-_.!~*'()")
+        if (
+            len(parts) < 5
+            or parts[0] != "principal"
+            or parts[1] != principal
+            or parts[2] != "draft"
+            or not parts[3]
+        ):
+            return None
+        if len(parts) == 5 and parts[4] in ("decision", "comment"):
+            return "read"
+        if len(parts) != 6 or not parts[5]:
+            return None
+        if parts[4] == "request":
+            return "append" if parts[5] == replica else None
+        if parts[4] != "revision":
+            return None
+        if parts[5] == replica:
+            return "append"
+        known = {
+            quote(value, safe="-_.!~*'()")
+            for value in replicas
+        }
+        return "read" if parts[5] in known else None
+
+    def owner(self, log_id: str) -> tuple[str, str] | None:
+        parts = log_id.split("/")
+        if (
+            len(parts) == 6
+            and parts[0] == "principal"
+            and parts[2] == "draft"
+            and parts[4] in ("revision", "request")
+        ):
+            return parts[1], parts[5]
+        return None
 
 
 def revision_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
@@ -43,18 +94,6 @@ def draft_scope(log_id: str, kind: str) -> tuple[str, str, str | None]:
 
 def component(value: str, label: str) -> str:
     return quote(text(value, label), safe="-_.!~*'()")
-
-
-def text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be non-empty")
-    return value
-
-
-def position(value: object, label: str = "position") -> Position:
-    if not isinstance(value, Mapping) or set(value) != {"logId", "recordId"}:
-        raise ValueError(f"{label} must contain logId and recordId")
-    return Position(text(value["logId"], f"{label}.logId"), text(value["recordId"], f"{label}.recordId"))
 
 
 @dataclass(frozen=True, slots=True)

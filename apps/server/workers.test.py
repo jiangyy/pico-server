@@ -11,10 +11,24 @@ for entry in (ROOT, SRC):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from apps.server.authentication.model import PrincipalSession  # noqa: E402
-from apps.server.draft.protocol import decision_log_id, request_log_id, revision_log_id  # noqa: E402
+from apps.server.authentication.model import (  # noqa: E402
+    PrincipalLogAuthorization,
+    PrincipalSession,
+    StaticReplicaDirectory,
+)
+from apps.server.draft.protocol import (  # noqa: E402
+    DraftLogRule,
+    decision_log_id,
+    request_log_id,
+    revision_log_id,
+)
+from apps.server.draft.authority import DraftAuthority  # noqa: E402
 from apps.server.draft.worker import DraftRequestConsumer  # noqa: E402
-from apps.server.submission.logs import result_log as submission_result_log  # noqa: E402
+from apps.server.playground.catalog import PlaygroundLogRule  # noqa: E402
+from apps.server.submission.logs import (  # noqa: E402
+    SubmissionLogRule,
+    result_log as submission_result_log,
+)
 from apps.server.submission.worker import SubmissionRequestConsumer  # noqa: E402
 from picopg.api import Position, ReplicatedRecord, record_id_of  # noqa: E402
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
@@ -85,15 +99,102 @@ def draft_rejections_are_durable(root: Path) -> None:
     assert store.head(decision_log_id(principal_id, draft_id)) == head
 
 
+def draft_transitions_and_faults_are_visible(root: Path) -> None:
+    store = FileReplicaLogStore(root)
+    authority = DraftAuthority(store)
+    principal_id = "user"
+    draft_id = "lesson"
+    revision_a = revision_log_id(principal_id, draft_id, "A")
+    request_a = request_log_id(principal_id, draft_id, "A")
+    initial = append(store, record(revision_a, None, (), {
+        "type": "draft.revised", "draftId": draft_id, "replicaId": "A",
+        "source": "print(0)", "base": None,
+    }))
+    begin = append(store, record(request_a, None, (initial,), {
+        "type": "draft.beginEditing", "commandId": "begin-A",
+        "draftId": draft_id, "replicaId": "A",
+        "expectedHead": initial.to_value(), "expectedEpoch": 0,
+    }))
+    assert authority.handle(begin).kind == "accepted"
+
+    advanced = append(store, record(revision_a, initial, (), {
+        "type": "draft.revised", "draftId": draft_id, "replicaId": "A",
+        "source": "print(1)", "base": initial.to_value(),
+    }))
+    advance = append(store, record(request_a, begin, (initial, advanced), {
+        "type": "draft.advance", "commandId": "advance-A",
+        "draftId": draft_id, "replicaId": "A",
+        "expectedHead": initial.to_value(), "expectedEpoch": 1,
+        "targetHead": advanced.to_value(),
+    }))
+    advanced_result = authority.handle(advance)
+    assert advanced_result.kind == "accepted"
+    assert advanced_result.ref is not None and advanced_result.ref.head == advanced
+
+    revision_b = revision_log_id(principal_id, draft_id, "B")
+    request_b = request_log_id(principal_id, draft_id, "B")
+    takeover_head = append(store, record(revision_b, None, (advanced,), {
+        "type": "draft.revised", "draftId": draft_id, "replicaId": "B",
+        "source": "print(2)", "base": advanced.to_value(),
+    }))
+    takeover = append(store, record(request_b, None, (advanced, takeover_head), {
+        "type": "draft.takeover", "commandId": "takeover-B",
+        "draftId": draft_id, "replicaId": "B",
+        "expectedHead": advanced.to_value(), "expectedEpoch": 1,
+        "targetHead": takeover_head.to_value(),
+    }))
+    takeover_result = authority.handle(takeover)
+    assert takeover_result.kind == "accepted"
+    assert takeover_result.ref is not None
+    assert takeover_result.ref.writer == "B" and takeover_result.ref.epoch == 2
+    replayed = authority.handle(takeover)
+    assert replayed.kind == "current" and replayed.decision == takeover_result.decision
+
+    decision_log = decision_log_id(principal_id, draft_id)
+    decision_head = store.head(decision_log)
+    assert decision_head is not None
+    append(store, record(decision_log, decision_head, (), {
+        "type": "broken", "draftId": draft_id,
+        "commandId": "broken", "epoch": 2,
+    }))
+    next_request = append(store, record(request_b, takeover, (takeover_head,), {
+        "type": "draft.beginEditing", "commandId": "after-broken",
+        "draftId": draft_id, "replicaId": "B",
+        "expectedHead": takeover_head.to_value(), "expectedEpoch": 2,
+    }))
+    try:
+        authority.handle(next_request)
+    except ValueError as error:
+        assert str(error) == "decision type is invalid"
+    else:
+        raise AssertionError("invalid Decision Log was hidden as a command rejection")
+
+
 def replica_grants_are_fenced() -> None:
-    PrincipalSession.create("user", "A", "token", {
+    valid = PrincipalSession.create("user", "A", "token", {
         "principal/user/draft/lesson/revision/A": "append",
         "principal/user/draft/lesson/request/A": "append",
         "principal/user/submission/A/requests": "append",
         "principal/user/submission/A/results": "read",
     })
+    rules = (PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule())
+    PrincipalLogAuthorization(
+        (valid,),
+        StaticReplicaDirectory((valid,)),
+        rules=rules,
+    )
+    invalid = PrincipalSession.create(
+        "user",
+        "A",
+        "token",
+        {"principal/user/draft/lesson/request/B": "append"},
+    )
     try:
-        PrincipalSession.create("user", "A", "token", {"principal/user/draft/lesson/request/B": "append"})
+        PrincipalLogAuthorization(
+            (invalid,),
+            StaticReplicaDirectory((invalid,)),
+            rules=rules,
+        )
     except ValueError:
         pass
     else:
@@ -141,6 +242,8 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw:
         draft_rejections_are_durable(Path(raw))
+    with tempfile.TemporaryDirectory() as raw:
+        draft_transitions_and_faults_are_visible(Path(raw))
     with tempfile.TemporaryDirectory() as raw:
         branch_revisions_can_be_submitted(Path(raw))
     replica_grants_are_fenced()
