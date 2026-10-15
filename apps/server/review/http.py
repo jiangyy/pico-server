@@ -6,6 +6,7 @@ from urllib.parse import unquote
 from apps.server.protocol import _ResponseSent, logger
 from apps.server.review.comments import CommentError
 from apps.server.submission.read_model import SubmissionError, SubmissionNotFound
+from apps.server.review.submissions_view import detail_value, summary_value
 from picopg.api import InvalidReplicaData
 
 if TYPE_CHECKING:
@@ -43,13 +44,18 @@ def dispatch_review(handler: PicoRequestHandler, path: str) -> bool:
 def _submission(handler: PicoRequestHandler, action: str, request_record_id: str) -> None:
     if action == "list" and handler.command == "GET":
         handler._send_json(200, {
-            "submissions": [item.summary_value() for item in handler.server.submissions.list()]
+            "submissions": [summary_value(item) for item in handler.server.submissions.list()]
         }, (("Cache-Control", "no-store"),))
         return
     if action == "detail" and handler.command == "GET":
         handler._send_json(
             200,
-            handler.server.submissions.detail_value(request_record_id),
+            detail_value(
+                handler.server.store,
+                handler.server.submissions,
+                handler.server.comments,
+                request_record_id,
+            ),
             (("Cache-Control", "no-store"),),
         )
         return

@@ -119,7 +119,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
             self, FilePackageStore(package_root), package_adapter
         )
         self.comments = CommentPublisher(self)
-        self.submissions = SubmissionReader(self.store, self.comments)
+        self.submissions = SubmissionReader(self.store)
         worker_bindings = dict(self.bindings)
         request_logs = tuple(sorted(set(draft_request_logs(worker_bindings)) | {
             log_id for log_id in self.store.log_ids() if is_draft_request_log(log_id)

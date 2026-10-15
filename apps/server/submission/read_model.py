@@ -1,13 +1,11 @@
-"""Read models projected from immutable Submission and Revision facts."""
+"""Immutable Submission facts projected from Request and Result Logs."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from apps.server.draft.protocol import decode_revision
-from apps.server.log_reads import PaginationStalled, find_record, read_all
-from apps.server.review.comments import CommentPublisher
+from apps.server.log_reads import PaginationStalled, read_all
 from apps.server.submission.logs import is_request_log, request_scope, result_log
 from apps.server.validation import require_non_blank_position, require_non_blank_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord
@@ -33,27 +31,9 @@ class Submission:
     tag: str | None = None
     message: str | None = None
 
-    def summary_value(self) -> dict[str, object]:
-        value: dict[str, object] = {
-            "requestRecordId": self.request.record_id,
-            "principalId": self.principal_id,
-            "replicaId": self.replica_id,
-            "submissionId": self.submission_id,
-            "playgroundId": self.playground_id,
-            "revision": self.revision.to_value(),
-            "status": self.status,
-        }
-        if self.tag is not None:
-            value["tag"] = self.tag
-        if self.message is not None:
-            value["message"] = self.message
-        return value
-
-
 class SubmissionReader:
-    def __init__(self, store: ReplicaLogStore, comments: CommentPublisher) -> None:
+    def __init__(self, store: ReplicaLogStore) -> None:
         self._store = store
-        self._comments = comments
 
     def list(self) -> tuple[Submission, ...]:
         return self._list(
@@ -95,32 +75,6 @@ class SubmissionReader:
         if len(matches) != 1:
             raise SubmissionError("submission request Record ID is ambiguous")
         return matches[0]
-
-    def detail_value(self, request_record_id: str) -> dict[str, object]:
-        submission = self.get(request_record_id)
-        revision_record = find_record(self._store, submission.revision)
-        if revision_record is None:
-            raise SubmissionError("Submission Revision is missing")
-        decoded = decode_revision(revision_record)
-        if decoded["principalId"] != submission.principal_id:
-            raise SubmissionError("Submission Revision belongs to another Principal")
-        if decoded["draftId"] != submission.playground_id:
-            raise SubmissionError("Submission Revision belongs to another Draft")
-        value = submission.summary_value()
-        value["request"] = submission.request.to_value()
-        value["source"] = decoded["source"]
-        value["comments"] = [
-            {
-                "position": comment.position.to_value(),
-                "author": comment.author,
-                "text": comment.text,
-            }
-            for comment in self._comments.comments(
-                submission.principal_id, submission.playground_id
-            )
-            if comment.submission_request == submission.request
-        ]
-        return value
 
     def _results(self, request_log: str) -> dict[Position, ReplicatedRecord]:
         results: dict[Position, ReplicatedRecord] = {}
