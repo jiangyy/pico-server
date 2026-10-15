@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from urllib.parse import quote, unquote
 
+from apps.server.log_ids import decode_component, encode_component
 from apps.server.validation import require_position as position
 from apps.server.validation import require_text as text
 from picopg.api import Position, ReplicatedRecord
@@ -20,8 +20,8 @@ class DraftLogRule:
         log_id: str,
     ) -> str | None:
         parts = log_id.split("/")
-        principal = quote(principal_id, safe="-_.!~*'()")
-        replica = quote(replica_id, safe="-_.!~*'()")
+        principal = encode_component(principal_id, "principalId")
+        replica = encode_component(replica_id, "replicaId")
         if (
             len(parts) < 5
             or parts[0] != "principal"
@@ -40,10 +40,7 @@ class DraftLogRule:
             return None
         if parts[5] == replica:
             return "append"
-        known = {
-            quote(value, safe="-_.!~*'()")
-            for value in replicas
-        }
+        known = {encode_component(value, "replicaId") for value in replicas}
         return "read" if parts[5] in known else None
 
     def owner(self, log_id: str) -> tuple[str, str] | None:
@@ -60,20 +57,25 @@ class DraftLogRule:
 
 def revision_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
     return (
-        f"principal/{component(principal_id, 'principalId')}"
-        f"/draft/{component(draft_id, 'draftId')}/revision/{component(replica_id, 'replicaId')}"
+        f"principal/{encode_component(principal_id, 'principalId')}"
+        f"/draft/{encode_component(draft_id, 'draftId')}"
+        f"/revision/{encode_component(replica_id, 'replicaId')}"
     )
 
 
 def request_log_id(principal_id: str, draft_id: str, replica_id: str) -> str:
     return (
-        f"principal/{component(principal_id, 'principalId')}"
-        f"/draft/{component(draft_id, 'draftId')}/request/{component(replica_id, 'replicaId')}"
+        f"principal/{encode_component(principal_id, 'principalId')}"
+        f"/draft/{encode_component(draft_id, 'draftId')}"
+        f"/request/{encode_component(replica_id, 'replicaId')}"
     )
 
 
 def decision_log_id(principal_id: str, draft_id: str) -> str:
-    return f"principal/{component(principal_id, 'principalId')}/draft/{component(draft_id, 'draftId')}/decision"
+    return (
+        f"principal/{encode_component(principal_id, 'principalId')}"
+        f"/draft/{encode_component(draft_id, 'draftId')}/decision"
+    )
 
 
 def draft_scope(log_id: str, kind: str) -> tuple[str, str, str | None]:
@@ -89,11 +91,11 @@ def draft_scope(log_id: str, kind: str) -> tuple[str, str, str | None]:
         or (expected == 6 and not parts[5])
     ):
         raise ValueError(f"Log is not a Draft {kind} Log")
-    return unquote(parts[1]), unquote(parts[3]), None if expected == 5 else unquote(parts[5])
-
-
-def component(value: str, label: str) -> str:
-    return quote(text(value, label), safe="-_.!~*'()")
+    return (
+        decode_component(parts[1], "principalId"),
+        decode_component(parts[3], "draftId"),
+        None if expected == 5 else decode_component(parts[5], "replicaId"),
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from urllib.parse import quote, unquote
+
+from apps.server.log_ids import decode_component, encode_component
 
 
 class SubmissionLogRule:
@@ -18,9 +19,9 @@ class SubmissionLogRule:
         if (
             len(parts) != 5
             or parts[0] != "principal"
-            or parts[1] != quote(principal_id, safe="-_.!~*'()")
+            or parts[1] != encode_component(principal_id, "principalId")
             or parts[2] != "submission"
-            or parts[3] != quote(replica_id, safe="-_.!~*'()")
+            or parts[3] != encode_component(replica_id, "replicaId")
         ):
             return None
         if parts[4] == "requests":
@@ -50,8 +51,10 @@ def request_logs(bindings: Mapping[str, str]) -> tuple[str, ...]:
 
 def result_log(request_log: str) -> str:
     principal, replica = request_scope(request_log)
-    safe = "-_.!~*'()"
-    return f"principal/{quote(principal, safe=safe)}/submission/{quote(replica, safe=safe)}/results"
+    return (
+        f"principal/{encode_component(principal, 'principalId')}"
+        f"/submission/{encode_component(replica, 'replicaId')}/results"
+    )
 
 
 def is_request_log(log_id: str) -> bool:
@@ -70,4 +73,7 @@ def request_scope(log_id: str) -> tuple[str, str]:
     if not is_request_log(log_id):
         raise ValueError("request_log is not a Submission Request Log")
     parts = log_id.split("/")
-    return unquote(parts[1]), unquote(parts[3])
+    return (
+        decode_component(parts[1], "principalId"),
+        decode_component(parts[3], "replicaId"),
+    )

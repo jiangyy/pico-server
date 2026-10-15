@@ -10,8 +10,8 @@ import re
 import threading
 from dataclasses import dataclass
 from typing import Mapping, Protocol, Union
-from urllib.parse import quote
 
+from apps.server.log_ids import encode_component
 from apps.server.log_reads import PaginationStalled, read_all
 from apps.server.validation import require_non_blank_position, require_non_blank_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
@@ -27,8 +27,10 @@ class CommentError(ValueError):
 
 
 def comment_log_id(principal_id: str, draft_id: str) -> str:
-    safe = "-_.!~*()"
-    return f"principal/{quote(principal_id, safe=safe)}/draft/{quote(draft_id, safe=safe)}/comment"
+    return (
+        f"principal/{encode_component(principal_id, 'principalId')}"
+        f"/draft/{encode_component(draft_id, 'draftId')}/comment"
+    )
 
 
 @dataclass(frozen=True, slots=True)

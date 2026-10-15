@@ -7,8 +7,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping, Protocol
-from urllib.parse import quote
 
+from apps.server.log_ids import encode_component
 from apps.server.validation import require_text
 
 
@@ -276,5 +276,7 @@ def permits_log(access: str | None, action: str, method: str) -> bool:
 
 
 def _encoded_identity(identity: AuthenticatedReplica) -> tuple[str, str]:
-    safe = "-_.!~*'()"
-    return quote(identity.principal_id, safe=safe), quote(identity.replica_id, safe=safe)
+    return (
+        encode_component(identity.principal_id, "principalId"),
+        encode_component(identity.replica_id, "replicaId"),
+    )
