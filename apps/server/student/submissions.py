@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from apps.server.review.comments import CommentPublisher
-from apps.server.review.submissions import SubmissionReader
+from apps.server.submission.read_model import SubmissionReader
 
 
 def history_value(

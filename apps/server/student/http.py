@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 from apps.server.protocol import _ResponseSent, logger
 from apps.server.review.comments import CommentError
-from apps.server.review.submissions import SubmissionError
+from apps.server.submission.read_model import SubmissionError
 from apps.server.student.submissions import history_value
 
 if TYPE_CHECKING:

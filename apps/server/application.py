@@ -29,7 +29,7 @@ from apps.server.protocol import (
 )
 from apps.server.authentication.registry import FileSessionRegistry
 from apps.server.review.http import dispatch_review
-from apps.server.review.submissions import SubmissionReader
+from apps.server.submission.read_model import SubmissionReader
 from apps.server.student.http import dispatch_student
 from apps.server.draft.protocol import DraftLogRule
 from apps.server.draft.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log

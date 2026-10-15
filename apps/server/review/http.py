@@ -5,7 +5,7 @@ from urllib.parse import unquote
 
 from apps.server.protocol import _ResponseSent, logger
 from apps.server.review.comments import CommentError
-from apps.server.review.submissions import SubmissionError, SubmissionNotFound
+from apps.server.submission.read_model import SubmissionError, SubmissionNotFound
 from picopg.api import InvalidReplicaData
 
 if TYPE_CHECKING:

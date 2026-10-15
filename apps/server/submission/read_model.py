@@ -1,4 +1,4 @@
-"""Operator projection over immutable Submission and Revision facts."""
+"""Read models projected from immutable Submission and Revision facts."""
 
 from __future__ import annotations
 
