@@ -56,11 +56,30 @@ class SubmissionReader:
         self._comments = comments
 
     def list(self) -> tuple[Submission, ...]:
+        return self._list(
+            tuple(
+                log_id
+                for log_id in sorted(self._store.log_ids())
+                if is_request_log(log_id)
+            )
+        )
+
+    def list_for(self, principal_id: str) -> tuple[Submission, ...]:
+        try:
+            request_logs = tuple(
+                log_id
+                for log_id in sorted(self._store.log_ids())
+                if is_request_log(log_id)
+                and request_scope(log_id)[0] == principal_id
+            )
+        except ValueError as error:
+            raise SubmissionError(str(error)) from error
+        return self._list(request_logs)
+
+    def _list(self, request_logs: tuple[str, ...]) -> tuple[Submission, ...]:
         submissions: list[Submission] = []
         record_ids: set[str] = set()
-        for log_id in sorted(self._store.log_ids()):
-            if not is_request_log(log_id):
-                continue
+        for log_id in request_logs:
             results = self._results(log_id)
             for request in self._records(log_id):
                 if request.id in record_ids:

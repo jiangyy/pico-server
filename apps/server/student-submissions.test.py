@@ -76,6 +76,12 @@ def _get(base_url: str, token: str) -> tuple[int, object]:
         return error.code, json.loads(error.read())
 
 
+def _invalid_submission(store, principal_id: str, replica_id: str):
+    request_log = f"principal/{principal_id}/submission/{replica_id}/requests"
+    request = _record(request_log, None, (), {"type": "not-a-submission"})
+    assert store.append(request_log, None, (request,)).kind == "accepted"
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -83,9 +89,14 @@ def main() -> None:
         first, first_revision = _submission(store, "student", "A", "submission-a")
         _submission(store, "student", "B", "submission-b")
         _submission(store, "other", "C", "submission-c")
+        _invalid_submission(store, "other", "D")
+        _invalid_submission(store, "broken", "E")
         sessions = (
             PrincipalSession.create(
                 "student", "A", "student-token", {}, ["submissions"]
+            ),
+            PrincipalSession.create(
+                "broken", "E", "broken-token", {}, ["submissions"]
             ),
         )
         server = PicoPGHttpServer(
@@ -124,6 +135,9 @@ def main() -> None:
             assert all("replicaId" not in item for item in submissions)
             assert all(item["id"] for item in submissions)
             assert _get(base_url, "wrong")[0] == 401
+            status, invalid = _get(base_url, "broken-token")
+            assert status == 400
+            assert invalid["error"]["code"] == "submission.invalid"  # type: ignore[index]
         finally:
             server.shutdown()
             server.server_close()

@@ -13,15 +13,11 @@ if TYPE_CHECKING:
 
 
 def dispatch_review(handler: PicoRequestHandler, path: str) -> bool:
-    student = path == "/api/v1/submissions"
     submission = _submission_route(path)
     comment = _comment_route(path)
-    if not student and submission is None and comment is None:
+    if submission is None and comment is None:
         return False
     try:
-        if student:
-            _student_submissions(handler)
-            return True
         if not handler._admin_authorized():
             handler._error(401, "auth.required", "valid operator token required")
             return True
@@ -43,49 +39,6 @@ def dispatch_review(handler: PicoRequestHandler, path: str) -> bool:
         logger.exception("review request failed")
         handler._error(500, "server.failure", "server failure")
     return True
-
-
-def _student_submissions(handler: PicoRequestHandler) -> None:
-    if handler.command != "GET":
-        handler._error(405, "method.not_allowed", "method not allowed")
-        return
-    identity = handler._authenticated_replica()
-    if identity is None:
-        handler._error(401, "auth.required", "valid Session required")
-        return
-    comments_by_draft = {}
-    values = []
-    for submission in handler.server.submissions.list():
-        if submission.principal_id != identity.principal_id:
-            continue
-        comments = comments_by_draft.setdefault(
-            submission.playground_id,
-            handler.server.comments.comments(
-                submission.principal_id, submission.playground_id
-            ),
-        )
-        value = {
-            "id": submission.request.record_id,
-            "submissionId": submission.submission_id,
-            "playgroundId": submission.playground_id,
-            "status": submission.status,
-            "comments": [
-                {"author": comment.author, "text": comment.text}
-                for comment in comments
-                if comment.submission_request == submission.request
-            ],
-        }
-        if submission.tag is not None:
-            value["tag"] = submission.tag
-        if submission.message is not None:
-            value["message"] = submission.message
-        values.append(value)
-    handler._send_json(
-        200,
-        {"submissions": values},
-        (("Cache-Control", "no-store"),),
-    )
-
 
 def _submission(handler: PicoRequestHandler, action: str, request_record_id: str) -> None:
     if action == "list" and handler.command == "GET":

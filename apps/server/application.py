@@ -30,6 +30,7 @@ from apps.server.protocol import (
 from apps.server.authentication.registry import FileSessionRegistry
 from apps.server.review.http import dispatch_review
 from apps.server.review.submissions import SubmissionReader
+from apps.server.student.http import dispatch_student
 from apps.server.draft.protocol import DraftLogRule
 from apps.server.draft.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log
 from apps.server.submission.logs import (
@@ -167,6 +168,8 @@ class PicoRequestHandler(ReplicaRequestHandler):
     def _dispatch(self) -> None:
         path = urlsplit(self.path).path
         if dispatch_session(self, path):
+            return
+        if dispatch_student(self, path):
             return
         if dispatch_review(self, path):
             return
