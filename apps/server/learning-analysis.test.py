@@ -26,6 +26,10 @@ from apps.server.learning_analysis.pipeline import (  # noqa: E402
     SYSTEM_PROMPT,
     LearningFeedbackAnalyzer,
 )
+from apps.server.learning_analysis.openai_provider import (  # noqa: E402
+    OpenAIStructuredLearningProvider,
+)
+from apps.server.main import load_learning_analyzer  # noqa: E402
 from apps.server.learning_analysis.protocol import (  # noqa: E402
     decode_assessment,
     decode_evidence_data,
@@ -625,6 +629,76 @@ def feedback_pipeline_exposes_only_the_versioned_prompt_contract(root: Path) -> 
     assert result.data["output"]["data"]["summary"] == "你已经能够正确使用 range 完成遍历。"
 
 
+def production_provider_uses_structured_output_without_exposing_configuration() -> None:
+    requests: list[tuple[object, float]] = []
+
+    def transport(request, timeout):
+        requests.append((request, timeout))
+        return json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                assessment("真实 provider 响应")["data"],
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+    provider = OpenAIStructuredLearningProvider(
+        api_key="test-secret",
+        model="test-model",
+        base_url="https://provider.example/v1",
+        transport=transport,
+    )
+    output = provider.generate(
+        analysis="learning.feedback@1",
+        system="system prompt",
+        input={"submission": {"source": "print('hello')"}},
+        output_schema=OUTPUT_SCHEMA,
+    )
+    assert output["summary"] == "真实 provider 响应"
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert request.full_url == "https://provider.example/v1/chat/completions"
+    assert request.get_header("Authorization") == "Bearer test-secret"
+    assert timeout == 120.0
+    body = json.loads(request.data)
+    assert body["model"] == "test-model"
+    assert body["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {
+            "role": "user",
+            "content": "{\"submission\":{\"source\":\"print('hello')\"}}",
+        },
+    ]
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "learning_feedback_1",
+            "strict": True,
+            "schema": plain(OUTPUT_SCHEMA),
+        },
+    }
+
+    assert load_learning_analyzer(
+        None, api_key=None, api_base="https://api.openai.com/v1"
+    ) is None
+    try:
+        load_learning_analyzer(
+            "test-model", api_key=None, api_base="https://api.openai.com/v1"
+        )
+    except ValueError as error:
+        assert str(error) == "OPENAI_API_KEY is required when learning analysis is enabled"
+    else:
+        raise AssertionError("learning analysis started without an API key")
+
+
 def main() -> int:
     shared_contract_fixtures_are_strict()
     with tempfile.TemporaryDirectory() as raw:
@@ -649,6 +723,7 @@ def main() -> int:
         blocked_analysis_does_not_block_draft_worker(Path(raw))
     with tempfile.TemporaryDirectory() as raw:
         feedback_pipeline_exposes_only_the_versioned_prompt_contract(Path(raw))
+    production_provider_uses_structured_output_without_exposing_configuration()
     print("learning analysis Jobs, Results, retries and prompt contract passed")
     return 0
 
