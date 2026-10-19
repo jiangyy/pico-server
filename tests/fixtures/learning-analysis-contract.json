@@ -1,0 +1,177 @@
+{
+  "evidence": [
+    {
+      "name": "submission evidence",
+      "valid": true,
+      "value": {
+        "version": 1,
+        "type": "learning.evidence.recorded",
+        "source": { "session": "session-a", "sequence": 1 },
+        "subject": { "playgroundId": "loops", "versionId": "sha256:course" },
+        "payload": {
+          "schema": "learning.submission.requested",
+          "version": 1,
+          "data": { "request": { "logId": "submission/A", "recordId": "request-1" } }
+        }
+      }
+    },
+    {
+      "name": "generic future payload",
+      "valid": true,
+      "value": {
+        "version": 1,
+        "type": "learning.evidence.recorded",
+        "source": { "session": "session-b", "sequence": 2 },
+        "subject": { "playgroundId": "loops", "versionId": "sha256:course", "exerciseKey": "for" },
+        "payload": { "schema": "learning.future", "version": 2, "data": { "score": 0.5 } }
+      }
+    },
+    {
+      "name": "unknown envelope field",
+      "valid": false,
+      "value": {
+        "version": 1,
+        "type": "learning.evidence.recorded",
+        "source": { "session": "session-a", "sequence": 1 },
+        "subject": { "playgroundId": "loops", "versionId": "sha256:course" },
+        "payload": { "schema": "learning.future", "version": 1, "data": {} },
+        "extra": true
+      }
+    },
+    {
+      "name": "unknown payload field",
+      "valid": false,
+      "value": {
+        "version": 1,
+        "type": "learning.evidence.recorded",
+        "source": { "session": "session-a", "sequence": 1 },
+        "subject": { "playgroundId": "loops", "versionId": "sha256:course" },
+        "payload": { "schema": "learning.future", "version": 1, "data": {}, "extra": true }
+      }
+    },
+    {
+      "name": "zero sequence",
+      "valid": false,
+      "value": {
+        "version": 1,
+        "type": "learning.evidence.recorded",
+        "source": { "session": "session-a", "sequence": 0 },
+        "subject": { "playgroundId": "loops", "versionId": "sha256:course" },
+        "payload": { "schema": "learning.future", "version": 1, "data": {} }
+      }
+    },
+    {
+      "name": "unsafe sequence integer",
+      "valid": false,
+      "value": {
+        "version": 1,
+        "type": "learning.evidence.recorded",
+        "source": { "session": "session-a", "sequence": 9007199254740992 },
+        "subject": { "playgroundId": "loops", "versionId": "sha256:course" },
+        "payload": { "schema": "learning.future", "version": 1, "data": {} }
+      }
+    }
+  ],
+  "assessments": [
+    {
+      "name": "complete assessment",
+      "valid": true,
+      "value": {
+        "schema": "learning.assessment",
+        "version": 1,
+        "data": {
+          "summary": "已经能稳定使用循环。",
+          "findings": [
+            {
+              "kind": "strength",
+              "topic": { "key": "loops", "label": "循环" },
+              "claim": "能够选择正确的循环结构。",
+              "confidence": "high"
+            }
+          ],
+          "recommendations": [
+            {
+              "action": "challenge",
+              "topic": { "key": "loops", "label": "循环" },
+              "priority": "soon",
+              "rationale": "可以练习嵌套循环。"
+            }
+          ],
+          "limitations": ["只观察到一次运行。"]
+        }
+      }
+    },
+    {
+      "name": "unknown assessment field",
+      "valid": false,
+      "value": {
+        "schema": "learning.assessment",
+        "version": 1,
+        "data": {
+          "summary": "摘要",
+          "findings": [],
+          "recommendations": [],
+          "limitations": [],
+          "score": 1
+        }
+      }
+    },
+    {
+      "name": "unknown finding field",
+      "valid": false,
+      "value": {
+        "schema": "learning.assessment",
+        "version": 1,
+        "data": {
+          "summary": "摘要",
+          "findings": [
+            {
+              "kind": "strength",
+              "topic": { "key": "loops", "label": "循环" },
+              "claim": "结论",
+              "confidence": "high",
+              "score": 1
+            }
+          ],
+          "recommendations": [],
+          "limitations": []
+        }
+      }
+    },
+    {
+      "name": "invalid confidence",
+      "valid": false,
+      "value": {
+        "schema": "learning.assessment",
+        "version": 1,
+        "data": {
+          "summary": "摘要",
+          "findings": [
+            {
+              "kind": "strength",
+              "topic": { "key": "loops", "label": "循环" },
+              "claim": "结论",
+              "confidence": "certain"
+            }
+          ],
+          "recommendations": [],
+          "limitations": []
+        }
+      }
+    },
+    {
+      "name": "empty summary",
+      "valid": false,
+      "value": {
+        "schema": "learning.assessment",
+        "version": 1,
+        "data": {
+          "summary": "",
+          "findings": [],
+          "recommendations": [],
+          "limitations": []
+        }
+      }
+    }
+  ]
+}

@@ -5,7 +5,7 @@ from types import MappingProxyType
 from typing import Protocol, cast
 
 from apps.server.draft.protocol import decode_revision
-from apps.server.learning_analysis.worker import LearningAnalysisInvalidInput
+from apps.server.learning_analysis.protocol import LearningAnalysisInvalidInput
 from apps.server.validation import require_position
 from picopg.api import ReplicatedRecord
 

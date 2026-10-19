@@ -26,6 +26,10 @@ from apps.server.learning_analysis.pipeline import (  # noqa: E402
     SYSTEM_PROMPT,
     LearningFeedbackAnalyzer,
 )
+from apps.server.learning_analysis.protocol import (  # noqa: E402
+    decode_assessment,
+    decode_evidence_data,
+)
 from apps.server.application import PicoPGHttpServer  # noqa: E402
 from apps.server.draft.protocol import (  # noqa: E402
     decision_log_id,
@@ -80,6 +84,35 @@ def plain(value):
     if isinstance(value, tuple):
         return [plain(item) for item in value]
     return value
+
+
+def shared_contract_fixtures_are_strict() -> None:
+    fixture = json.loads(
+        (ROOT / "tests/fixtures/learning-analysis-contract.json").read_text(encoding="utf-8")
+    )
+    for collection, decoder in (
+        (fixture["evidence"], decode_evidence_data),
+        (fixture["assessments"], decode_assessment),
+    ):
+        for case in collection:
+            try:
+                decoder(case["value"])
+            except LearningAnalysisInvalidInput:
+                accepted = False
+            else:
+                accepted = True
+            assert accepted is case["valid"], case["name"]
+
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    evidence = fixture["evidence"][1]["value"]
+    evidence["payload"]["data"] = cyclic
+    try:
+        decode_evidence_data(evidence)
+    except LearningAnalysisInvalidInput as error:
+        assert "acyclic JSON" in str(error)
+    else:
+        raise AssertionError("cyclic payload was accepted")
 
 
 def submission_evidence(
@@ -593,6 +626,7 @@ def feedback_pipeline_exposes_only_the_versioned_prompt_contract(root: Path) -> 
 
 
 def main() -> int:
+    shared_contract_fixtures_are_strict()
     with tempfile.TemporaryDirectory() as raw:
         durable_job_and_result_are_idempotent(Path(raw))
     with tempfile.TemporaryDirectory() as raw:

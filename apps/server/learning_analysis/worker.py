@@ -15,6 +15,11 @@ from apps.server.learning_analysis.logs import (
     job_log_id,
     result_log_id,
 )
+from apps.server.learning_analysis.protocol import (
+    LearningAnalysisInvalidInput,
+    decode_assessment,
+    decode_evidence_data,
+)
 from apps.server.log_reads import find_record, read_all
 from apps.server.submission.logs import request_scope
 from apps.server.validation import require_position, require_text
@@ -26,10 +31,6 @@ POLICY = {"key": "immediate-evidence", "revision": "1"}
 MAX_EVIDENCE_BYTES = 64 * 1024
 RETRY_BASE_SECONDS = 1.0
 RETRY_MAX_SECONDS = 300.0
-
-
-class LearningAnalysisInvalidInput(ValueError):
-    pass
 
 
 class LearningAnalyzer(Protocol):
@@ -205,7 +206,7 @@ class LearningAnalysisConsumer:
             if len(records) != len(job_record.requires):
                 raise RuntimeError("Job input is missing")
             try:
-                output = _decode_assessment(self._analyzer.analyze(job=job, records=records))
+                output = decode_assessment(self._analyzer.analyze(job=job, records=records))
                 data: Mapping[str, object] = {
                     "version": 1,
                     "type": "learning.analysis.completed",
@@ -282,32 +283,10 @@ def _decode_evidence(record: ReplicatedRecord, principal_id: str) -> Mapping[str
     ).encode("utf-8")
     if len(encoded) > MAX_EVIDENCE_BYTES:
         raise LearningAnalysisInvalidInput(f"Evidence exceeds {MAX_EVIDENCE_BYTES} bytes")
-    if not isinstance(data, Mapping) or set(data) != {
-        "version",
-        "type",
-        "source",
-        "subject",
-        "payload",
-    }:
-        raise LearningAnalysisInvalidInput("Evidence shape is invalid")
-    if data["version"] != 1 or data["type"] != "learning.evidence.recorded":
-        raise LearningAnalysisInvalidInput("Evidence version or type is invalid")
-    source = data["source"]
-    if not isinstance(source, Mapping) or set(source) != {"session", "sequence"}:
-        raise LearningAnalysisInvalidInput("Evidence source is invalid")
-    require_text(source.get("session"), "source.session", error_type=LearningAnalysisInvalidInput)
-    sequence = source.get("sequence")
-    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
-        raise LearningAnalysisInvalidInput("source.sequence must be a positive integer")
-    subject = _decode_subject(data["subject"])
-    payload = data["payload"]
-    if not isinstance(payload, Mapping) or set(payload) != {"schema", "version", "data"}:
-        raise LearningAnalysisInvalidInput("Evidence payload is invalid")
-    require_text(payload.get("schema"), "payload.schema", error_type=LearningAnalysisInvalidInput)
-    version = payload.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-        raise LearningAnalysisInvalidInput("payload.version must be a positive integer")
-    if payload["schema"] != "learning.submission.requested" or version != 1:
+    decoded = decode_evidence_data(data)
+    payload = decoded["payload"]
+    assert isinstance(payload, Mapping)
+    if payload["schema"] != "learning.submission.requested" or payload["version"] != 1:
         raise LearningAnalysisInvalidInput("Evidence payload schema is unsupported")
     detail = payload["data"]
     if not isinstance(detail, Mapping) or set(detail) != {"request"}:
@@ -323,38 +302,7 @@ def _decode_evidence(record: ReplicatedRecord, principal_id: str) -> Mapping[str
         raise LearningAnalysisInvalidInput("Submission request Log is invalid") from error
     if request_principal != principal_id:
         raise LearningAnalysisInvalidInput("Submission belongs to another Principal")
-    return {
-        "version": 1,
-        "type": "learning.evidence.recorded",
-        "source": {"session": source["session"], "sequence": sequence},
-        "subject": subject,
-        "payload": payload,
-    }
-
-
-def _decode_subject(value: object) -> Mapping[str, str]:
-    if not isinstance(value, Mapping):
-        raise LearningAnalysisInvalidInput("subject is invalid")
-    expected = {"playgroundId", "versionId"} | (
-        {"exerciseKey"} if "exerciseKey" in value else set()
-    )
-    if set(value) != expected:
-        raise LearningAnalysisInvalidInput("subject shape is invalid")
-    subject = {
-        "playgroundId": require_text(
-            value.get("playgroundId"),
-            "subject.playgroundId",
-            error_type=LearningAnalysisInvalidInput,
-        ),
-        "versionId": require_text(
-            value.get("versionId"), "subject.versionId", error_type=LearningAnalysisInvalidInput
-        ),
-    }
-    if "exerciseKey" in value:
-        subject["exerciseKey"] = require_text(
-            value["exerciseKey"], "subject.exerciseKey", error_type=LearningAnalysisInvalidInput
-        )
-    return subject
+    return decoded
 
 
 def _source_key(value: Mapping[str, object]) -> tuple[str, int]:
@@ -568,78 +516,6 @@ def _latest_attempts(records: tuple[ReplicatedRecord, ...]) -> dict[str, tuple[i
             continue
         attempts[data["jobKey"]] = (data["attempt"], float(data["retryAt"]))
     return attempts
-
-
-def _decode_assessment(value: object) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or set(value) != {"schema", "version", "data"}:
-        raise LearningAnalysisInvalidInput("Analysis output envelope is invalid")
-    if value.get("schema") != "learning.assessment" or value.get("version") != 1:
-        raise LearningAnalysisInvalidInput("Analysis output schema or version is invalid")
-    data = value.get("data")
-    if not isinstance(data, Mapping) or set(data) != {
-        "summary",
-        "findings",
-        "recommendations",
-        "limitations",
-    }:
-        raise LearningAnalysisInvalidInput("Analysis assessment shape is invalid")
-    require_text(data.get("summary"), "assessment.summary", error_type=LearningAnalysisInvalidInput)
-    for field in ("findings", "recommendations", "limitations"):
-        if not isinstance(data.get(field), (list, tuple)):
-            raise LearningAnalysisInvalidInput(f"assessment.{field} must be an array")
-    for index, finding in enumerate(data["findings"]):
-        label = f"assessment.findings[{index}]"
-        if not isinstance(finding, Mapping) or set(finding) != {
-            "kind",
-            "topic",
-            "claim",
-            "confidence",
-        }:
-            raise LearningAnalysisInvalidInput(f"{label} shape is invalid")
-        if finding["kind"] not in {
-            "strength",
-            "difficulty",
-            "misconception",
-            "strategy",
-            "progress",
-            "uncertain",
-        }:
-            raise LearningAnalysisInvalidInput(f"{label}.kind is invalid")
-        _decode_topic(finding["topic"], f"{label}.topic")
-        require_text(finding["claim"], f"{label}.claim", error_type=LearningAnalysisInvalidInput)
-        if finding["confidence"] not in {"low", "medium", "high"}:
-            raise LearningAnalysisInvalidInput(f"{label}.confidence is invalid")
-    for index, recommendation in enumerate(data["recommendations"]):
-        label = f"assessment.recommendations[{index}]"
-        if not isinstance(recommendation, Mapping) or set(recommendation) != {
-            "action",
-            "topic",
-            "priority",
-            "rationale",
-        }:
-            raise LearningAnalysisInvalidInput(f"{label} shape is invalid")
-        if recommendation["action"] not in {"explain", "practice", "review", "challenge"}:
-            raise LearningAnalysisInvalidInput(f"{label}.action is invalid")
-        _decode_topic(recommendation["topic"], f"{label}.topic")
-        if recommendation["priority"] not in {"now", "soon", "later"}:
-            raise LearningAnalysisInvalidInput(f"{label}.priority is invalid")
-        require_text(
-            recommendation["rationale"],
-            f"{label}.rationale",
-            error_type=LearningAnalysisInvalidInput,
-        )
-    for index, limitation in enumerate(data["limitations"]):
-        require_text(
-            limitation, f"assessment.limitations[{index}]", error_type=LearningAnalysisInvalidInput
-        )
-    return value
-
-
-def _decode_topic(value: object, label: str) -> None:
-    if not isinstance(value, Mapping) or set(value) != {"key", "label"}:
-        raise LearningAnalysisInvalidInput(f"{label} shape is invalid")
-    require_text(value["key"], f"{label}.key", error_type=LearningAnalysisInvalidInput)
-    require_text(value["label"], f"{label}.label", error_type=LearningAnalysisInvalidInput)
 
 
 def _canonical(value: object) -> bytes:
