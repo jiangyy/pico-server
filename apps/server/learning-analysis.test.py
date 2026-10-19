@@ -93,29 +93,48 @@ class Analyzer:
         self.summary = summary
         self.calls = 0
 
-    def analyze(self, *, job, evidence):
+    def analyze(self, *, job, records):
         self.calls += 1
-        assert job["inputs"][0]["record"] == evidence[0].position.to_value()
+        assert job["inputs"][0]["record"] == records[0].position.to_value()
         return assessment(self.summary)
 
 
-def durable_job_and_result_are_idempotent(root: Path) -> None:
-    store = FileReplicaLogStore(root)
-    request_log = "principal/user/submission/A/requests"
+def submission_request(store: FileReplicaLogStore) -> tuple[Position, Position]:
+    revision = append(
+        store,
+        record(
+            "principal/user/draft/loops/revision/A",
+            None,
+            (),
+            {
+                "type": "draft.revised",
+                "draftId": "loops",
+                "replicaId": "A",
+                "source": "for item in range(3):\n    print(item)\n",
+                "base": None,
+            },
+        ),
+    )
     request = append(
         store,
         record(
-            request_log,
+            "principal/user/submission/A/requests",
             None,
-            (),
+            (revision,),
             {
                 "type": "submission.requested",
                 "submissionId": "one",
                 "playgroundId": "loops",
-                "revision": {"logId": "revision", "recordId": "one"},
+                "revision": revision.to_value(),
             },
         ),
     )
+    return request, revision
+
+
+def durable_job_and_result_are_idempotent(root: Path) -> None:
+    store = FileReplicaLogStore(root)
+    request, revision = submission_request(store)
     evidence_log = evidence_log_id("user", "A")
     evidence = append(
         store, submission_evidence(evidence_log, None, request, session="capture-a", sequence=1)
@@ -131,10 +150,16 @@ def durable_job_and_result_are_idempotent(root: Path) -> None:
     assert analyzer.calls == 1
 
     jobs = read_all(store, job_log_id("user"))
-    assert len(jobs) == 1 and jobs[0].requires == (evidence,)
+    assert len(jobs) == 1 and jobs[0].requires == (evidence, request, revision)
     job = jobs[0].data
     assert plain(job["basis"]) == {"evidence": [{"after": None, "through": evidence.to_value()}]}
-    assert plain(job["inputs"][1]) == {
+    assert [item["role"] for item in job["inputs"]] == [
+        "evidence",
+        "submission-request",
+        "draft-revision",
+        "course-context",
+    ]
+    assert plain(job["inputs"][3]) == {
         "role": "course-context",
         "snapshot": {
             "schema": "learning.course-context",
@@ -156,8 +181,7 @@ def durable_job_and_result_are_idempotent(root: Path) -> None:
 
 def duplicate_and_invalid_evidence_do_not_block(root: Path) -> None:
     store = FileReplicaLogStore(root)
-    request_log = "principal/user/submission/A/requests"
-    request = append(store, record(request_log, None, (), {"type": "submission.requested"}))
+    request, revision = submission_request(store)
     evidence_log = evidence_log_id("user", "A")
     invalid = append(store, record(evidence_log, None, (), {"type": "broken"}))
     first = append(
@@ -190,30 +214,25 @@ def duplicate_and_invalid_evidence_do_not_block(root: Path) -> None:
         "learning.analysis.evidence.duplicate",
         "learning.analysis.evidence.source-conflict",
     ]
-    assert [item.requires for item in jobs] == [(invalid,), (first,), (duplicate,), (conflict,)]
+    assert [item.requires for item in jobs] == [
+        (invalid,),
+        (first, request, revision),
+        (duplicate,),
+        (conflict,),
+    ]
     assert len(read_all(store, result_log_id("user"))) == 1
 
 
 def transient_failure_reuses_the_frozen_job(root: Path) -> None:
     class FlakyAnalyzer(Analyzer):
-        def analyze(self, *, job, evidence):
+        def analyze(self, *, job, records):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("provider unavailable")
             return assessment(job["jobKey"])
 
     store = FileReplicaLogStore(root)
-    request = append(
-        store,
-        record(
-            "principal/user/submission/A/requests",
-            None,
-            (),
-            {
-                "type": "submission.requested",
-            },
-        ),
-    )
+    request, _ = submission_request(store)
     evidence_log = evidence_log_id("user", "A")
     append(store, submission_evidence(evidence_log, None, request, session="capture-a", sequence=1))
     analyzer = FlakyAnalyzer()
@@ -235,21 +254,11 @@ def transient_failure_reuses_the_frozen_job(root: Path) -> None:
 
 def invalid_output_is_a_terminal_failure(root: Path) -> None:
     class InvalidAnalyzer:
-        def analyze(self, *, job, evidence):
+        def analyze(self, *, job, records):
             return {"schema": "learning.assessment", "version": 1, "data": {}}
 
     store = FileReplicaLogStore(root)
-    request = append(
-        store,
-        record(
-            "principal/user/submission/A/requests",
-            None,
-            (),
-            {
-                "type": "submission.requested",
-            },
-        ),
-    )
+    request, _ = submission_request(store)
     evidence_log = evidence_log_id("user", "A")
     append(store, submission_evidence(evidence_log, None, request, session="capture-a", sequence=1))
     consumer = LearningAnalysisConsumer(store, (evidence_log,), InvalidAnalyzer())

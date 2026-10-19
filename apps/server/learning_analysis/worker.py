@@ -6,6 +6,7 @@ import json
 from threading import Lock
 from typing import Protocol
 
+from apps.server.draft.protocol import decode_revision
 from apps.server.learning_analysis.logs import (
     evidence_scope,
     is_evidence_log,
@@ -30,7 +31,7 @@ class LearningAnalyzer(Protocol):
         self,
         *,
         job: Mapping[str, object],
-        evidence: tuple[ReplicatedRecord, ...],
+        records: tuple[ReplicatedRecord, ...],
     ) -> Mapping[str, object]: ...
 
 
@@ -124,8 +125,23 @@ class LearningAnalysisConsumer:
                 handled.add(position_key)
                 created += 1
                 continue
-            data = _job_data(evidence, decoded)
-            record = _record(output_log, head, (evidence.position,), data)
+            try:
+                data, dependencies = _job_data(self._store, evidence, decoded, principal_id)
+            except LearningAnalysisInvalidInput as error:
+                data = {
+                    "version": 1,
+                    "type": "learning.analysis.evidence.rejected",
+                    "reason": str(error) or "Evidence inputs are invalid",
+                }
+                record = _record(output_log, head, (evidence.position,), data)
+                appended = self._store.append(output_log, head, (record,))
+                if appended.kind != "accepted":
+                    raise RuntimeError(f"{output_log} lost its single writer") from None
+                head = record.position
+                handled.add(position_key)
+                created += 1
+                continue
+            record = _record(output_log, head, dependencies, data)
             appended = self._store.append(output_log, head, (record,))
             if appended.kind != "accepted":
                 raise RuntimeError(f"{output_log} lost its single writer")
@@ -153,15 +169,15 @@ class LearningAnalysisConsumer:
             job_key = require_text(job["jobKey"], "jobKey")
             if job_key in completed:
                 continue
-            evidence = tuple(
+            records = tuple(
                 record
                 for position in job_record.requires
                 if (record := find_record(self._store, position)) is not None
             )
-            if len(evidence) != len(job_record.requires):
-                raise RuntimeError("Job Evidence is missing")
+            if len(records) != len(job_record.requires):
+                raise RuntimeError("Job input is missing")
             try:
-                output = _decode_assessment(self._analyzer.analyze(job=job, evidence=evidence))
+                output = _decode_assessment(self._analyzer.analyze(job=job, records=records))
                 data: Mapping[str, object] = {
                     "version": 1,
                     "type": "learning.analysis.completed",
@@ -278,7 +294,12 @@ def _source_key(value: Mapping[str, object]) -> tuple[str, int]:
     return str(source["session"]), int(source["sequence"])
 
 
-def _job_data(evidence: ReplicatedRecord, decoded: Mapping[str, object]) -> Mapping[str, object]:
+def _job_data(
+    store: ReplicaLogStore,
+    evidence: ReplicatedRecord,
+    decoded: Mapping[str, object],
+    principal_id: str,
+) -> tuple[Mapping[str, object], tuple[Position, ...]]:
     subject = decoded["subject"]
     basis = {
         "evidence": [
@@ -293,23 +314,70 @@ def _job_data(evidence: ReplicatedRecord, decoded: Mapping[str, object]) -> Mapp
         "version": 1,
         "data": subject,
     }
+    inputs: list[Mapping[str, object]] = [
+        {"role": "evidence", "record": evidence.position.to_value()}
+    ]
+    dependencies = [evidence.position]
+    payload = decoded["payload"]
+    if isinstance(payload, Mapping) and payload.get("schema") == "learning.submission.requested":
+        detail = payload["data"]
+        assert isinstance(detail, Mapping)
+        request = require_position(
+            detail["request"],
+            "payload.data.request",
+            error_type=LearningAnalysisInvalidInput,
+        )
+        request_record = find_record(store, request)
+        if request_record is None:
+            raise LearningAnalysisInvalidInput("Submission request is missing")
+        request_data = request_record.data
+        if (
+            not isinstance(request_data, Mapping)
+            or request_data.get("type") != "submission.requested"
+        ):
+            raise LearningAnalysisInvalidInput("Referenced record is not a Submission request")
+        if request_data.get("playgroundId") != subject["playgroundId"]:
+            raise LearningAnalysisInvalidInput("Submission belongs to another Playground")
+        revision = require_position(
+            request_data.get("revision"),
+            "submission.revision",
+            error_type=LearningAnalysisInvalidInput,
+        )
+        if revision not in request_record.requires:
+            raise LearningAnalysisInvalidInput("Submission does not require its Revision")
+        revision_record = find_record(store, revision)
+        if revision_record is None:
+            raise LearningAnalysisInvalidInput("Submission Revision is missing")
+        try:
+            revision_data = decode_revision(revision_record)
+        except ValueError as error:
+            raise LearningAnalysisInvalidInput("Submission Revision is invalid") from error
+        if revision_data["principalId"] != principal_id:
+            raise LearningAnalysisInvalidInput("Submission Revision belongs to another Principal")
+        inputs.extend(
+            (
+                {"role": "submission-request", "record": request.to_value()},
+                {"role": "draft-revision", "record": revision.to_value()},
+            )
+        )
+        dependencies.extend((request, revision))
     frozen = {
         "subject": subject,
         "analysis": ANALYSIS,
         "basis": basis,
-        "inputs": [
-            {"role": "evidence", "record": evidence.position.to_value()},
-            {"role": "course-context", "snapshot": context},
-        ],
+        "inputs": [*inputs, {"role": "course-context", "snapshot": context}],
     }
     job_key = "sha256:" + sha256(_canonical(frozen)).hexdigest()
-    return {
-        "version": 1,
-        "type": "learning.analysis.job.created",
-        "jobKey": job_key,
-        "source": decoded["source"],
-        **frozen,
-    }
+    return (
+        {
+            "version": 1,
+            "type": "learning.analysis.job.created",
+            "jobKey": job_key,
+            "source": decoded["source"],
+            **frozen,
+        },
+        tuple(dependencies),
+    )
 
 
 def _decode_job(value: object) -> Mapping[str, object]:
