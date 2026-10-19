@@ -107,12 +107,20 @@ def shared_contract_fixtures_are_strict() -> None:
                 accepted = True
             assert accepted is case["valid"], case["name"]
 
+    invalid = fixture["evidence"][1]["value"]
+    invalid["payload"]["data"] = object()
+    try:
+        decode_evidence_data(invalid)
+    except LearningAnalysisInvalidInput as error:
+        assert "must be a JSON value" in str(error)
+    else:
+        raise AssertionError("non-JSON payload was accepted")
+
     cyclic: dict[str, object] = {}
     cyclic["self"] = cyclic
-    evidence = fixture["evidence"][1]["value"]
-    evidence["payload"]["data"] = cyclic
+    invalid["payload"]["data"] = cyclic
     try:
-        decode_evidence_data(evidence)
+        decode_evidence_data(invalid)
     except LearningAnalysisInvalidInput as error:
         assert "acyclic JSON" in str(error)
     else:

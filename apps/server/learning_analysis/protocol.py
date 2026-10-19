@@ -30,7 +30,9 @@ def _json(value: object, label: str, seen: set[int] | None = None) -> object:
         return value
     if seen is None:
         seen = set()
-    if not isinstance(value, (Mapping, list, tuple)) or id(value) in seen:
+    if not isinstance(value, (Mapping, list, tuple)):
+        raise LearningAnalysisInvalidInput(f"{label} must be a JSON value")
+    if id(value) in seen:
         raise LearningAnalysisInvalidInput(f"{label} must be an acyclic JSON value")
     seen.add(id(value))
     try:
