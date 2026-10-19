@@ -10,6 +10,10 @@ class LearningAnalysisInvalidInput(ValueError):
     pass
 
 
+MAX_ASSESSMENT_ITEMS = 8
+MAX_ASSESSMENT_TEXT_LENGTH = 1024
+
+
 def _exact(value: Mapping[str, object], fields: set[str], label: str) -> None:
     if set(value) != fields:
         raise LearningAnalysisInvalidInput(f"{label} shape is invalid")
@@ -113,10 +117,14 @@ def decode_assessment(value: object) -> Mapping[str, object]:
     if not isinstance(data, Mapping):
         raise LearningAnalysisInvalidInput("Analysis assessment shape is invalid")
     _exact(data, {"summary", "findings", "recommendations", "limitations"}, "Analysis assessment")
-    require_text(data.get("summary"), "assessment.summary", error_type=LearningAnalysisInvalidInput)
+    _assessment_text(data.get("summary"), "assessment.summary")
     for field in ("findings", "recommendations", "limitations"):
         if not isinstance(data.get(field), (list, tuple)):
             raise LearningAnalysisInvalidInput(f"assessment.{field} must be an array")
+        if len(data[field]) > MAX_ASSESSMENT_ITEMS:
+            raise LearningAnalysisInvalidInput(
+                f"assessment.{field} must contain at most {MAX_ASSESSMENT_ITEMS} items"
+            )
     for index, finding in enumerate(data["findings"]):
         label = f"assessment.findings[{index}]"
         if not isinstance(finding, Mapping):
@@ -132,7 +140,7 @@ def decode_assessment(value: object) -> Mapping[str, object]:
         }:
             raise LearningAnalysisInvalidInput(f"{label}.kind is invalid")
         _decode_topic(finding["topic"], f"{label}.topic")
-        require_text(finding["claim"], f"{label}.claim", error_type=LearningAnalysisInvalidInput)
+        _assessment_text(finding["claim"], f"{label}.claim")
         if finding["confidence"] not in {"low", "medium", "high"}:
             raise LearningAnalysisInvalidInput(f"{label}.confidence is invalid")
     for index, recommendation in enumerate(data["recommendations"]):
@@ -145,21 +153,24 @@ def decode_assessment(value: object) -> Mapping[str, object]:
         _decode_topic(recommendation["topic"], f"{label}.topic")
         if recommendation["priority"] not in {"now", "soon", "later"}:
             raise LearningAnalysisInvalidInput(f"{label}.priority is invalid")
-        require_text(
-            recommendation["rationale"],
-            f"{label}.rationale",
-            error_type=LearningAnalysisInvalidInput,
-        )
+        _assessment_text(recommendation["rationale"], f"{label}.rationale")
     for index, limitation in enumerate(data["limitations"]):
-        require_text(
-            limitation, f"assessment.limitations[{index}]", error_type=LearningAnalysisInvalidInput
-        )
+        _assessment_text(limitation, f"assessment.limitations[{index}]")
     return value
+
+
+def _assessment_text(value: object, label: str) -> str:
+    text = require_text(value, label, error_type=LearningAnalysisInvalidInput)
+    if len(text) > MAX_ASSESSMENT_TEXT_LENGTH:
+        raise LearningAnalysisInvalidInput(
+            f"{label} must contain at most {MAX_ASSESSMENT_TEXT_LENGTH} characters"
+        )
+    return text
 
 
 def _decode_topic(value: object, label: str) -> None:
     if not isinstance(value, Mapping):
         raise LearningAnalysisInvalidInput(f"{label} shape is invalid")
     _exact(value, {"key", "label"}, label)
-    require_text(value["key"], f"{label}.key", error_type=LearningAnalysisInvalidInput)
-    require_text(value["label"], f"{label}.label", error_type=LearningAnalysisInvalidInput)
+    _assessment_text(value["key"], f"{label}.key")
+    _assessment_text(value["label"], f"{label}.label")

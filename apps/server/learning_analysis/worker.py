@@ -33,6 +33,8 @@ from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 ANALYSIS = {"key": "learning.feedback", "revision": "1"}
 POLICY = {"key": "immediate-evidence", "revision": "1"}
 MAX_EVIDENCE_BYTES = 64 * 1024
+MAX_RESULT_BYTES = 256 * 1024
+MAX_BASIS_WINDOWS = 64
 RETRY_BASE_SECONDS = 1.0
 RETRY_MAX_SECONDS = 300.0
 
@@ -225,6 +227,7 @@ class LearningAnalysisConsumer:
                     "basis": job["basis"],
                     "output": output,
                 }
+                _require_result_size(data)
             except LearningAnalysisInvalidInput as error:
                 data = {
                     "version": 1,
@@ -413,6 +416,10 @@ def _canonical_basis(
     store: ReplicaLogStore,
     windows: tuple[tuple[Position | None, Position], ...],
 ) -> Mapping[str, object]:
+    if len(windows) > MAX_BASIS_WINDOWS:
+        raise LearningAnalysisInvalidInput(
+            f"Evidence basis must contain at most {MAX_BASIS_WINDOWS} windows"
+        )
     resolved: list[tuple[bytes, int, int, Position | None, Position]] = []
     for after, through in windows:
         if after is not None and after.log_id != through.log_id:
@@ -443,6 +450,14 @@ def _canonical_basis(
             for _, _, _, after, through in resolved
         ]
     }
+
+
+def _require_result_size(value: Mapping[str, object]) -> None:
+    encoded = json.dumps(
+        _json(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) > MAX_RESULT_BYTES:
+        raise LearningAnalysisInvalidInput(f"Result exceeds {MAX_RESULT_BYTES} bytes")
 
 
 def _completed_job_keys(records: tuple[ReplicatedRecord, ...]) -> set[str]:

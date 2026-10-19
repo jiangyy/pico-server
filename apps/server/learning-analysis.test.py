@@ -27,10 +27,13 @@ from apps.server.learning_analysis.pipeline import (  # noqa: E402
     LearningFeedbackAnalyzer,
 )
 from apps.server.learning_analysis.openai_provider import (  # noqa: E402
+    MAX_PROVIDER_RESPONSE_BYTES,
     OpenAIStructuredLearningProvider,
 )
 from apps.server.main import load_learning_analyzer  # noqa: E402
 from apps.server.learning_analysis.protocol import (  # noqa: E402
+    MAX_ASSESSMENT_ITEMS,
+    MAX_ASSESSMENT_TEXT_LENGTH,
     decode_assessment,
     decode_evidence_data,
 )
@@ -41,10 +44,13 @@ from apps.server.draft.protocol import (  # noqa: E402
     revision_log_id,
 )
 from apps.server.learning_analysis.worker import (  # noqa: E402
+    MAX_BASIS_WINDOWS,
     MAX_EVIDENCE_BYTES,
+    MAX_RESULT_BYTES,
     LearningAnalysisConsumer,
     LearningAnalysisInvalidInput,
     _canonical_basis,
+    _require_result_size,
 )
 from apps.server.log_reads import read_all  # noqa: E402
 from apps.server.worker_thread import ServerWorkerThread  # noqa: E402
@@ -125,6 +131,23 @@ def shared_contract_fixtures_are_strict() -> None:
         assert "acyclic JSON" in str(error)
     else:
         raise AssertionError("cyclic payload was accepted")
+
+    oversized = assessment("x" * (MAX_ASSESSMENT_TEXT_LENGTH + 1))
+    try:
+        decode_assessment(oversized)
+    except LearningAnalysisInvalidInput as error:
+        assert f"at most {MAX_ASSESSMENT_TEXT_LENGTH} characters" in str(error)
+    else:
+        raise AssertionError("oversized assessment text was accepted")
+
+    too_many = assessment("summary")
+    too_many["data"]["limitations"] = ["limited"] * (MAX_ASSESSMENT_ITEMS + 1)
+    try:
+        decode_assessment(too_many)
+    except LearningAnalysisInvalidInput as error:
+        assert f"at most {MAX_ASSESSMENT_ITEMS} items" in str(error)
+    else:
+        raise AssertionError("oversized assessment collection was accepted")
 
 
 def submission_evidence(
@@ -413,6 +436,12 @@ def basis_is_ancestral_non_overlapping_and_canonical(root: Path) -> None:
         assert str(error) == "Evidence windows overlap"
     else:
         raise AssertionError("overlapping Evidence windows were accepted")
+    try:
+        _canonical_basis(store, tuple((None, a1.position) for _ in range(MAX_BASIS_WINDOWS + 1)))
+    except LearningAnalysisInvalidInput as error:
+        assert f"at most {MAX_BASIS_WINDOWS} windows" in str(error)
+    else:
+        raise AssertionError("oversized Evidence basis was accepted")
 
 
 def historical_jobs_and_reordered_dependencies_remain_processable(root: Path) -> None:
@@ -632,6 +661,8 @@ def feedback_pipeline_exposes_only_the_versioned_prompt_contract(root: Path) -> 
     assert schema == plain(OUTPUT_SCHEMA)
     assert schema["additionalProperties"] is False
     assert schema["required"] == ["summary", "findings", "recommendations", "limitations"]
+    assert schema["properties"]["summary"]["maxLength"] == MAX_ASSESSMENT_TEXT_LENGTH
+    assert schema["properties"]["findings"]["maxItems"] == MAX_ASSESSMENT_ITEMS
     result = read_all(store, result_log_id("user"))[0]
     assert result.data["type"] == "learning.analysis.completed"
     assert result.data["output"]["data"]["summary"] == "你已经能够正确使用 range 完成遍历。"
@@ -693,6 +724,30 @@ def production_provider_uses_structured_output_without_exposing_configuration() 
             "schema": plain(OUTPUT_SCHEMA),
         },
     }
+
+    oversized_provider = OpenAIStructuredLearningProvider(
+        api_key="test-secret",
+        model="test-model",
+        transport=lambda request, timeout: b"x" * (MAX_PROVIDER_RESPONSE_BYTES + 1),
+    )
+    try:
+        oversized_provider.generate(
+            analysis="learning.feedback@1",
+            system="system prompt",
+            input={},
+            output_schema=OUTPUT_SCHEMA,
+        )
+    except RuntimeError as error:
+        assert str(error) == f"OpenAI response exceeds {MAX_PROVIDER_RESPONSE_BYTES} bytes"
+    else:
+        raise AssertionError("oversized provider response was accepted")
+
+    try:
+        _require_result_size({"value": "x" * MAX_RESULT_BYTES})
+    except LearningAnalysisInvalidInput as error:
+        assert str(error) == f"Result exceeds {MAX_RESULT_BYTES} bytes"
+    else:
+        raise AssertionError("oversized Result was accepted")
 
     assert load_learning_analyzer(
         None, api_key=None, api_base="https://api.openai.com/v1"

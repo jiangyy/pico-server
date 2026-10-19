@@ -9,11 +9,12 @@ from urllib.request import Request, urlopen
 
 
 Transport = Callable[[Request, float], bytes]
+MAX_PROVIDER_RESPONSE_BYTES = 512 * 1024
 
 
 def _send(request: Request, timeout: float) -> bytes:
     with urlopen(request, timeout=timeout) as response:
-        return response.read()
+        return response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
 
 
 class OpenAIStructuredLearningProvider:
@@ -94,6 +95,8 @@ class OpenAIStructuredLearningProvider:
             raise RuntimeError(f"OpenAI returned HTTP {error.code}") from error
         except (URLError, TimeoutError, OSError) as error:
             raise RuntimeError("OpenAI request failed") from error
+        if len(raw) > MAX_PROVIDER_RESPONSE_BYTES:
+            raise RuntimeError(f"OpenAI response exceeds {MAX_PROVIDER_RESPONSE_BYTES} bytes")
         try:
             response = json.loads(raw)
             choices = response["choices"]

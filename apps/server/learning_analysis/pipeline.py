@@ -10,7 +10,11 @@ from apps.server.learning_analysis.materializers import (
     materializer_for_job,
     materializer_map,
 )
-from apps.server.learning_analysis.protocol import LearningAnalysisInvalidInput
+from apps.server.learning_analysis.protocol import (
+    MAX_ASSESSMENT_ITEMS,
+    MAX_ASSESSMENT_TEXT_LENGTH,
+    LearningAnalysisInvalidInput,
+)
 from picopg.api import ReplicatedRecord
 
 
@@ -38,9 +42,14 @@ OUTPUT_SCHEMA = cast(
             "additionalProperties": False,
             "required": ("summary", "findings", "recommendations", "limitations"),
             "properties": {
-                "summary": {"type": "string", "minLength": 1},
+                "summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ASSESSMENT_TEXT_LENGTH,
+                },
                 "findings": {
                     "type": "array",
+                    "maxItems": MAX_ASSESSMENT_ITEMS,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -57,13 +66,18 @@ OUTPUT_SCHEMA = cast(
                                 )
                             },
                             "topic": {"$ref": "#/$defs/topic"},
-                            "claim": {"type": "string", "minLength": 1},
+                            "claim": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_ASSESSMENT_TEXT_LENGTH,
+                            },
                             "confidence": {"enum": ("low", "medium", "high")},
                         },
                     },
                 },
                 "recommendations": {
                     "type": "array",
+                    "maxItems": MAX_ASSESSMENT_ITEMS,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -72,11 +86,23 @@ OUTPUT_SCHEMA = cast(
                             "action": {"enum": ("explain", "practice", "review", "challenge")},
                             "topic": {"$ref": "#/$defs/topic"},
                             "priority": {"enum": ("now", "soon", "later")},
-                            "rationale": {"type": "string", "minLength": 1},
+                            "rationale": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_ASSESSMENT_TEXT_LENGTH,
+                            },
                         },
                     },
                 },
-                "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "limitations": {
+                    "type": "array",
+                    "maxItems": MAX_ASSESSMENT_ITEMS,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_ASSESSMENT_TEXT_LENGTH,
+                    },
+                },
             },
             "$defs": {
                 "topic": {
@@ -84,8 +110,16 @@ OUTPUT_SCHEMA = cast(
                     "additionalProperties": False,
                     "required": ("key", "label"),
                     "properties": {
-                        "key": {"type": "string", "minLength": 1},
-                        "label": {"type": "string", "minLength": 1},
+                        "key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_ASSESSMENT_TEXT_LENGTH,
+                        },
+                        "label": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_ASSESSMENT_TEXT_LENGTH,
+                        },
                     },
                 }
             },
