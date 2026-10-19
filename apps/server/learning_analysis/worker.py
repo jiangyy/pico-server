@@ -7,7 +7,6 @@ from threading import Lock
 from time import monotonic
 from typing import Protocol
 
-from apps.server.draft.protocol import decode_revision
 from apps.server.learning_analysis.logs import (
     attempt_log_id,
     evidence_scope,
@@ -15,13 +14,18 @@ from apps.server.learning_analysis.logs import (
     job_log_id,
     result_log_id,
 )
+from apps.server.learning_analysis.materializers import (
+    DEFAULT_MATERIALIZERS,
+    LearningEvidenceMaterializer,
+    materializer_map,
+    resolve_materializer,
+)
 from apps.server.learning_analysis.protocol import (
     LearningAnalysisInvalidInput,
     decode_assessment,
     decode_evidence_data,
 )
 from apps.server.log_reads import find_record, read_all
-from apps.server.submission.logs import request_scope
 from apps.server.validation import require_position, require_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
@@ -50,6 +54,7 @@ class LearningAnalysisConsumer:
         analyzer: LearningAnalyzer,
         on_result: Callable[[str, Position], None] | None = None,
         now: Callable[[], float] = monotonic,
+        materializers: tuple[LearningEvidenceMaterializer, ...] = DEFAULT_MATERIALIZERS,
     ) -> None:
         if len(set(evidence_logs)) != len(evidence_logs):
             raise ValueError("evidence_logs must be unique")
@@ -60,6 +65,7 @@ class LearningAnalysisConsumer:
         self._analyzer = analyzer
         self._on_result = on_result or (lambda _log_id, _head: None)
         self._now = now
+        self._materializers = materializer_map(materializers)
         self._lock = Lock()
 
     def add_evidence_log(self, log_id: str) -> None:
@@ -115,7 +121,8 @@ class LearningAnalysisConsumer:
             if position_key in handled:
                 continue
             try:
-                decoded = _decode_evidence(evidence, principal_id)
+                decoded = _decode_evidence(evidence)
+                materializer = resolve_materializer(decoded, self._materializers)
             except LearningAnalysisInvalidInput as error:
                 data = {
                     "version": 1,
@@ -155,7 +162,9 @@ class LearningAnalysisConsumer:
                 created += 1
                 continue
             try:
-                data, dependencies = _job_data(self._store, evidence, decoded, principal_id)
+                data, dependencies = _job_data(
+                    self._store, evidence, decoded, principal_id, materializer
+                )
             except LearningAnalysisInvalidInput as error:
                 data = {
                     "version": 1,
@@ -276,33 +285,14 @@ class LearningAnalysisConsumer:
                 raise RuntimeError(f"Unexpected append outcome {appended.kind}")
 
 
-def _decode_evidence(record: ReplicatedRecord, principal_id: str) -> Mapping[str, object]:
+def _decode_evidence(record: ReplicatedRecord) -> Mapping[str, object]:
     data = record.data
     encoded = json.dumps(
         _json(data), ensure_ascii=False, allow_nan=False, separators=(",", ":")
     ).encode("utf-8")
     if len(encoded) > MAX_EVIDENCE_BYTES:
         raise LearningAnalysisInvalidInput(f"Evidence exceeds {MAX_EVIDENCE_BYTES} bytes")
-    decoded = decode_evidence_data(data)
-    payload = decoded["payload"]
-    assert isinstance(payload, Mapping)
-    if payload["schema"] != "learning.submission.requested" or payload["version"] != 1:
-        raise LearningAnalysisInvalidInput("Evidence payload schema is unsupported")
-    detail = payload["data"]
-    if not isinstance(detail, Mapping) or set(detail) != {"request"}:
-        raise LearningAnalysisInvalidInput("Submission Evidence data is invalid")
-    request = require_position(
-        detail["request"], "payload.data.request", error_type=LearningAnalysisInvalidInput
-    )
-    if request not in record.requires:
-        raise LearningAnalysisInvalidInput("Submission Evidence does not require its request")
-    try:
-        request_principal, _ = request_scope(request.log_id)
-    except ValueError as error:
-        raise LearningAnalysisInvalidInput("Submission request Log is invalid") from error
-    if request_principal != principal_id:
-        raise LearningAnalysisInvalidInput("Submission belongs to another Principal")
-    return decoded
+    return decode_evidence_data(data)
 
 
 def _source_key(value: Mapping[str, object]) -> tuple[str, int]:
@@ -317,6 +307,7 @@ def _job_data(
     evidence: ReplicatedRecord,
     decoded: Mapping[str, object],
     principal_id: str,
+    materializer: LearningEvidenceMaterializer,
 ) -> tuple[Mapping[str, object], tuple[Position, ...]]:
     subject = decoded["subject"]
     basis = _canonical_basis(store, ((evidence.parent, evidence.position),))
@@ -325,53 +316,17 @@ def _job_data(
         "version": 1,
         "data": subject,
     }
+    materialized = materializer.materialize(
+        store=store,
+        evidence=evidence,
+        decoded=decoded,
+        principal_id=principal_id,
+    )
     inputs: list[Mapping[str, object]] = [
-        {"role": "evidence", "record": evidence.position.to_value()}
+        {"role": "evidence", "record": evidence.position.to_value()},
+        *materialized.inputs,
     ]
-    dependencies = [evidence.position]
-    payload = decoded["payload"]
-    if isinstance(payload, Mapping) and payload.get("schema") == "learning.submission.requested":
-        detail = payload["data"]
-        assert isinstance(detail, Mapping)
-        request = require_position(
-            detail["request"],
-            "payload.data.request",
-            error_type=LearningAnalysisInvalidInput,
-        )
-        request_record = find_record(store, request)
-        if request_record is None:
-            raise LearningAnalysisInvalidInput("Submission request is missing")
-        request_data = request_record.data
-        if (
-            not isinstance(request_data, Mapping)
-            or request_data.get("type") != "submission.requested"
-        ):
-            raise LearningAnalysisInvalidInput("Referenced record is not a Submission request")
-        if request_data.get("playgroundId") != subject["playgroundId"]:
-            raise LearningAnalysisInvalidInput("Submission belongs to another Playground")
-        revision = require_position(
-            request_data.get("revision"),
-            "submission.revision",
-            error_type=LearningAnalysisInvalidInput,
-        )
-        if revision not in request_record.requires:
-            raise LearningAnalysisInvalidInput("Submission does not require its Revision")
-        revision_record = find_record(store, revision)
-        if revision_record is None:
-            raise LearningAnalysisInvalidInput("Submission Revision is missing")
-        try:
-            revision_data = decode_revision(revision_record)
-        except ValueError as error:
-            raise LearningAnalysisInvalidInput("Submission Revision is invalid") from error
-        if revision_data["principalId"] != principal_id:
-            raise LearningAnalysisInvalidInput("Submission Revision belongs to another Principal")
-        inputs.extend(
-            (
-                {"role": "submission-request", "record": request.to_value()},
-                {"role": "draft-revision", "record": revision.to_value()},
-            )
-        )
-        dependencies.extend((request, revision))
+    dependencies = [evidence.position, *materialized.dependencies]
     frozen = {
         "subject": subject,
         "analysis": ANALYSIS,

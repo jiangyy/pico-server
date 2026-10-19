@@ -4,9 +4,13 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Protocol, cast
 
-from apps.server.draft.protocol import decode_revision
+from apps.server.learning_analysis.materializers import (
+    DEFAULT_MATERIALIZERS,
+    LearningEvidenceMaterializer,
+    materializer_for_job,
+    materializer_map,
+)
 from apps.server.learning_analysis.protocol import LearningAnalysisInvalidInput
-from apps.server.validation import require_position
 from picopg.api import ReplicatedRecord
 
 
@@ -102,8 +106,13 @@ class StructuredLearningProvider(Protocol):
 
 
 class LearningFeedbackAnalyzer:
-    def __init__(self, provider: StructuredLearningProvider) -> None:
+    def __init__(
+        self,
+        provider: StructuredLearningProvider,
+        materializers: tuple[LearningEvidenceMaterializer, ...] = DEFAULT_MATERIALIZERS,
+    ) -> None:
         self._provider = provider
+        self._materializers = materializer_map(materializers)
 
     def analyze(
         self,
@@ -117,7 +126,8 @@ class LearningFeedbackAnalyzer:
             "revision": "1",
         }:
             raise LearningAnalysisInvalidInput("Analysis revision is unsupported")
-        prompt_input = _prompt_input(job, records)
+        materializer = materializer_for_job(job, records, self._materializers)
+        prompt_input = materializer.prompt_input(job=job, records=records)
         assessment = self._provider.generate(
             analysis="learning.feedback@1",
             system=SYSTEM_PROMPT,
@@ -131,98 +141,3 @@ class LearningFeedbackAnalyzer:
             "version": 1,
             "data": assessment,
         }
-
-
-def _prompt_input(
-    job: Mapping[str, object], records: tuple[ReplicatedRecord, ...]
-) -> Mapping[str, object]:
-    inputs = job.get("inputs")
-    if not isinstance(inputs, tuple):
-        raise LearningAnalysisInvalidInput("Job inputs are invalid")
-    by_position = {(record.log_id, record.id): record for record in records}
-    roles: dict[str, object] = {}
-    for value in inputs:
-        if not isinstance(value, Mapping):
-            raise LearningAnalysisInvalidInput("Job input is invalid")
-        role = value.get("role")
-        if not isinstance(role, str) or role in roles:
-            raise LearningAnalysisInvalidInput("Job input role is invalid")
-        if "record" in value:
-            position = require_position(
-                value["record"], f"inputs.{role}.record", error_type=LearningAnalysisInvalidInput
-            )
-            record = by_position.get((position.log_id, position.record_id))
-            if record is None:
-                raise LearningAnalysisInvalidInput(f"{role} record is missing")
-            roles[role] = record
-        elif "snapshot" in value:
-            roles[role] = value["snapshot"]
-        else:
-            raise LearningAnalysisInvalidInput("Job input has no value")
-    if set(roles) != {"evidence", "submission-request", "draft-revision", "course-context"}:
-        raise LearningAnalysisInvalidInput("Job input roles are unsupported")
-
-    evidence = _record_data(roles["evidence"], "Evidence")
-    payload = evidence.get("payload")
-    if not isinstance(payload, Mapping) or payload.get("schema") != "learning.submission.requested":
-        raise LearningAnalysisInvalidInput("Evidence schema is unsupported")
-    detail = payload.get("data")
-    if not isinstance(detail, Mapping) or set(detail) != {"request"}:
-        raise LearningAnalysisInvalidInput("Evidence data is invalid")
-    request = _record_data(roles["submission-request"], "Submission request")
-    if request.get("type") != "submission.requested":
-        raise LearningAnalysisInvalidInput("Submission request type is invalid")
-    revision_record = roles["draft-revision"]
-    if not isinstance(revision_record, ReplicatedRecord):
-        raise LearningAnalysisInvalidInput("Draft Revision is invalid")
-    try:
-        revision = decode_revision(revision_record)
-    except ValueError as error:
-        raise LearningAnalysisInvalidInput("Draft Revision is invalid") from error
-    context = roles["course-context"]
-    if not isinstance(context, Mapping) or set(context) != {"schema", "version", "data"}:
-        raise LearningAnalysisInvalidInput("Course context is invalid")
-    if context.get("schema") != "learning.course-context" or context.get("version") != 1:
-        raise LearningAnalysisInvalidInput("Course context version is unsupported")
-    subject = job.get("subject")
-    if not isinstance(subject, Mapping) or context.get("data") != subject:
-        raise LearningAnalysisInvalidInput("Course context does not match the Job subject")
-    if evidence.get("subject") != subject:
-        raise LearningAnalysisInvalidInput("Evidence does not match the Job subject")
-    request_record = roles["submission-request"]
-    assert isinstance(request_record, ReplicatedRecord)
-    evidence_request = require_position(
-        detail["request"], "evidence.request", error_type=LearningAnalysisInvalidInput
-    )
-    if evidence_request != request_record.position:
-        raise LearningAnalysisInvalidInput("Evidence does not reference the Job submission")
-    request_revision = require_position(
-        request.get("revision"),
-        "submission.revision",
-        error_type=LearningAnalysisInvalidInput,
-    )
-    if request_revision != revision_record.position:
-        raise LearningAnalysisInvalidInput("Submission does not reference the Job revision")
-    if request.get("playgroundId") != subject.get("playgroundId"):
-        raise LearningAnalysisInvalidInput("Submission does not match the Job subject")
-    return _freeze(
-        {
-            "language": "zh-CN",
-            "subject": subject,
-            "courseContext": context["data"],
-            "evidence": (
-                {
-                    "schema": "learning.submission.requested",
-                    "version": 1,
-                    "data": {"event": "submission-requested"},
-                },
-            ),
-            "submission": {"source": revision["source"]},
-        }
-    )
-
-
-def _record_data(value: object, label: str) -> Mapping[str, object]:
-    if not isinstance(value, ReplicatedRecord) or not isinstance(value.data, Mapping):
-        raise LearningAnalysisInvalidInput(f"{label} is invalid")
-    return value.data
