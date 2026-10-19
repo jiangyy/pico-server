@@ -13,6 +13,11 @@ from apps.server.draft.protocol import draft_scope, revision_log_id  # noqa: E40
 from apps.server.log_ids import decode_component, encode_component  # noqa: E402
 from apps.server.review.comments import comment_log_id  # noqa: E402
 from apps.server.submission.logs import request_scope, result_log  # noqa: E402
+from apps.server.learning_analysis.logs import (  # noqa: E402
+    evidence_log_id,
+    evidence_scope,
+    result_log_id,
+)
 
 
 def main() -> int:
@@ -40,6 +45,10 @@ def main() -> int:
     )
     assert request_scope(request) == (principal, replica)
     assert result_log(request).endswith("/submission/device%2Fa/results")
+
+    evidence = evidence_log_id(principal, replica)
+    assert evidence_scope(evidence) == (principal, replica)
+    assert result_log_id(principal).endswith("/analysis/results")
 
     for noncanonical in ("space here", "%2f", "%", "中文"):
         try:

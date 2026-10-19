@@ -71,7 +71,7 @@ def _start(data: Path, repository: Path):
         port=0,
         token="operator-token",
         principal_accounts=[PrincipalAccount.create(
-            "student", "access-code", ("playgrounds", "drafts", "submissions")
+            "student", "access-code", ("playgrounds", "drafts", "submissions", "analysis")
         )],
         secure_cookies=False,
         submission_tag_writer=GitSubmissionTagWriter({"smoke": repository}),

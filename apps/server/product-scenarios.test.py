@@ -136,10 +136,10 @@ def main() -> None:
         tags = Tags()
         sessions = (
             PrincipalSession.create(
-                "student", "A", "token-a", {}, ["playgrounds", "drafts", "submissions"]
+                "student", "A", "token-a", {}, ["playgrounds", "drafts", "submissions", "analysis"]
             ),
             PrincipalSession.create(
-                "student", "B", "token-b", {}, ["playgrounds", "drafts", "submissions"]
+                "student", "B", "token-b", {}, ["playgrounds", "drafts", "submissions", "analysis"]
             ),
         )
         server = PicoPGHttpServer(

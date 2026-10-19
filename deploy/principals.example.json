@@ -2,6 +2,6 @@
   {
     "principalId": "pilot-student-01",
     "accessCode": "replace-with-a-random-classroom-code",
-    "capabilities": ["playgrounds", "drafts", "submissions"]
+    "capabilities": ["playgrounds", "drafts", "submissions", "analysis"]
   }
 ]

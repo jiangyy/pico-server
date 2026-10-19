@@ -12,7 +12,7 @@ from apps.server.log_ids import encode_component
 from apps.server.validation import require_text
 
 
-PRINCIPAL_CAPABILITIES = frozenset(("playgrounds", "drafts", "submissions"))
+PRINCIPAL_CAPABILITIES = frozenset(("playgrounds", "drafts", "submissions", "analysis"))
 
 
 @dataclass(frozen=True, slots=True)

@@ -56,7 +56,7 @@ def _start(root: Path):
         port=0,
         token="operator-secret",
         principal_accounts=[PrincipalAccount.create(
-            "user", "student-code", ["playgrounds", "drafts", "submissions"],
+            "user", "student-code", ["playgrounds", "drafts", "submissions", "analysis"],
         )],
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)

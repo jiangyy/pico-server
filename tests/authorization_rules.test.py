@@ -18,6 +18,7 @@ from apps.server.authentication.model import (  # noqa: E402
 from apps.server.draft.protocol import DraftLogRule  # noqa: E402
 from apps.server.playground.catalog import PlaygroundLogRule  # noqa: E402
 from apps.server.submission.logs import SubmissionLogRule  # noqa: E402
+from apps.server.learning_analysis.logs import LearningAnalysisLogRule  # noqa: E402
 
 
 def main() -> int:
@@ -27,7 +28,7 @@ def main() -> int:
             "A",
             "token-a",
             {"explicit": "read"},
-            ("playgrounds", "drafts", "submissions"),
+            ("playgrounds", "drafts", "submissions", "analysis"),
         ),
         PrincipalSession.create(
             "user",
@@ -40,7 +41,12 @@ def main() -> int:
     authorization = PrincipalLogAuthorization(
         sessions,
         StaticReplicaDirectory(sessions),
-        rules=(PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule()),
+        rules=(
+            PlaygroundLogRule(),
+            DraftLogRule(),
+            SubmissionLogRule(),
+            LearningAnalysisLogRule(),
+        ),
     )
     identity = AuthenticatedReplica("user", "A")
 
@@ -56,6 +62,9 @@ def main() -> int:
         "principal/user/submission/A/requests": "append",
         "principal/user/submission/A/results": "read",
         "principal/user/submission/B/requests": None,
+        "principal/user/analysis/A/evidence": "append",
+        "principal/user/analysis/B/evidence": None,
+        "principal/user/analysis/results": "read",
         "principal/other/draft/lesson/decision": None,
     }
     for log_id, access in expected.items():

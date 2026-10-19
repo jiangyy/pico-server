@@ -41,6 +41,7 @@ from apps.server.submission.logs import (
     request_logs as submission_request_logs,
 )
 from apps.server.submission.worker import SubmissionRequestConsumer, SubmissionTagWriter
+from apps.server.learning_analysis.logs import LearningAnalysisLogRule
 from apps.server.teacher.http import dispatch_teacher
 from apps.server.worker_thread import ServerWorkerThread
 from picopg.api import ReplicaLogStore
@@ -91,7 +92,12 @@ class PicoPGHttpServer(ReplicaHttpServer):
         )
         authenticator = CompositeAuthenticator(authenticators) if authenticators else None
         directory = CompositeReplicaDirectory(directories)
-        rules = (PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule())
+        rules = (
+            PlaygroundLogRule(),
+            DraftLogRule(),
+            SubmissionLogRule(),
+            LearningAnalysisLogRule(),
+        )
         authorization = (
             PrincipalLogAuthorization(
                 sessions,
