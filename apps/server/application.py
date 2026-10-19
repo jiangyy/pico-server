@@ -163,6 +163,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
             )
             consumers.append(self.submission_consumer)
         self.learning_analysis_consumer = None
+        self.learning_workers = None
         if learning_analyzer is not None:
             analysis_logs = tuple(
                 sorted(
@@ -176,10 +177,12 @@ class PicoPGHttpServer(ReplicaHttpServer):
                 learning_analyzer,
                 lambda log_id, head: self.broadcast(log_id, head),
             )
-            consumers.append(self.learning_analysis_consumer)
         self.workers = ServerWorkerThread(tuple(consumers)) if consumers else None
         if self.workers is not None:
             self.workers.start()
+        if self.learning_analysis_consumer is not None:
+            self.learning_workers = ServerWorkerThread((self.learning_analysis_consumer,))
+            self.learning_workers.start()
 
     def append_and_broadcast(self, log_id, expected_head, records):
         result = super().append_and_broadcast(log_id, expected_head, records)
@@ -190,10 +193,15 @@ class PicoPGHttpServer(ReplicaHttpServer):
                 self.submission_consumer.add_request_log(log_id)
             if self.learning_analysis_consumer is not None and is_evidence_log(log_id):
                 self.learning_analysis_consumer.add_evidence_log(log_id)
-            self.workers.notify_append(log_id)
+                assert self.learning_workers is not None
+                self.learning_workers.notify_append(log_id)
+            else:
+                self.workers.notify_append(log_id)
         return result
 
     def server_close(self) -> None:
+        if self.learning_workers is not None:
+            self.learning_workers.close()
         if self.workers is not None:
             self.workers.close()
         super().server_close()

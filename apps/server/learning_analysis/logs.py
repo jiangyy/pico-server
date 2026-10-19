@@ -60,6 +60,10 @@ def job_log_id(principal_id: str) -> str:
     return f"server/analysis/{encode_component(principal_id, 'principalId')}/jobs"
 
 
+def attempt_log_id(principal_id: str) -> str:
+    return f"server/analysis/{encode_component(principal_id, 'principalId')}/attempts"
+
+
 def is_evidence_log(log_id: str) -> bool:
     parts = log_id.split("/")
     return (

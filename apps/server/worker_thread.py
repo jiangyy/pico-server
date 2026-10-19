@@ -35,8 +35,9 @@ class ServerWorkerThread:
             self._thread.join()
 
     def _run(self) -> None:
+        delay: float | None = None
         while not self._stop.is_set():
-            self._wake.wait()
+            self._wake.wait(delay)
             self._wake.clear()
             if self._stop.is_set():
                 return
@@ -47,6 +48,12 @@ class ServerWorkerThread:
                 except Exception:
                     logger.exception("request Log consumer failed")
                     failed = True
-            if failed and not self._stop.is_set():
-                self._stop.wait(1)
-                self._wake.set()
+            delays = [
+                next_delay
+                for consumer in self._consumers
+                if callable(next_wake_delay := getattr(consumer, "next_wake_delay", None))
+                if (next_delay := next_wake_delay()) is not None
+            ]
+            delay = min(delays) if delays else None
+            if failed:
+                delay = min(1.0, delay) if delay is not None else 1.0
