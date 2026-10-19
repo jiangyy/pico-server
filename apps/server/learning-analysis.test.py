@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from collections.abc import Mapping
@@ -16,6 +17,11 @@ from apps.server.learning_analysis.logs import (  # noqa: E402
     evidence_log_id,
     job_log_id,
     result_log_id,
+)
+from apps.server.learning_analysis.pipeline import (  # noqa: E402
+    OUTPUT_SCHEMA,
+    SYSTEM_PROMPT,
+    LearningFeedbackAnalyzer,
 )
 from apps.server.learning_analysis.worker import LearningAnalysisConsumer  # noqa: E402
 from apps.server.log_reads import read_all  # noqa: E402
@@ -97,6 +103,20 @@ class Analyzer:
         self.calls += 1
         assert job["inputs"][0]["record"] == records[0].position.to_value()
         return assessment(self.summary)
+
+
+class Provider:
+    def __init__(self) -> None:
+        self.call: dict[str, object] | None = None
+
+    def generate(self, *, analysis, system, input, output_schema):
+        self.call = {
+            "analysis": analysis,
+            "system": system,
+            "input": input,
+            "output_schema": output_schema,
+        }
+        return assessment("你已经能够正确使用 range 完成遍历。")["data"]
 
 
 def submission_request(store: FileReplicaLogStore) -> tuple[Position, Position]:
@@ -269,6 +289,49 @@ def invalid_output_is_a_terminal_failure(root: Path) -> None:
     assert consumer.run_once() == 0
 
 
+def feedback_pipeline_exposes_only_the_versioned_prompt_contract(root: Path) -> None:
+    store = FileReplicaLogStore(root)
+    request, _ = submission_request(store)
+    evidence_log = evidence_log_id("user", "A")
+    append(store, submission_evidence(evidence_log, None, request, session="capture-a", sequence=1))
+    provider = Provider()
+    consumer = LearningAnalysisConsumer(
+        store,
+        (evidence_log,),
+        LearningFeedbackAnalyzer(provider),
+    )
+
+    assert consumer.run_once() == 2
+    assert provider.call is not None
+    call = provider.call
+    assert call["analysis"] == "learning.feedback@1"
+    assert call["system"] == SYSTEM_PROMPT
+    assert "不推测身份" in SYSTEM_PROMPT
+    assert plain(call["input"]) == {
+        "language": "zh-CN",
+        "subject": {"playgroundId": "loops", "versionId": "sha256:course"},
+        "courseContext": {"playgroundId": "loops", "versionId": "sha256:course"},
+        "evidence": [
+            {
+                "schema": "learning.submission.requested",
+                "version": 1,
+                "data": {"event": "submission-requested"},
+            }
+        ],
+        "submission": {"source": "for item in range(3):\n    print(item)\n"},
+    }
+    serialized = json.dumps(plain(call["input"]), ensure_ascii=False, sort_keys=True)
+    for private_field in ("principal/", "accessCode", "jobKey", "session", "recordId"):
+        assert private_field not in serialized
+    schema = plain(call["output_schema"])
+    assert schema == plain(OUTPUT_SCHEMA)
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["summary", "findings", "recommendations", "limitations"]
+    result = read_all(store, result_log_id("user"))[0]
+    assert result.data["type"] == "learning.analysis.completed"
+    assert result.data["output"]["data"]["summary"] == "你已经能够正确使用 range 完成遍历。"
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw:
         durable_job_and_result_are_idempotent(Path(raw))
@@ -278,7 +341,9 @@ def main() -> int:
         transient_failure_reuses_the_frozen_job(Path(raw))
     with tempfile.TemporaryDirectory() as raw:
         invalid_output_is_a_terminal_failure(Path(raw))
-    print("learning analysis Jobs, Results, deduplication and retry semantics passed")
+    with tempfile.TemporaryDirectory() as raw:
+        feedback_pipeline_exposes_only_the_versioned_prompt_contract(Path(raw))
+    print("learning analysis Jobs, Results, retries and prompt contract passed")
     return 0
 
 
