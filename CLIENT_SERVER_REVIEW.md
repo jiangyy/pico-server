@@ -10,7 +10,7 @@
 
 ## Requirement
 
-同一提交在归档、教师查看和 AI 分析中必须指向同一学生、课程和 Revision；客户端入队后不允许调用方修改已接受的数据；密集同步通知不应排出等量全量读取，最后一次通知仍必须被覆盖。
+同一提交在归档、教师查看和 AI 分析中必须指向同一学生、Playground/Draft 和 Revision；客户端入队后不允许调用方修改已接受的数据；密集同步通知不应排出等量全量读取，最后一次通知仍必须被覆盖。
 
 ## Existing Contract / Consumers
 
@@ -26,7 +26,7 @@
 
 | 问题 | 代码证据 | 实际影响 |
 |---|---|---|
-| 提交解释重复且不一致 | `submission/worker.py`、`submission/read_model.py`、`review/submissions_view.py`、`learning_analysis/materializers.py` | 教师详情检查 draftId，worker/分析路径只检查 Principal；同一学生另一门课的源码可能被归档或分析为当前课 |
+| 提交解释重复且不一致 | `submission/worker.py`、`submission/read_model.py`、`review/submissions_view.py`、`learning_analysis/materializers.py` | 教师详情检查 draftId，worker/分析路径只检查 Principal；请求声明的 playgroundId 与 Revision 的 draftId 不一致时，源码可能被归档或分析为该请求的提交 |
 | 排队期间数据仍可变 | `apps/client/impl/client/writer.ts` 在异步读取 head 后才复制 data/requires | 总线的外层事件快照未固定嵌套数据；事件接收后修改对象，会改变持久化内容和依赖 |
 | 三套同形刷新队列 | `submission/history.ts`、`playground/catalog.ts`、`learning-analysis/projection.ts` | 每个通知排一次完整读取；突发通知造成冗余工作和延迟，三处还要分别维护失败与关闭行为 |
 
@@ -52,7 +52,7 @@
 
 ## Verification
 
-先新增跨课程提交拒绝、事件入队后修改、突发刷新/中途通知/失败恢复/dispose 的回归；确认旧代码可复现，再实现。运行服务端全套测试、客户端全套测试、TypeScript 检查和客户端构建。新测试必须被现有默认测试入口发现。
+先新增 Playground/Draft 与 Revision 不匹配时拒绝、事件入队后修改、突发刷新/中途通知/失败恢复/dispose 的回归；确认旧代码可复现，再实现。运行服务端全套测试、客户端全套测试、TypeScript 检查和客户端构建。新测试必须被现有默认测试入口发现。
 
 ## Unresolved / 后续单独决策
 
@@ -62,7 +62,7 @@
 
 ## 已实现与验证
 
-- [Submission 协议实现](apps/server/submission/protocol.py)集中解析请求及校验源码归属，四条消费路径已接入；同学生跨课程提交由成功归档改为拒绝，同课跨设备仍成功。请求身份与结果状态分开建模，列表继续展示尚未完成的提交。
+- [Submission 协议实现](apps/server/submission/protocol.py)集中解析请求及校验源码归属，四条消费路径已接入；Playground/Draft 与 Revision 不匹配时拒绝，同一 Playground 的另一设备 Revision 仍可提交。正常客户端流程提交当前 Playground 的 Revision；该检查用于防止不一致请求被归档或用于分析。请求身份与结果状态分开建模，列表继续展示尚未完成的提交。
 - [Client writer](../learn-python/apps/client/impl/client/writer.ts)在入队时固定整个请求；嵌套对象和依赖引用被调用方修改也不会改变入队内容。无效 JSON 值同步拒绝。
 - [刷新调度](../learn-python/apps/client/impl/refresh.ts)由目录、历史、反馈共同使用。测试场景中，第一次读取未完成时连续收到 20 次通知，读取从 21 次降到 2 次；这是该突发场景的结果，不是整体性能基准。
 - 先在旧实现复现上述失败，再验证修复。服务端 `./run-tests.sh` 共 17 个脚本通过；客户端 `npm run test:client` 共 44 个测试通过；`npm run check` 和 `npm run build:client` 通过。新增测试已由默认测试入口发现；修改的 Python 文件通过 Ruff。

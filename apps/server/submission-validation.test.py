@@ -75,13 +75,13 @@ class SubmissionValidationTest(unittest.TestCase):
                 with self.assertRaises(LearningAnalysisInvalidInput):
                     materializer.materialize(**arguments)
 
-    def test_another_course_is_rejected_before_archival_and_analysis(self):
+    def test_revision_from_another_draft_is_rejected_before_archival_and_analysis(self):
         self.check_consumers("student", "another-lesson", False)
 
     def test_another_student_is_rejected(self):
         self.check_consumers("another-student", "lesson", False)
 
-    def test_same_course_revision_from_another_device_is_valid(self):
+    def test_same_draft_revision_from_another_device_is_valid(self):
         self.check_consumers("student", "lesson", True)
 
 
