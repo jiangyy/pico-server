@@ -4,10 +4,10 @@ from collections.abc import Callable, Mapping
 from threading import Lock
 from typing import Protocol
 
-from apps.server.draft.protocol import decode_revision
-from apps.server.log_reads import find_record, read_all
-from apps.server.submission.logs import is_request_log, request_scope, result_log
-from apps.server.validation import require_position, require_text
+from apps.server.log_reads import read_all
+from apps.server.submission.logs import is_request_log, result_log
+from apps.server.submission.protocol import decode_request, read_source
+from apps.server.validation import require_non_blank_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 
@@ -89,37 +89,24 @@ class SubmissionRequestConsumer:
             }, ())
 
     def _complete(self, request: ReplicatedRecord) -> tuple[Mapping[str, object], tuple[Position, ...]]:
-        principal_id, _ = request_scope(request.log_id)
-        data = request.data
-        if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
-            raise ValueError("request is not a Submission")
-        submission_id = require_text(data.get("submissionId"), "submissionId")
-        playground_id = require_text(data.get("playgroundId"), "playgroundId")
-        revision = require_position(data.get("revision"), "revision")
-        if revision not in request.requires:
-            raise ValueError("Submission does not require its Revision")
-        revision_record = find_record(self._store, revision)
-        if revision_record is None:
-            raise ValueError("Submission Revision is missing")
-        decoded = decode_revision(revision_record)
-        if decoded["principalId"] != principal_id:
-            raise ValueError("Submission Revision belongs to another Principal")
+        submission = decode_request(request)
+        source = read_source(self._store, submission)
         tag = self._tags.create(
             idempotency_key=f"{request.log_id}:{request.id}",
-            submission_id=submission_id,
-            playground_id=playground_id,
-            revision=revision,
-            source=decoded["source"],
+            submission_id=submission.submission_id,
+            playground_id=submission.playground_id,
+            revision=submission.revision,
+            source=source,
         )
-        tag = require_text(tag, "tag")
+        tag = require_non_blank_text(tag, "tag")
         return ({
             "type": "submission.completed",
-            "submissionId": submission_id,
-            "playgroundId": playground_id,
+            "submissionId": submission.submission_id,
+            "playgroundId": submission.playground_id,
             "request": request.position.to_value(),
-            "revision": revision.to_value(),
+            "revision": submission.revision.to_value(),
             "tag": tag,
-        }, (revision,))
+        }, (submission.revision,))
 
 
 def _unique(positions: tuple[Position, ...], own_log: str) -> tuple[Position, ...]:

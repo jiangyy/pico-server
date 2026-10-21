@@ -5,13 +5,18 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
 
-from apps.server.draft.protocol import decode_revision
 from apps.server.learning_analysis.protocol import (
     LearningAnalysisInvalidInput,
     decode_evidence_data,
 )
 from apps.server.log_reads import find_record
 from apps.server.submission.logs import request_scope
+from apps.server.submission.protocol import (
+    SubmissionError,
+    decode_request,
+    read_source,
+    source_from_revision,
+)
 from apps.server.validation import require_position
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord
 
@@ -77,34 +82,19 @@ class SubmissionMaterializer:
         request_record = find_record(store, request)
         if request_record is None:
             raise LearningAnalysisInvalidInput("Submission request is missing")
-        request_data = request_record.data
-        if (
-            not isinstance(request_data, Mapping)
-            or request_data.get("type") != "submission.requested"
-        ):
-            raise LearningAnalysisInvalidInput("Referenced record is not a Submission request")
+        try:
+            submission = decode_request(request_record)
+        except SubmissionError as error:
+            raise LearningAnalysisInvalidInput(str(error)) from error
         subject = decoded["subject"]
         assert isinstance(subject, Mapping)
-        if request_data.get("playgroundId") != subject["playgroundId"]:
+        if submission.playground_id != subject["playgroundId"]:
             raise LearningAnalysisInvalidInput("Submission belongs to another Playground")
-        revision = require_position(
-            request_data.get("revision"),
-            "submission.revision",
-            error_type=LearningAnalysisInvalidInput,
-        )
-        if revision not in request_record.requires:
-            raise LearningAnalysisInvalidInput("Submission does not require its Revision")
-        revision_record = find_record(store, revision)
-        if revision_record is None:
-            raise LearningAnalysisInvalidInput("Submission Revision is missing")
         try:
-            revision_data = decode_revision(revision_record)
-        except ValueError as error:
-            raise LearningAnalysisInvalidInput("Submission Revision is invalid") from error
-        if revision_data["principalId"] != principal_id:
-            raise LearningAnalysisInvalidInput(
-                "Submission Revision belongs to another Principal"
-            )
+            read_source(store, submission)
+        except SubmissionError as error:
+            raise LearningAnalysisInvalidInput(str(error)) from error
+        revision = submission.revision
         return MaterializedEvidence(
             inputs=(
                 {"role": "submission-request", "record": request.to_value()},
@@ -139,16 +129,17 @@ class SubmissionMaterializer:
         detail = payload.get("data")
         if not isinstance(detail, Mapping) or set(detail) != {"request"}:
             raise LearningAnalysisInvalidInput("Evidence data is invalid")
-        request = _record_data(roles["submission-request"], "Submission request")
-        if request.get("type") != "submission.requested":
-            raise LearningAnalysisInvalidInput("Submission request type is invalid")
+        request_record = roles["submission-request"]
+        if not isinstance(request_record, ReplicatedRecord):
+            raise LearningAnalysisInvalidInput("Submission request is invalid")
         revision_record = roles["draft-revision"]
         if not isinstance(revision_record, ReplicatedRecord):
             raise LearningAnalysisInvalidInput("Draft Revision is invalid")
         try:
-            revision = decode_revision(revision_record)
-        except ValueError as error:
-            raise LearningAnalysisInvalidInput("Draft Revision is invalid") from error
+            submission = decode_request(request_record)
+            source = source_from_revision(submission, revision_record)
+        except SubmissionError as error:
+            raise LearningAnalysisInvalidInput(str(error)) from error
         context = roles["course-context"]
         if not isinstance(context, Mapping) or set(context) != {"schema", "version", "data"}:
             raise LearningAnalysisInvalidInput("Course context is invalid")
@@ -159,21 +150,12 @@ class SubmissionMaterializer:
             raise LearningAnalysisInvalidInput("Course context does not match the Job subject")
         if evidence.get("subject") != subject:
             raise LearningAnalysisInvalidInput("Evidence does not match the Job subject")
-        request_record = roles["submission-request"]
-        assert isinstance(request_record, ReplicatedRecord)
         evidence_request = require_position(
             detail["request"], "evidence.request", error_type=LearningAnalysisInvalidInput
         )
         if evidence_request != request_record.position:
             raise LearningAnalysisInvalidInput("Evidence does not reference the Job submission")
-        request_revision = require_position(
-            request.get("revision"),
-            "submission.revision",
-            error_type=LearningAnalysisInvalidInput,
-        )
-        if request_revision != revision_record.position:
-            raise LearningAnalysisInvalidInput("Submission does not reference the Job revision")
-        if request.get("playgroundId") != subject.get("playgroundId"):
+        if submission.playground_id != subject.get("playgroundId"):
             raise LearningAnalysisInvalidInput("Submission does not match the Job subject")
         return _freeze(
             {
@@ -187,7 +169,7 @@ class SubmissionMaterializer:
                         "data": {"event": "submission-requested"},
                     },
                 ),
-                "submission": {"source": revision["source"]},
+                "submission": {"source": source},
             }
         )
 

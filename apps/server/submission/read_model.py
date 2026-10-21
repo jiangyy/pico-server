@@ -7,12 +7,9 @@ from dataclasses import dataclass
 
 from apps.server.log_reads import PaginationStalled, read_all
 from apps.server.submission.logs import is_request_log, request_scope, result_log
+from apps.server.submission.protocol import SubmissionError, SubmissionRequest, decode_request
 from apps.server.validation import require_non_blank_position, require_non_blank_text
 from picopg.api import Position, ReplicaLogStore, ReplicatedRecord
-
-
-class SubmissionError(ValueError):
-    pass
 
 
 class SubmissionNotFound(SubmissionError):
@@ -20,13 +17,7 @@ class SubmissionNotFound(SubmissionError):
 
 
 @dataclass(frozen=True, slots=True)
-class Submission:
-    request: Position
-    principal_id: str
-    replica_id: str
-    submission_id: str
-    playground_id: str
-    revision: Position
+class Submission(SubmissionRequest):
     status: str
     tag: str | None = None
     message: str | None = None
@@ -116,27 +107,10 @@ class SubmissionReader:
     def _submission(
         self, request: ReplicatedRecord, result: ReplicatedRecord | None
     ) -> Submission:
-        principal_id, replica_id = request_scope(request.log_id)
-        data = request.data
-        if not isinstance(data, Mapping) or data.get("type") != "submission.requested":
-            raise SubmissionError("request is not a Submission")
-        submission_id = require_non_blank_text(
-            data.get("submissionId"),
-            "submissionId",
-            error_type=SubmissionError,
-        )
-        playground_id = require_non_blank_text(
-            data.get("playgroundId"),
-            "playgroundId",
-            error_type=SubmissionError,
-        )
-        revision = require_non_blank_position(
-            data.get("revision"),
-            "revision",
-            error_type=SubmissionError,
-        )
-        if revision not in request.requires:
-            raise SubmissionError("Submission does not require its Revision")
+        decoded = decode_request(request)
+        principal_id, replica_id = decoded.principal_id, decoded.replica_id
+        submission_id, playground_id = decoded.submission_id, decoded.playground_id
+        revision = decoded.revision
         if result is None:
             return Submission(
                 request.position, principal_id, replica_id, submission_id,

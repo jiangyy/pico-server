@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-from apps.server.draft.protocol import decode_revision
-from apps.server.log_reads import find_record
 from apps.server.review.comments import CommentPublisher
-from apps.server.submission.read_model import (
-    Submission,
-    SubmissionError,
-)
+from apps.server.submission.read_model import Submission
+from apps.server.submission.protocol import read_source
 from picopg.api import ReplicaLogStore
 
 
@@ -32,17 +28,10 @@ def detail_value(
     comments: CommentPublisher,
     submission: Submission,
 ) -> dict[str, object]:
-    revision_record = find_record(store, submission.revision)
-    if revision_record is None:
-        raise SubmissionError("Submission Revision is missing")
-    decoded = decode_revision(revision_record)
-    if decoded["principalId"] != submission.principal_id:
-        raise SubmissionError("Submission Revision belongs to another Principal")
-    if decoded["draftId"] != submission.playground_id:
-        raise SubmissionError("Submission Revision belongs to another Draft")
+    source = read_source(store, submission)
     value = summary_value(submission)
     value["request"] = submission.request.to_value()
-    value["source"] = decoded["source"]
+    value["source"] = source
     value["comments"] = [
         {
             "position": comment.position.to_value(),
