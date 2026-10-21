@@ -1,9 +1,16 @@
 __pycache__/
 *.py[cod]
 
+# Local provider credentials for learning-analysis experiments.
+apps/server/learning_analysis/lab/.env
+
 # 部署机的运行数据（app.db、裸仓库、generated/、artifacts/、runtime/、submissions/）
 # 只存在于那台机器上，不进库。
 data/
 
 # 教学页面（learn-python 的 dist/ 同步过来）。由 rsync 部署，不进库。
 site/
+
+# 外部参考仓库（学习分析领域开源项目），仅本地阅读，不进库。
+# 见 upstream-repos/README.md 的调研结论。
+upstream-repos/
