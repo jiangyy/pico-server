@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from collections.abc import Mapping
+"""Authorization for student-owned learning-event logs."""
 
 from apps.server.log_ids import decode_component, encode_component
 
@@ -56,40 +54,15 @@ def result_log_id(principal_id: str) -> str:
     return f"principal/{encode_component(principal_id, 'principalId')}/analysis/results"
 
 
-def job_log_id(principal_id: str) -> str:
-    return f"server/analysis/{encode_component(principal_id, 'principalId')}/jobs"
-
-
-def attempt_log_id(principal_id: str) -> str:
-    return f"server/analysis/{encode_component(principal_id, 'principalId')}/attempts"
-
-
-def is_evidence_log(log_id: str) -> bool:
-    parts = log_id.split("/")
-    return (
-        len(parts) == 5
-        and parts[0] == "principal"
-        and bool(parts[1])
-        and parts[2] == "analysis"
-        and bool(parts[3])
-        and parts[4] == "evidence"
-    )
-
-
-def evidence_logs(bindings: Mapping[str, str]) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            log_id
-            for log_id, access in bindings.items()
-            if access == "append" and is_evidence_log(log_id)
-        )
-    )
-
-
 def evidence_scope(log_id: str) -> tuple[str, str]:
-    if not is_evidence_log(log_id):
-        raise ValueError("Log is not a Learning Analysis Evidence Log")
     parts = log_id.split("/")
+    if (
+        len(parts) != 5
+        or parts[0] != "principal"
+        or parts[2] != "analysis"
+        or parts[4] != "evidence"
+    ):
+        raise ValueError("Log is not a Learning Analysis Evidence Log")
     return (
         decode_component(parts[1], "principalId"),
         decode_component(parts[3], "replicaId"),

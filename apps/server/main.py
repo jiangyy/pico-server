@@ -15,11 +15,6 @@ for _entry in (_ROOT, _SRC):
 
 from apps.server.application import PicoPGHttpServer  # noqa: E402
 from apps.server.authentication.model import PrincipalAccount, PrincipalSession  # noqa: E402
-from apps.server.learning_analysis.openai_provider import (  # noqa: E402
-    OpenAIStructuredLearningProvider,
-)
-from apps.server.learning_analysis.pipeline import LearningFeedbackAnalyzer  # noqa: E402
-from apps.server.learning_analysis.worker import LearningAnalyzer  # noqa: E402
 from apps.server.submission.git_tags import GitSubmissionTagWriter  # noqa: E402
 from apps.server.submission.worker import SubmissionTagWriter  # noqa: E402
 from apps.server.authentication.registry import FileSessionRegistry  # noqa: E402
@@ -61,16 +56,6 @@ def build_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--insecure-cookies",
         action="store_true",
         help="Allow browser Session cookies over local HTTP; never use in production.",
-    )
-    parser.add_argument(
-        "--learning-model",
-        default=os.environ.get("PICOPG_LEARNING_MODEL"),
-        help="Enable learning analysis with this OpenAI model (or PICOPG_LEARNING_MODEL).",
-    )
-    parser.add_argument(
-        "--learning-api-base",
-        default=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        help="OpenAI-compatible API base URL (or OPENAI_BASE_URL).",
     )
     return parser.parse_args(argv)
 
@@ -222,26 +207,6 @@ def load_token(data_dir: Path, argument: str | None) -> str:
     return token
 
 
-def load_learning_analyzer(
-    model: str | None,
-    *,
-    api_key: str | None,
-    api_base: str,
-) -> LearningAnalyzer | None:
-    if model is None:
-        return None
-    if not model.strip():
-        raise ValueError("learning model must be non-empty")
-    if api_key is None or not api_key.strip():
-        raise ValueError("OPENAI_API_KEY is required when learning analysis is enabled")
-    provider = OpenAIStructuredLearningProvider(
-        api_key=api_key,
-        model=model,
-        base_url=api_base,
-    )
-    return LearningFeedbackAnalyzer(provider)
-
-
 def build_server(
     data_dir: Path,
     *,
@@ -253,7 +218,6 @@ def build_server(
     principal_accounts: list[PrincipalAccount] | None = None,
     secure_cookies: bool = True,
     submission_tag_writer: SubmissionTagWriter | None = None,
-    learning_analyzer: LearningAnalyzer | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
     return PicoPGHttpServer(
@@ -267,7 +231,6 @@ def build_server(
         session_registry=FileSessionRegistry(data_dir / "auth" / "sessions.json"),
         secure_cookies=secure_cookies,
         submission_tag_writer=submission_tag_writer,
-        learning_analyzer=learning_analyzer,
     )
 
 
@@ -282,11 +245,6 @@ def main(argv: list[str] | None = None) -> int:
         bindings = load_bindings(arguments.binding, arguments.binding_config)
         principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
-        learning_analyzer = load_learning_analyzer(
-            arguments.learning_model,
-            api_key=os.environ.get("OPENAI_API_KEY"),
-            api_base=arguments.learning_api_base,
-        )
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)
         return 2
@@ -300,15 +258,12 @@ def main(argv: list[str] | None = None) -> int:
         principal_accounts=principal_accounts,
         secure_cookies=not arguments.insecure_cookies,
         submission_tag_writer=submission_tag_writer,
-        learning_analyzer=learning_analyzer,
     )
     host, port = server.server_address
     logger.info(
         "replica server listening on http://%s:%s with %d Log binding(s)",
         host, port, len(server.bindings),
     )
-    if learning_analyzer is not None:
-        logger.info("learning analysis enabled with model %s", arguments.learning_model)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
