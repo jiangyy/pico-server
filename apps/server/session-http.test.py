@@ -142,6 +142,31 @@ def main() -> None:
             )
             assert status == 201 and restored == identity
             restarted_cookie = _cookies(headers)["picopg_session"]
+
+            # Native clients get their tokens in the body and present the session as a Bearer token.
+            native = {"X-Pico-Client": "native"}
+            status, headers, issued = _request(
+                server, "POST", "/api/v1/session", value={"accessCode": "student-code"}, headers=native,
+            )
+            assert status == 201 and not _cookies(headers)
+            assert set(issued) == {"principalId", "replicaId", "sessionToken", "deviceToken", "expiresAt"}
+            bearer = {"Authorization": f"Bearer {issued['sessionToken']}"}
+            status, _, current = _request(server, "GET", "/api/v1/replica/identity", headers=bearer)
+            assert status == 200 and current["replicaId"] == issued["replicaId"]
+            status, _, again = _request(
+                server, "POST", "/api/v1/session",
+                value={"accessCode": "student-code", "deviceToken": issued["deviceToken"]}, headers=native,
+            )
+            assert status == 201 and again["replicaId"] == issued["replicaId"], "the device token restores the Replica"
+            status, _, _ = _request(server, "DELETE", "/api/v1/session", headers=bearer)
+            assert status == 200
+            status, _, _ = _request(server, "GET", "/api/v1/replica/identity", headers=bearer)
+            assert status == 401
+            status, _, _ = _request(
+                server, "POST", "/api/v1/session",
+                value={"accessCode": "student-code", "deviceToken": issued["deviceToken"]},
+            )
+            assert status == 400, "browsers send the device token only as a cookie"
         finally:
             _stop(server, thread)
 
@@ -157,7 +182,7 @@ def main() -> None:
         finally:
             _stop(server, thread)
 
-    print("browser Session bootstrap, logout, Replica restore and operator Session passed")
+    print("browser and native Session bootstrap, logout, Replica restore and operator Session passed")
 
 
 if __name__ == "__main__":

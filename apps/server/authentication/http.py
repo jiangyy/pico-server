@@ -44,8 +44,11 @@ def _student_session(handler: PicoRequestHandler) -> None:
         }, (("Cache-Control", "no-store"),))
         return
     if handler.command == "POST":
+        # Native clients (Electron) keep tokens in OS-encrypted storage instead of a cookie jar.
+        native = handler.headers.get("X-Pico-Client") == "native"
         body = handler._read_json()
-        if not isinstance(body, dict) or set(body) != {"accessCode"}:
+        allowed = {"accessCode", "deviceToken"} if native else {"accessCode"}
+        if not isinstance(body, dict) or "accessCode" not in body or not set(body) <= allowed:
             handler._error(400, "session.invalid", "body must contain accessCode")
             return
         access_code = body["accessCode"]
@@ -60,7 +63,20 @@ def _student_session(handler: PicoRequestHandler) -> None:
         if account is None:
             handler._error(401, "auth.required", "valid access code required")
             return
-        session = registry.bootstrap(account.principal_id, handler._cookie("picopg_device"))
+        device = body.get("deviceToken") if native else handler._cookie("picopg_device")
+        if device is not None and (not isinstance(device, str) or not device):
+            handler._error(400, "session.invalid", "deviceToken must be non-empty")
+            return
+        session = registry.bootstrap(account.principal_id, device)
+        if native:
+            handler._send_json(201, {
+                "principalId": session.identity.principal_id,
+                "replicaId": session.identity.replica_id,
+                "sessionToken": session.session_token,
+                "deviceToken": session.device_token,
+                "expiresAt": session.expires_at,
+            }, (("Cache-Control", "no-store"),))
+            return
         handler._send_json(201, {
             "principalId": session.identity.principal_id,
             "replicaId": session.identity.replica_id,
@@ -71,7 +87,7 @@ def _student_session(handler: PicoRequestHandler) -> None:
         ))
         return
     if handler.command == "DELETE":
-        token = handler._cookie("picopg_session")
+        token = handler._bearer_token() or handler._cookie("picopg_session")
         if token is not None:
             registry.revoke(token)
         handler._send_json(200, {"status": "signedOut"}, (
