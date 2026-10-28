@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from apps.server.course_ai.agent import agent_request
+from apps.server.course_ai.agent import agent_request, tutor_request
 from apps.server.course_ai.service import CourseAiError
 from apps.server.protocol import _ResponseSent, logger
 
@@ -12,8 +12,8 @@ if TYPE_CHECKING:
 
 
 def dispatch_course_ai(handler: PicoRequestHandler, path: str) -> bool:
-    if path == "/api/v1/ai/agent":
-        return _dispatch_agent(handler)
+    if path in ("/api/v1/ai/agent", "/api/v1/ai/tutor"):
+        return _dispatch_agent(handler, path)
     if path != "/api/v1/ai/course":
         return False
     try:
@@ -41,7 +41,7 @@ def dispatch_course_ai(handler: PicoRequestHandler, path: str) -> bool:
     return True
 
 
-def _dispatch_agent(handler: PicoRequestHandler) -> bool:
+def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
     try:
         if handler.command != "POST":
             handler._error(405, "method.not_allowed", "method not allowed")
@@ -52,8 +52,11 @@ def _dispatch_agent(handler: PicoRequestHandler) -> bool:
         if handler.server.course_agent is None:
             handler._error(503, "ai.unavailable", "course agent is not configured")
             return True
-        playground_id, version_id, messages, tools = agent_request(handler._read_json())
-        turn = handler.server.course_agent.step(playground_id, version_id, messages, tools)
+        if path == "/api/v1/ai/tutor":
+            turn = handler.server.course_agent.tutor(*tutor_request(handler._read_json()))
+        else:
+            playground_id, version_id, messages, tools = agent_request(handler._read_json())
+            turn = handler.server.course_agent.step(playground_id, version_id, messages, tools)
         handler._send_json(200, turn, (("Cache-Control", "no-store"),))
     except ValueError as error:
         handler._error(400, "ai.request.invalid", str(error))

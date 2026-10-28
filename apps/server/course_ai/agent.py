@@ -17,6 +17,8 @@ class CourseAgent(Protocol):
         messages: list[dict[str, object]], tools: list[dict[str, object]],
     ) -> dict[str, object]: ...
 
+    def tutor(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> dict[str, object]: ...
+
 
 MAX_MESSAGES = 240
 MAX_CONTENT = 60_000
@@ -40,6 +42,14 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
 - 对学生说的话要短：一次只讲一件事，最多 5 句，可以用 Markdown 和 `代码`。
 - 工具失败时读返回的原因，换参数或换办法，不要重复同样的调用。"""
 
+    TUTOR = """你是 Pico，学生在整个学习平台上的导师，面对的是初中生。你看得到这个学生的全部课程、打开过的课、提交与老师的批注，以及知识地图。
+你负责：接下来学什么、学得怎么样、老师的批注说了什么、某门课练什么。具体某一行代码的问题，请学生打开那门课问课程里的 AI。
+
+怎么做：
+- 只根据用户消息里的学习数据说话，不要编造课程、提交或批注。
+- 推荐课程时用 offer 放上「打开」或「回到」这门课的按钮，按钮最多 3 个。
+- 对学生说的话要短：最多 5 句，具体、鼓励，可以用 Markdown。"""
+
     def __init__(self, model: ToolModel, skills: CourseSkillRepository) -> None:
         self.model = model
         self.skills = skills
@@ -56,12 +66,23 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
         reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools])
         return _turn(reply)
 
+    def tutor(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> dict[str, object]:
+        chat = [{"role": "system", "content": self.TUTOR}, *(_chat_message(message) for message in messages)]
+        return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools]))
+
     def _skill(self, playground_id: str) -> dict[str, object] | None:
         try:
             skill = self.skills.read(playground_id)
         except CourseAiError:
             return None
         return {key: value for key, value in skill.items() if key not in ("actions", "course")}
+
+
+def tutor_request(value: object) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if not isinstance(value, dict) or set(value) != {"messages", "tools"}:
+        raise ValueError("body must contain messages and tools")
+    _, _, messages, tools = agent_request({"playgroundId": "tutor", "versionId": "tutor", **value})
+    return messages, tools
 
 
 def agent_request(value: object) -> tuple[str, str, list[dict[str, object]], list[dict[str, object]]]:

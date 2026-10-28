@@ -81,9 +81,18 @@ for invalid in (
         raise AssertionError(f"request must be rejected: {invalid}")
 
 
+# 导师用同一个模型，换成平台层的系统提示，不带课程。
+tutor_model = RecordingModel([{"content": "先把汉诺塔收个尾。"}])
+assert CourseAgentService(tutor_model, skills).tutor(MESSAGES[:1], TOOLS)["content"] == "先把汉诺塔收个尾。"
+assert tutor_model.calls[0][0][0]["content"].startswith("你是 Pico，学生在整个学习平台上的导师")
+
+
 class FakeAgent:
     def step(self, playground_id, version_id, messages, tools):
         return {"content": f"{playground_id}:{len(messages)}", "calls": []}
+
+    def tutor(self, messages, tools):
+        return {"content": f"tutor:{len(messages)}", "calls": []}
 
 
 def post(connection, token, body):
@@ -107,6 +116,12 @@ with tempfile.TemporaryDirectory() as temporary:
     connection = http.client.HTTPConnection(*server.server_address)
     body = {"playgroundId": "hello", "versionId": "v1", "messages": MESSAGES, "tools": TOOLS}
     assert post(connection, "student-token", body) == (200, {"content": "hello:3", "calls": []})
+    connection.request(
+        "POST", "/api/v1/ai/tutor", json.dumps({"messages": MESSAGES[:1], "tools": []}).encode(),
+        {"Authorization": "Bearer student-token", "Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    assert (response.status, json.loads(response.read())) == (200, {"content": "tutor:1", "calls": []})
     status, error = post(connection, "wrong-token", body)
     assert status == 401 and error["error"]["code"] == "auth.required"
     status, error = post(connection, "student-token", {**body, "tools": "act"})
