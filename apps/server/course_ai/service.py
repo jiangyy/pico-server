@@ -40,12 +40,13 @@ class CourseSkillRepository:
 
 
 class OpenAiCompatibleChatModel:
-    def __init__(self, base_url: str, model: str, api_key: str | None = None) -> None:
+    def __init__(self, base_url: str, model: str, api_key: str | None = None, effort: str | None = None) -> None:
         if not base_url.startswith(("http://", "https://")) or not model:
             raise ValueError("AI base URL must be HTTP(S) and model must be non-empty")
         self.url = f"{base_url.rstrip('/')}/chat/completions"
         self.model = model
         self.api_key = api_key
+        self.effort = effort
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         body = json.dumps({
@@ -66,6 +67,26 @@ class OpenAiCompatibleChatModel:
         if not isinstance(content, str) or not content.strip():
             raise CourseAiError("model returned no content")
         return content
+
+    def step(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> dict[str, object]:
+        """一次带工具的补全，返回 assistant 消息原样（content、tool_calls、reasoning_content）。"""
+        request: dict[str, object] = {"model": self.model, "messages": messages, "temperature": 0.3}
+        if tools:
+            request["tools"] = tools
+        if self.effort:
+            request["reasoning_effort"] = self.effort
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        try:
+            with urlopen(Request(self.url, body, headers, method="POST"), timeout=120) as response:
+                message = json.loads(response.read().decode("utf-8"))["choices"][0]["message"]
+        except Exception as error:
+            raise CourseAiError("model request failed") from error
+        if not isinstance(message, dict):
+            raise CourseAiError("model returned no message")
+        return message
 
 
 class CourseAiService:

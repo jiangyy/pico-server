@@ -19,6 +19,8 @@ from apps.server.submission.git_tags import GitSubmissionTagWriter  # noqa: E402
 from apps.server.submission.worker import SubmissionTagWriter  # noqa: E402
 from apps.server.authentication.registry import FileSessionRegistry  # noqa: E402
 from apps.server.course_ai import (  # noqa: E402
+    CourseAgent,
+    CourseAgentService,
     CourseAi,
     CourseAiService,
     CourseSkillRepository,
@@ -224,6 +226,18 @@ def load_course_ai() -> CourseAi | None:
     return CourseAiService(chat, CourseSkillRepository(_ROOT / "apps/server/course_ai/skills"))
 
 
+def load_course_agent() -> CourseAgent | None:
+    """与课程 AI 同一个模型；PICOPG_AI_EFFORT 可选（如 low），推理模型据此少想一点、答得更快。"""
+    base_url = os.environ.get("PICOPG_AI_BASE_URL")
+    model = os.environ.get("PICOPG_AI_MODEL")
+    if not base_url or not model:
+        return None
+    chat = OpenAiCompatibleChatModel(
+        base_url, model, os.environ.get("PICOPG_AI_API_KEY"), os.environ.get("PICOPG_AI_EFFORT") or None,
+    )
+    return CourseAgentService(chat, CourseSkillRepository(_ROOT / "apps/server/course_ai/skills"))
+
+
 def build_server(
     data_dir: Path,
     *,
@@ -236,6 +250,7 @@ def build_server(
     secure_cookies: bool = True,
     submission_tag_writer: SubmissionTagWriter | None = None,
     course_ai: CourseAi | None = None,
+    course_agent: CourseAgent | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
     return PicoPGHttpServer(
@@ -250,6 +265,7 @@ def build_server(
         secure_cookies=secure_cookies,
         submission_tag_writer=submission_tag_writer,
         course_ai=course_ai,
+        course_agent=course_agent,
     )
 
 
@@ -265,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
         course_ai = load_course_ai()
+        course_agent = load_course_agent()
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)
         return 2
@@ -279,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         secure_cookies=not arguments.insecure_cookies,
         submission_tag_writer=submission_tag_writer,
         course_ai=course_ai,
+        course_agent=course_agent,
     )
     host, port = server.server_address
     logger.info(

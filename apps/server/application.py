@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from apps.server.authentication.http import dispatch_session
-from apps.server.course_ai import CourseAi
+from apps.server.course_ai import CourseAgent, CourseAi
 from apps.server.course_ai.http import dispatch_course_ai
 from apps.server.authentication.model import (
     CompositeAuthenticator,
@@ -64,6 +64,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         secure_cookies: bool = True,
         submission_tag_writer: SubmissionTagWriter | None = None,
         course_ai: CourseAi | None = None,
+        course_agent: CourseAgent | None = None,
     ) -> None:
         self.workers = None
         sessions = tuple(principal_sessions)
@@ -123,6 +124,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.session_registry = session_registry
         self.secure_cookies = secure_cookies
         self.course_ai = course_ai
+        self.course_agent = course_agent
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
         )
