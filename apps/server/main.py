@@ -18,6 +18,12 @@ from apps.server.authentication.model import PrincipalAccount, PrincipalSession 
 from apps.server.submission.git_tags import GitSubmissionTagWriter  # noqa: E402
 from apps.server.submission.worker import SubmissionTagWriter  # noqa: E402
 from apps.server.authentication.registry import FileSessionRegistry  # noqa: E402
+from apps.server.course_ai import (  # noqa: E402
+    CourseAi,
+    CourseAiService,
+    CourseSkillRepository,
+    OpenAiCompatibleChatModel,
+)
 from picopg.impl.file_replica_log import FileReplicaLogStore  # noqa: E402
 
 
@@ -207,6 +213,17 @@ def load_token(data_dir: Path, argument: str | None) -> str:
     return token
 
 
+def load_course_ai() -> CourseAi | None:
+    base_url = os.environ.get("PICOPG_AI_BASE_URL")
+    model = os.environ.get("PICOPG_AI_MODEL")
+    if base_url is None and model is None:
+        return None
+    if not base_url or not model:
+        raise ValueError("PICOPG_AI_BASE_URL and PICOPG_AI_MODEL must be set together")
+    chat = OpenAiCompatibleChatModel(base_url, model, os.environ.get("PICOPG_AI_API_KEY"))
+    return CourseAiService(chat, CourseSkillRepository(_ROOT / "apps/server/course_ai/skills"))
+
+
 def build_server(
     data_dir: Path,
     *,
@@ -218,6 +235,7 @@ def build_server(
     principal_accounts: list[PrincipalAccount] | None = None,
     secure_cookies: bool = True,
     submission_tag_writer: SubmissionTagWriter | None = None,
+    course_ai: CourseAi | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
     return PicoPGHttpServer(
@@ -231,6 +249,7 @@ def build_server(
         session_registry=FileSessionRegistry(data_dir / "auth" / "sessions.json"),
         secure_cookies=secure_cookies,
         submission_tag_writer=submission_tag_writer,
+        course_ai=course_ai,
     )
 
 
@@ -245,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         bindings = load_bindings(arguments.binding, arguments.binding_config)
         principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
+        course_ai = load_course_ai()
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)
         return 2
@@ -258,12 +278,15 @@ def main(argv: list[str] | None = None) -> int:
         principal_accounts=principal_accounts,
         secure_cookies=not arguments.insecure_cookies,
         submission_tag_writer=submission_tag_writer,
+        course_ai=course_ai,
     )
     host, port = server.server_address
     logger.info(
         "replica server listening on http://%s:%s with %d Log binding(s)",
         host, port, len(server.bindings),
     )
+    if course_ai is None:
+        logger.info("course AI disabled; clients will use their offline answers")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
