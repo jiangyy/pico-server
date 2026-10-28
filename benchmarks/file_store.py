@@ -8,10 +8,8 @@ from pathlib import Path
 from time import perf_counter
 
 
-ROOT = Path(__file__).resolve().parents[1]
-for entry in (ROOT, ROOT / "src"):
-    if str(entry) not in sys.path:
-        sys.path.insert(0, str(entry))
+# 直接以脚本运行（部署机上没有安装 picopg）：从仓库的 src/ 导入。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picopg.replica import Position, ReplicatedRecord, record_id_of  # noqa: E402
 from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402

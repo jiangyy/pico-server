@@ -52,4 +52,4 @@ python3 deploy/backup.py restore --archive /path/to/snapshot.tar.gz --target /tm
 
 Verify `/tmp/picopg-restored`, stop the service, move the current `data` directory aside, move the verified restore into its place, start the service, and run `deploy/restart-smoke.sh`. Keep the old directory until the classroom data has been checked.
 
-`python3 deploy/backup.test.py` performs a local create/restore comparison and verifies path-traversal refusal. It does not replace an off-host restore drill.
+`./run-tests.sh tests.test_backup` performs a local create/restore comparison and verifies path-traversal refusal. It does not replace an off-host restore drill.

@@ -18,11 +18,8 @@ from urllib.parse import quote, urljoin, urlsplit
 from uuid import uuid4
 
 
-_ROOT = Path(__file__).resolve().parents[1]
-_SRC = _ROOT / "src"
-for _entry in (_ROOT, _SRC):
-    if str(_entry) not in sys.path:
-        sys.path.insert(0, str(_entry))
+# 直接以脚本运行（部署机上没有安装 picopg）：从仓库的 src/ 导入。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picopg.server.drafts.protocol import (  # noqa: E402
     decision_log_id,
