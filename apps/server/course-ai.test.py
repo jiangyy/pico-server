@@ -93,12 +93,29 @@ with tempfile.TemporaryDirectory() as temporary:
 skills = CourseSkillRepository(Path(__file__).parent / "course_ai" / "skills")
 model = SequencedModel([
     '{"text":"请看第 99 行。"}',
-    '{"text":"先看 `break` 停掉哪一层。","primary":{"action":"code.locate","label":"定位","args":{"line":2}}}',
+    '{"text":"先看 `break` 停掉哪一层。","primary":{"action":"code.locate","args":{"line":2}}}',
 ])
 service = CourseAiService(model, skills)
 reply = service.reply("sudoku", "v1", request)
 assert reply["primary"]["args"] == {"line": 2}
+assert reply["primary"]["label"] == "定位这一行"
 assert len(model.messages) == 2 and "上个 JSON 无效" in model.messages[1][-1]["content"]
+
+contextual = {**request, "context": {
+    "source": "x = 1\nprint(x)",
+    "moment": {
+        "step": 2, "steps": 3, "line": 2, "occurrence": None,
+        "frames": [], "globals": {"x": 1}, "stdout": "",
+    },
+}}
+short_model = SequencedModel([
+    '{"text":"看当前这一步。","actions":["trace.seek",{"id":"code.locate"}]}'
+])
+short_reply = CourseAiService(short_model, skills).reply("sudoku", "v1", contextual)
+assert short_reply["actions"] == [
+    {"action": "trace.seek", "label": "跳到这一步", "args": {"step": 2}},
+    {"action": "code.locate", "label": "定位这一行", "args": {"line": 2}},
+]
 
 bad_model = SequencedModel(['{"text":"答案","primary":{"action":"source.replace","label":"替换"}}'] * 2)
 try:

@@ -71,7 +71,11 @@ class OpenAiCompatibleChatModel:
 class CourseAiService:
     SYSTEM = (
         "你是面向初中生的 Python 学习助手。只使用给定事实，一次只解释一件事，"
-        "结尾给一个小问题；不要直接贴完整答案。只输出 title/text/primary/actions JSON。"
+        "结尾给一个小问题；不要直接贴完整答案。只输出 JSON："
+        '{"title":"标题","text":"正文","primary":{"action":"动作 id","label":"按钮文字",'
+        '"args":{}},"actions":[]}。primary、actions 和动作 label 可以省略；动作不能只写 id 字符串。'
+        'trace.seek 的 args 是 {"step":当前步整数}；code.locate 是 {"line":源码行号}；'
+        "selection.locate 和 python.run 没有参数。不确定参数时省略动作。"
     )
 
     def __init__(self, model: ChatModel, skills: CourseSkillRepository) -> None:
@@ -99,7 +103,10 @@ class CourseAiService:
                 error = caught
                 messages.extend([
                     {"role": "assistant", "content": content},
-                    {"role": "user", "content": f"上个 JSON 无效：{caught}。只重写合法 JSON。"},
+                    {"role": "user", "content": (
+                        f"上个 JSON 无效：{caught}。只重写合法 JSON；"
+                        '动作格式必须是 {"action":"允许的 id","args":{}}，不能只写 id 字符串。'
+                    )},
                 ])
         raise CourseAiError("model returned invalid replies twice") from error
 
@@ -164,21 +171,29 @@ def _reply_value(content: str, skill: dict[str, object], request: dict[str, obje
 
 
 def _action_value(value: object, allowed: frozenset[str], request: dict[str, object]) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) - {"action", "label", "args"}:
-        raise CourseAiError("action is invalid")
-    action, label, args = value.get("action"), value.get("label"), value.get("args")
-    if action not in allowed or not isinstance(label, str) or not label.strip():
-        raise CourseAiError("action is not allowed")
+    if isinstance(value, str):
+        value = {"action": value}
+    if not isinstance(value, dict) or set(value) - {"action", "id", "label", "args"}:
+        raise CourseAiError("each action must name an allowed action and optional args")
+    action, alias, args = value.get("action"), value.get("id"), value.get("args")
+    if action is None:
+        action = alias
+    elif alias is not None and alias != action:
+        raise CourseAiError("action and id must not disagree")
+    if not isinstance(action, str) or action not in allowed or action not in _ACTION_LABELS:
+        raise CourseAiError("action id must be allowed")
     if args is not None and not isinstance(args, dict):
         raise CourseAiError("action args are invalid")
-    if action in ("selection.locate", "python.run") and args is not None:
+    if action in ("selection.locate", "python.run") and args not in (None, {}):
         raise CourseAiError("action does not accept args")
     context = request.get("context")
     source = context.get("source", "") if isinstance(context, dict) else ""
     moment = context.get("moment") if isinstance(context, dict) else None
     if action == "code.locate":
+        if args is None and isinstance(moment, dict) and isinstance(moment.get("line"), int):
+            args = {"line": moment["line"]}
         if not isinstance(args, dict) or set(args) - {"line", "occurrence"}:
-            raise CourseAiError("code.locate args are invalid")
+            raise CourseAiError("code.locate requires args with a source line")
         line = args.get("line")
         if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= str(source).count("\n") + 1:
             raise CourseAiError("code.locate line is invalid")
@@ -187,7 +202,21 @@ def _action_value(value: object, allowed: frozenset[str], request: dict[str, obj
             raise CourseAiError("code.locate occurrence is invalid")
     if action == "trace.seek":
         steps = moment.get("steps") if isinstance(moment, dict) else None
+        if args is None and isinstance(moment, dict) and isinstance(moment.get("step"), int):
+            args = {"step": moment["step"]}
         step = args.get("step") if isinstance(args, dict) else None
         if isinstance(step, bool) or not isinstance(step, int) or not isinstance(steps, int) or not 1 <= step <= steps:
-            raise CourseAiError("trace.seek step is invalid")
-    return value
+            raise CourseAiError("trace.seek requires args with an integer step inside the current Trace")
+    return {
+        "action": action,
+        "label": _ACTION_LABELS[action],
+        **({} if args is None else {"args": args}),
+    }
+
+
+_ACTION_LABELS = {
+    "selection.locate": "定位执行",
+    "code.locate": "定位这一行",
+    "trace.seek": "跳到这一步",
+    "python.run": "运行代码",
+}
