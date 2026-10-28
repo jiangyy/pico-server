@@ -6,10 +6,11 @@ After=network.target
 Type=simple
 WorkingDirectory=%h/picopg
 EnvironmentFile=%h/.config/picopg/server.env
-ExecStart=/usr/bin/python3 %h/picopg/apps/server/main.py --host 127.0.0.1 --port 8001 --data %h/picopg/data --principal-config %h/picopg/config/principals.json --submission-repositories %h/picopg/config/submissions.json
+ExecStart=/usr/bin/python3 -m picopg.server --host 127.0.0.1 --port 8001 --data %h/picopg/data --principal-config %h/picopg/config/principals.json --submission-repositories %h/picopg/config/submissions.json
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=%h/picopg/src
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

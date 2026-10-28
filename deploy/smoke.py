@@ -24,16 +24,16 @@ for _entry in (_ROOT, _SRC):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
-from apps.server.draft.protocol import (  # noqa: E402
+from picopg.server.drafts.protocol import (  # noqa: E402
     decision_log_id,
     project_draft,
     request_log_id,
     revision_log_id,
 )
-from apps.server.log_ids import encode_component  # noqa: E402
-from apps.server.review.comments import comment_log_id  # noqa: E402
-from apps.server.submission.logs import result_log  # noqa: E402
-from picopg.api import Position, ReplicatedRecord, record_id_of  # noqa: E402
+from picopg.server.common.ids import encode_component  # noqa: E402
+from picopg.server.review.comments import comment_log_id  # noqa: E402
+from picopg.server.submissions.logs import result_log  # noqa: E402
+from picopg.replica import Position, ReplicatedRecord, record_id_of  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)

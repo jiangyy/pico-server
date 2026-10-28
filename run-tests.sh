@@ -7,9 +7,9 @@ log=$(mktemp "${TMPDIR:-/tmp}/picopg-tests.XXXXXX")
 trap 'rm -f "$log"' EXIT HUP INT TERM
 
 failed=0
-for test in $(find apps deploy tests -name '*.test.py' | sort); do
+for test in tests/test_*.py; do
     printf '%-45s' "$test"
-    if python3 "$test" >"$log" 2>&1; then
+    if PYTHONPATH=src:. python3 "$test" >"$log" 2>&1; then
         echo ok
     else
         echo FAIL
