@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
 from picopg.server.classroom.roster import ClassRosterError
-from picopg.server.replication import _ResponseSent, logger
+from picopg.server.replication import ResponseSent, logger
 from picopg.replica import InvalidReplicaData
 
 if TYPE_CHECKING:
@@ -16,13 +16,13 @@ def dispatch_classroom(handler: PicoRequestHandler, path: str) -> bool:
     if class_id is None:
         return False
     try:
-        if not handler._admin_authorized():
-            handler._error(401, "auth.required", "valid operator token required")
+        if not handler.operator_authorized():
+            handler.error(401, "auth.required", "valid operator token required")
             return True
         if handler.command != "POST":
-            handler._error(405, "method.not_allowed", "method not allowed")
+            handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        body = handler._read_json()
+        body = handler.read_json()
         if not isinstance(body, dict) or set(body) != {"teachers", "students"}:
             raise ClassRosterError("body must contain teachers and students")
         position = handler.server.class_rosters.replace(
@@ -30,14 +30,14 @@ def dispatch_classroom(handler: PicoRequestHandler, path: str) -> bool:
             body["teachers"],
             body["students"],
         )
-        handler._send_json(201, {"position": position.to_value()})
+        handler.send_json(201, {"position": position.to_value()})
     except (ClassRosterError, InvalidReplicaData) as error:
-        handler._error(400, "class.invalid", str(error))
-    except _ResponseSent:
+        handler.error(400, "class.invalid", str(error))
+    except ResponseSent:
         pass
     except Exception:
         logger.exception("class roster request failed")
-        handler._error(500, "server.failure", "server failure")
+        handler.error(500, "server.failure", "server failure")
     return True
 
 

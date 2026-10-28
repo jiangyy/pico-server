@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
-from picopg.server.replication import _ResponseSent, logger
+from picopg.server.replication import ResponseSent, logger
 from picopg.server.review.comments import CommentError
 from picopg.server.submissions.reader import SubmissionError, SubmissionNotFound
 from picopg.server.submissions.views import detail_value, summary_value
@@ -19,37 +19,37 @@ def dispatch_review(handler: PicoRequestHandler, path: str) -> bool:
     if submission is None and comment is None:
         return False
     try:
-        if not handler._admin_authorized():
-            handler._error(401, "auth.required", "valid operator token required")
+        if not handler.operator_authorized():
+            handler.error(401, "auth.required", "valid operator token required")
             return True
         if submission is not None:
             _submission(handler, *submission)
         else:
             _comment(handler, *comment)
     except SubmissionNotFound as error:
-        handler._error(404, "submission.not_found", str(error))
+        handler.error(404, "submission.not_found", str(error))
     except (CommentError, SubmissionError, InvalidReplicaData) as error:
-        handler._error(
+        handler.error(
             400,
             "submission.invalid" if submission is not None else "comment.invalid",
             str(error),
         )
-    except _ResponseSent:
+    except ResponseSent:
         pass
     except Exception:
         logger.exception("review request failed")
-        handler._error(500, "server.failure", "server failure")
+        handler.error(500, "server.failure", "server failure")
     return True
 
 def _submission(handler: PicoRequestHandler, action: str, request_record_id: str) -> None:
     if action == "list" and handler.command == "GET":
-        handler._send_json(200, {
+        handler.send_json(200, {
             "submissions": [summary_value(item) for item in handler.server.submissions.list()]
         }, (("Cache-Control", "no-store"),))
         return
     if action == "detail" and handler.command == "GET":
         submission = handler.server.submissions.get(request_record_id)
-        handler._send_json(
+        handler.send_json(
             200,
             detail_value(
                 handler.server.store,
@@ -60,7 +60,7 @@ def _submission(handler: PicoRequestHandler, action: str, request_record_id: str
         )
         return
     if action == "comment" and handler.command == "POST":
-        body = handler._read_json()
+        body = handler.read_json()
         if not isinstance(body, dict) or set(body) != {"author", "text"}:
             raise CommentError("comment body must contain author and text")
         submission = handler.server.submissions.get(request_record_id)
@@ -73,20 +73,20 @@ def _submission(handler: PicoRequestHandler, action: str, request_record_id: str
             submission.request,
             submission.revision,
         )
-        handler._send_json(201, {"position": position.to_value()})
+        handler.send_json(201, {"position": position.to_value()})
         return
-    handler._error(405, "method.not_allowed", "method not allowed")
+    handler.error(405, "method.not_allowed", "method not allowed")
 
 
 def _comment(handler: PicoRequestHandler, principal_id: str, draft_id: str) -> None:
     if handler.command != "POST":
-        handler._error(405, "method.not_allowed", "method not allowed")
+        handler.error(405, "method.not_allowed", "method not allowed")
         return
-    body = handler._read_json()
+    body = handler.read_json()
     if not isinstance(body, dict) or set(body) != {"author", "text"}:
         raise CommentError("comment body must contain author and text")
     position = handler.server.comments.add(principal_id, draft_id, body["author"], body["text"])
-    handler._send_json(201, {"position": position.to_value()})
+    handler.send_json(201, {"position": position.to_value()})
 
 
 def _comment_route(path: str) -> tuple[str, str] | None:

@@ -157,13 +157,13 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         try:
             url = urlsplit(self.path)
             if url.path == "/healthz" and self.command in ("GET", "HEAD"):
-                self._send_json(200, {"status": "ok"})
+                self.send_json(200, {"status": "ok"})
                 return
             if url.path == "/api/v1/replica/handshake":
                 if self.command != "GET":
-                    self._error(405, "method.not_allowed", "method not allowed")
+                    self.error(405, "method.not_allowed", "method not allowed")
                     return
-                self._send_json(
+                self.send_json(
                     200,
                     {
                         "protocol": PROTOCOL_VERSION,
@@ -174,38 +174,38 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                 return
             if url.path == "/api/v1/replica/identity":
                 if self.command != "GET":
-                    self._error(405, "method.not_allowed", "method not allowed")
+                    self.error(405, "method.not_allowed", "method not allowed")
                     return
-                identity = self._authenticated_replica()
+                identity = self.authenticated_replica()
                 if identity is None:
-                    self._error(401, "auth.required", "valid bearer token required")
+                    self.error(401, "auth.required", "valid bearer token required")
                     return
-                self._send_json(200, {
+                self.send_json(200, {
                     "principalId": identity.principal_id,
                     "replicaId": identity.replica_id,
                 })
                 return
             if url.path == "/api/v1/replica/events":
                 if self.command != "GET":
-                    self._error(405, "method.not_allowed", "method not allowed")
+                    self.error(405, "method.not_allowed", "method not allowed")
                     return
                 self._stream_events()
                 return
             route = _route(url.path)
             if route is None:
-                self._error(404, "route.not_found", "route not found")
+                self.error(404, "route.not_found", "route not found")
                 return
             if not self._authorized():
-                self._error(401, "auth.required", "valid bearer token required")
+                self.error(401, "auth.required", "valid bearer token required")
                 return
             log_id, action, record_id = route
             error = self._authorize(log_id, action, self.command)
             if error is not None:
-                self._error(error[0], error[1], error[2])
+                self.error(error[0], error[1], error[2])
                 return
             if action == "head" and self.command == "GET":
                 head = self.server.store.head(log_id)
-                self._send_json(
+                self.send_json(
                     200,
                     {"head": None if head is None else head.to_value()},
                 )
@@ -225,8 +225,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             if action == "records" and self.command == "POST":
                 self._append(log_id)
                 return
-            self._error(405, "method.not_allowed", "method not allowed")
-        except _ResponseSent:
+            self.error(405, "method.not_allowed", "method not allowed")
+        except ResponseSent:
             pass
         except (
             InvalidReplicaData,
@@ -234,12 +234,12 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             UnknownPosition,
             ValueError,
         ) as error:
-            self._error(400, "request.invalid", str(error))
+            self.error(400, "request.invalid", str(error))
         except ReplicaLogError as error:
-            self._error(400, "replica.invalid", str(error))
+            self.error(400, "replica.invalid", str(error))
         except Exception:
             logger.exception("replica request failed")
-            self._error(500, "server.failure", "server failure")
+            self.error(500, "server.failure", "server failure")
 
     def _read(self, log_id: str, query: dict[str, list[str]]) -> None:
         if set(query) - {"after", "limit"}:
@@ -261,12 +261,12 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             if not after_values
             else Position(log_id, after_values[0])
         )
-        self._send_json(
+        self.send_json(
             200, self.server.store.read(log_id, after, limit).to_value()
         )
 
     def _append(self, log_id: str) -> None:
-        value = self._read_json()
+        value = self.read_json()
         if not isinstance(value, dict) or set(value) != {
             "expectedHead",
             "records",
@@ -288,12 +288,12 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             for record in records_value
         )
         result = self.server.append_and_broadcast(log_id, expected, records)
-        self._send_json(
+        self.send_json(
             409 if result.kind == "changed" else 200,
             result.to_value(),
         )
 
-    def _read_json(self) -> object:
+    def read_json(self) -> object:
         content_type = self.headers.get_content_type()
         if content_type != "application/json":
             raise InvalidReplicaData("content-type must be application/json")
@@ -307,8 +307,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if length < 0:
             raise InvalidReplicaData("content-length is invalid")
         if length > MAX_BODY_BYTES:
-            self._error(413, "request.too_large", "request body is too large")
-            raise _ResponseSent()
+            self.error(413, "request.too_large", "request body is too large")
+            raise ResponseSent()
         data = self.rfile.read(length)
         if len(data) != length:
             raise InvalidReplicaData("request body ended early")
@@ -319,9 +319,9 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
 
     def _stream_events(self) -> None:
         if not self._authorized():
-            self._error(401, "auth.required", "valid bearer token required")
+            self.error(401, "auth.required", "valid bearer token required")
             return
-        identity = self._authenticated_replica()
+        identity = self.authenticated_replica()
         authorization = self.server.log_authorization
         if identity is not None and authorization is not None:
             def observes(log_id: str) -> bool:
@@ -332,7 +332,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             observes = readable_logs.__contains__
             has_access = bool(readable_logs)
         if not has_access:
-            self._error(403, "log.not_exposed", "no readable Logs available")
+            self.error(403, "log.not_exposed", "no readable Logs available")
             return
         subscriber: queue.Queue[str] = queue.Queue(maxsize=64)
         with self.server._subscriber_lock:
@@ -364,25 +364,25 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
                 if entry is not None:
                     self.server._subscribers.remove(entry)
 
-    def _authenticated_replica(self) -> AuthenticatedReplica | None:
+    def authenticated_replica(self) -> AuthenticatedReplica | None:
         if self.server.authenticator is None:
             return None
-        token = self._bearer_token() or self._cookie(SESSION_COOKIE)
+        token = self._bearer_token() or self.cookie(SESSION_COOKIE)
         if token is None:
             return None
         return self.server.authenticator.authenticate(token)
 
     def _authorized(self) -> bool:
         if self.server.authenticator is not None:
-            return self._authenticated_replica() is not None
-        return self._admin_authorized()
+            return self.authenticated_replica() is not None
+        return self.operator_authorized()
 
-    def _admin_authorized(self) -> bool:
+    def operator_authorized(self) -> bool:
         expected = f"Bearer {self.server.replica_token}"
         actual = self.headers.get("Authorization", "")
         if hmac.compare_digest(actual, expected):
             return True
-        token = self._cookie(OPERATOR_SESSION_COOKIE)
+        token = self.cookie(OPERATOR_SESSION_COOKIE)
         return (
             token is not None
             and self.server.operator_authenticator is not None
@@ -393,7 +393,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         actual = self.headers.get("Authorization", "")
         return actual[7:] if actual.startswith("Bearer ") and len(actual) > 7 else None
 
-    def _cookie(self, name: str) -> str | None:
+    def cookie(self, name: str) -> str | None:
         source = self.headers.get("Cookie")
         if source is None:
             return None
@@ -408,7 +408,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     def _authorize(
         self, log_id: str, action: str, method: str
     ) -> tuple[int, str, str] | None:
-        identity = self._authenticated_replica()
+        identity = self.authenticated_replica()
         authorization = self.server.log_authorization
         if identity is not None and authorization is not None:
             access = authorization.access(identity, log_id)
@@ -440,7 +440,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             return None
         return (405, "method.not_allowed", "method not allowed")
 
-    def _send_json(
+    def send_json(
         self,
         status: int,
         value: object,
@@ -461,8 +461,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _error(self, status: int, code: str, message: str) -> None:
-        self._send_json(
+    def error(self, status: int, code: str, message: str) -> None:
+        self.send_json(
             status, {"error": {"code": code, "message": message}}
         )
 
@@ -470,8 +470,8 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         logger.info("%s - %s", self.address_string(), format % args)
 
 
-class _ResponseSent(Exception):
-    pass
+class ResponseSent(Exception):
+    """错误响应已经写出，调用方停止处理。"""
 
 
 def _route(path: str) -> tuple[str, str, str] | None:

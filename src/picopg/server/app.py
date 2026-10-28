@@ -4,9 +4,12 @@ from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from picopg.server.auth.http import dispatch_session
+from picopg.replica import ReplicaLogStore
+from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.ai import CourseAgent, CourseAi
-from picopg.server.ai.http import dispatch_course_ai
+from picopg.server.ai.http import dispatch_ai
+from picopg.server.analysis import LearningAnalysisLogRule
+from picopg.server.auth.http import dispatch_session
 from picopg.server.auth.model import (
     CompositeAuthenticator,
     CompositeReplicaDirectory,
@@ -16,38 +19,35 @@ from picopg.server.auth.model import (
     StaticAuthenticator,
     StaticReplicaDirectory,
 )
-from picopg.server.review.comments import CommentPublisher
+from picopg.server.auth.registry import FileSessionRegistry
+from picopg.server.classroom.http import dispatch_classroom
+from picopg.server.classroom.roster import ClassRosterRepository
+from picopg.server.common.workers import ServerWorkerThread
+from picopg.server.drafts.protocol import DraftLogRule
+from picopg.server.drafts.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log
+from picopg.server.playgrounds.http import dispatch_playground
+from picopg.server.playgrounds.packages import FilePackageStore, PackageAdapter
 from picopg.server.playgrounds.releases import (
     PLAYGROUND_RELEASES_LOG_ID,
     PlaygroundLogRule,
     PlaygroundPublisher,
 )
-from picopg.server.playgrounds.packages import FilePackageStore, PackageAdapter
-from picopg.server.playgrounds.http import dispatch_playground
 from picopg.server.replication import (
     LogBinding,
     ReplicaHttpServer,
     ReplicaRequestHandler,
 )
-from picopg.server.auth.registry import FileSessionRegistry
-from picopg.server.classroom.http import dispatch_classroom
-from picopg.server.classroom.roster import ClassRosterRepository
+from picopg.server.review.comments import CommentPublisher
 from picopg.server.review.http import dispatch_review
-from picopg.server.submissions.reader import SubmissionReader
-from picopg.server.submissions.http import dispatch_student
-from picopg.server.drafts.protocol import DraftLogRule
-from picopg.server.drafts.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log
+from picopg.server.review.teacher import dispatch_teacher
+from picopg.server.submissions.http import dispatch_submissions
 from picopg.server.submissions.logs import (
     SubmissionLogRule,
     is_request_log,
     request_logs as submission_request_logs,
 )
+from picopg.server.submissions.reader import SubmissionReader
 from picopg.server.submissions.worker import SubmissionRequestConsumer, SubmissionTagWriter
-from picopg.server.analysis import LearningAnalysisLogRule
-from picopg.server.review.teacher import dispatch_teacher
-from picopg.server.common.workers import ServerWorkerThread
-from picopg.replica import ReplicaLogStore
-from picopg.replica.file_store import FileReplicaLogStore
 
 
 class PicoPGHttpServer(ReplicaHttpServer):
@@ -190,9 +190,9 @@ class PicoRequestHandler(ReplicaRequestHandler):
         path = urlsplit(self.path).path
         if dispatch_session(self, path):
             return
-        if dispatch_course_ai(self, path):
+        if dispatch_ai(self, path):
             return
-        if dispatch_student(self, path):
+        if dispatch_submissions(self, path):
             return
         if dispatch_classroom(self, path):
             return

@@ -4,11 +4,8 @@ import json
 import re
 from typing import Protocol
 
-from picopg.server.ai.course import CourseAiError, CourseSkillRepository
-
-
-class ToolModel(Protocol):
-    def step(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> dict[str, object]: ...
+from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.model import CourseAiError, ToolModel
 
 
 class CourseAgent(Protocol):

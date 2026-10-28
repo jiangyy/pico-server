@@ -4,69 +4,69 @@ import re
 from typing import TYPE_CHECKING
 
 from picopg.server.ai.agent import agent_request, tutor_request
-from picopg.server.ai.course import CourseAiError
-from picopg.server.replication import _ResponseSent, logger
+from picopg.server.ai.model import CourseAiError
+from picopg.server.replication import ResponseSent, logger
 
 if TYPE_CHECKING:
     from picopg.server.app import PicoRequestHandler
 
 
-def dispatch_course_ai(handler: PicoRequestHandler, path: str) -> bool:
+def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
     if path in ("/api/v1/ai/agent", "/api/v1/ai/tutor"):
         return _dispatch_agent(handler, path)
     if path != "/api/v1/ai/course":
         return False
     try:
         if handler.command != "POST":
-            handler._error(405, "method.not_allowed", "method not allowed")
+            handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        if handler._authenticated_replica() is None:
-            handler._error(401, "auth.required", "valid Session required")
+        if handler.authenticated_replica() is None:
+            handler.error(401, "auth.required", "valid Session required")
             return True
         if handler.server.course_ai is None:
-            handler._error(503, "ai.unavailable", "course AI is not configured")
+            handler.error(503, "ai.unavailable", "course AI is not configured")
             return True
-        playground_id, version_id, request = _request_value(handler._read_json())
+        playground_id, version_id, request = _request_value(handler.read_json())
         reply = handler.server.course_ai.reply(playground_id, version_id, request)
-        handler._send_json(200, reply, (("Cache-Control", "no-store"),))
+        handler.send_json(200, reply, (("Cache-Control", "no-store"),))
     except ValueError as error:
-        handler._error(400, "ai.request.invalid", str(error))
+        handler.error(400, "ai.request.invalid", str(error))
     except CourseAiError as error:
-        handler._error(502, "ai.reply.invalid", str(error))
-    except _ResponseSent:
+        handler.error(502, "ai.reply.invalid", str(error))
+    except ResponseSent:
         pass
     except Exception:
         logger.exception("course AI request failed")
-        handler._error(500, "server.failure", "server failure")
+        handler.error(500, "server.failure", "server failure")
     return True
 
 
 def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
     try:
         if handler.command != "POST":
-            handler._error(405, "method.not_allowed", "method not allowed")
+            handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        if handler._authenticated_replica() is None:
-            handler._error(401, "auth.required", "valid Session required")
+        if handler.authenticated_replica() is None:
+            handler.error(401, "auth.required", "valid Session required")
             return True
         if handler.server.course_agent is None:
-            handler._error(503, "ai.unavailable", "course agent is not configured")
+            handler.error(503, "ai.unavailable", "course agent is not configured")
             return True
         if path == "/api/v1/ai/tutor":
-            turn = handler.server.course_agent.tutor(*tutor_request(handler._read_json()))
+            turn = handler.server.course_agent.tutor(*tutor_request(handler.read_json()))
         else:
-            playground_id, version_id, messages, tools = agent_request(handler._read_json())
+            playground_id, version_id, messages, tools = agent_request(handler.read_json())
             turn = handler.server.course_agent.step(playground_id, version_id, messages, tools)
-        handler._send_json(200, turn, (("Cache-Control", "no-store"),))
+        handler.send_json(200, turn, (("Cache-Control", "no-store"),))
     except ValueError as error:
-        handler._error(400, "ai.request.invalid", str(error))
+        handler.error(400, "ai.request.invalid", str(error))
     except CourseAiError as error:
-        handler._error(502, "ai.reply.invalid", str(error))
-    except _ResponseSent:
+        handler.error(502, "ai.reply.invalid", str(error))
+    except ResponseSent:
         pass
     except Exception:
         logger.exception("course agent request failed")
-        handler._error(500, "server.failure", "server failure")
+        handler.error(500, "server.failure", "server failure")
     return True
 
 

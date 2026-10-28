@@ -5,14 +5,10 @@ from urllib.parse import unquote
 
 from picopg.server.playgrounds.releases import PLAYGROUND_RELEASES_LOG_ID
 from picopg.server.playgrounds.packages import PackageError, PackageNotFound
-from picopg.server.replication import logger
+from picopg.server.replication import ResponseSent, logger
 
 if TYPE_CHECKING:
     from picopg.server.app import PicoRequestHandler
-
-
-class _PackageResponseSent(Exception):
-    pass
 
 
 def dispatch_playground(handler: PicoRequestHandler, path: str) -> bool:
@@ -21,18 +17,18 @@ def dispatch_playground(handler: PicoRequestHandler, path: str) -> bool:
         return False
     try:
         action, playground_id, version_id = route
-        identity = handler._authenticated_replica()
-        authenticated = handler._admin_authorized() or (
+        identity = handler.authenticated_replica()
+        authenticated = handler.operator_authorized() or (
             action != "publish"
             and identity is not None
             and handler.server.log_authorization is not None
             and handler.server.log_authorization.access(identity, PLAYGROUND_RELEASES_LOG_ID) == "read"
         )
         if not authenticated:
-            handler._error(401, "auth.required", "valid bearer token required")
+            handler.error(401, "auth.required", "valid bearer token required")
             return True
         if action == "catalog" and handler.command == "GET":
-            handler._send_json(200, {
+            handler.send_json(200, {
                 "playgrounds": [release.to_catalog_value() for release in handler.server.playgrounds.catalog()]
             })
             return True
@@ -43,7 +39,7 @@ def dispatch_playground(handler: PicoRequestHandler, path: str) -> bool:
                 handler.headers.get_content_type(),
                 _read_package(handler),
             )
-            handler._send_json(
+            handler.send_json(
                 409 if result.status == "conflict" else (201 if result.status == "accepted" else 200),
                 {"status": result.status, "version_id": result.version_id},
             )
@@ -57,16 +53,16 @@ def dispatch_playground(handler: PicoRequestHandler, path: str) -> bool:
             handler.end_headers()
             handler.wfile.write(payload)
             return True
-        handler._error(405, "method.not_allowed", "method not allowed")
+        handler.error(405, "method.not_allowed", "method not allowed")
     except PackageNotFound as error:
-        handler._error(404, "package.not_found", str(error))
+        handler.error(404, "package.not_found", str(error))
     except PackageError as error:
-        handler._error(400, "package.invalid", str(error))
-    except _PackageResponseSent:
+        handler.error(400, "package.invalid", str(error))
+    except ResponseSent:
         pass
     except Exception:
         logger.exception("playground request failed")
-        handler._error(500, "server.failure", "server failure")
+        handler.error(500, "server.failure", "server failure")
     return True
 
 
@@ -81,8 +77,8 @@ def _read_package(handler: PicoRequestHandler) -> bytes:
     if length < 0:
         raise PackageError("content-length is invalid")
     if length > handler.server.playgrounds.max_package_bytes:
-        handler._error(413, "package.too_large", "package is too large")
-        raise _PackageResponseSent()
+        handler.error(413, "package.too_large", "package is too large")
+        raise ResponseSent()
     payload = handler.rfile.read(length)
     if len(payload) != length:
         raise PackageError("request body ended early")

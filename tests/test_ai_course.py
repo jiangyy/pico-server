@@ -17,11 +17,8 @@ for entry in (ROOT, SRC):
 from picopg.server.app import PicoPGHttpServer  # noqa: E402
 from picopg.server.auth.model import PrincipalSession  # noqa: E402
 from picopg.server.config import SKILLS  # noqa: E402
-from picopg.server.ai.course import (  # noqa: E402
-    CourseAiError,
-    CourseAiService,
-    CourseSkillRepository,
-)
+from picopg.server.ai.course import CourseAiService, CourseSkillRepository  # noqa: E402
+from picopg.server.ai.model import CourseAiError  # noqa: E402
 from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
 
 
