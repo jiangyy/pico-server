@@ -3,7 +3,7 @@
   "concepts": ["nested-loop", "break", "range", "flag"],
   "teaches": "用两层循环穷举两个空格，用 is_valid 检查约束，用标记变量停下外层循环。",
   "answerStyle": "一次只说一件事，不贴完整答案，结尾给一个小问题。",
-  "actions": ["selection.locate", "code.locate", "trace.seek", "python.run"],
+  "actions": ["selection.locate", "code.locate", "trace.seek", "code.run", "annotation.show", "source.explain", "source.restore"],
   "misconceptions": [
     {
       "id": "break-inner-only",

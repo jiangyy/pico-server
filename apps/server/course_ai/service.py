@@ -75,7 +75,10 @@ class CourseAiService:
         '{"title":"标题","text":"正文","primary":{"action":"动作 id","label":"按钮文字",'
         '"args":{}},"actions":[]}。primary、actions 和动作 label 可以省略；动作不能只写 id 字符串。'
         'trace.seek 的 args 是 {"step":当前步整数}；code.locate 是 {"line":源码行号}；'
-        "selection.locate 和 python.run 没有参数。不确定参数时省略动作。"
+        'annotation.show 用 {"kind":"mark|note","at":{"line":源码行号},"text":"短批注"}；'
+        'source.explain 用 {"source":"完整临时代码"}，必须以 context.source 为底稿且只做讲解所需的最小改动；'
+        "selection.locate、code.run 和 source.restore 没有参数。临时代码只用于演示，结束对话会恢复学生原稿。"
+        "能用批注说明时不要改代码；不确定参数时省略动作。"
     )
 
     def __init__(self, model: ChatModel, skills: CourseSkillRepository) -> None:
@@ -184,7 +187,7 @@ def _action_value(value: object, allowed: frozenset[str], request: dict[str, obj
         raise CourseAiError("action id must be allowed")
     if args is not None and not isinstance(args, dict):
         raise CourseAiError("action args are invalid")
-    if action in ("selection.locate", "python.run") and args not in (None, {}):
+    if action in ("selection.locate", "code.run", "source.restore") and args not in (None, {}):
         raise CourseAiError("action does not accept args")
     context = request.get("context")
     source = context.get("source", "") if isinstance(context, dict) else ""
@@ -207,6 +210,28 @@ def _action_value(value: object, allowed: frozenset[str], request: dict[str, obj
         step = args.get("step") if isinstance(args, dict) else None
         if isinstance(step, bool) or not isinstance(step, int) or not isinstance(steps, int) or not 1 <= step <= steps:
             raise CourseAiError("trace.seek requires args with an integer step inside the current Trace")
+    if action == "annotation.show":
+        if not isinstance(args, dict) or set(args) - {"kind", "at", "to", "text"}:
+            raise CourseAiError("annotation.show args are invalid")
+        kind = args.get("kind")
+        if kind not in ("mark", "note", "link"):
+            raise CourseAiError("annotation.show kind is invalid")
+        _source_anchor(args.get("at"), source)
+        if kind == "link":
+            _source_anchor(args.get("to"), source)
+        elif "to" in args:
+            raise CourseAiError("only link annotations accept to")
+        note = args.get("text")
+        if kind == "note" and not isinstance(note, str):
+            raise CourseAiError("note annotations require text")
+        if note is not None and (not isinstance(note, str) or not note.strip() or len(note) > 120):
+            raise CourseAiError("annotation text is invalid")
+    if action == "source.explain":
+        if not isinstance(args, dict) or set(args) != {"source"}:
+            raise CourseAiError("source.explain requires complete temporary source")
+        temporary = args["source"]
+        if not isinstance(temporary, str) or not temporary.strip() or len(temporary) > 50_000:
+            raise CourseAiError("source.explain source is invalid")
     return {
         "action": action,
         "label": _ACTION_LABELS[action],
@@ -218,5 +243,20 @@ _ACTION_LABELS = {
     "selection.locate": "定位执行",
     "code.locate": "定位这一行",
     "trace.seek": "跳到这一步",
-    "python.run": "运行代码",
+    "code.run": "运行代码",
+    "annotation.show": "在代码上标出来",
+    "source.explain": "在临时代码中演示",
+    "source.restore": "恢复我的代码",
 }
+
+
+def _source_anchor(value: object, source: object) -> None:
+    if not isinstance(value, dict) or set(value) - {"line", "text"} or "line" not in value:
+        raise CourseAiError("annotation source anchor is invalid")
+    line = value["line"]
+    lines = str(source).splitlines() or [""]
+    if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= len(lines):
+        raise CourseAiError("annotation source line is invalid")
+    text = value.get("text")
+    if text is not None and (not isinstance(text, str) or not text or text not in lines[line - 1]):
+        raise CourseAiError("annotation source text is invalid")

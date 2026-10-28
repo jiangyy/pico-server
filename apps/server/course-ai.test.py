@@ -117,6 +117,24 @@ assert short_reply["actions"] == [
     {"action": "code.locate", "label": "定位这一行", "args": {"line": 2}},
 ]
 
+active_model = SequencedModel(['''{
+  "text":"先把这一行标出来，再看一个只改动输出的临时版本。",
+  "primary":{"action":"annotation.show","args":{"kind":"note","at":{"line":2,"text":"print"},"text":"这里读取 x"}},
+  "actions":[
+    {"action":"source.explain","args":{"source":"x = 1\\nprint(x + 1)"}},
+    {"action":"code.run"},
+    {"action":"source.restore"}
+  ]
+}'''])
+active_reply = CourseAiService(active_model, skills).reply("sudoku", "v1", contextual)
+assert active_reply["primary"] == {
+    "action": "annotation.show", "label": "在代码上标出来",
+    "args": {"kind": "note", "at": {"line": 2, "text": "print"}, "text": "这里读取 x"},
+}
+assert [action["action"] for action in active_reply["actions"]] == [
+    "source.explain", "code.run", "source.restore",
+]
+
 bad_model = SequencedModel(['{"text":"答案","primary":{"action":"source.replace","label":"替换"}}'] * 2)
 try:
     CourseAiService(bad_model, skills).reply("sudoku", "v1", request)

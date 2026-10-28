@@ -3,7 +3,7 @@
   "concepts": ["recursion", "base-case", "call-frame", "loop"],
   "teaches": "把搬盘子拆成更小的同类任务，并用基本情况停止递归。",
   "answerStyle": "一次只解释当前语句或当前调用，结尾问一个能从 Trace 回答的小问题。",
-  "actions": ["selection.locate", "code.locate", "trace.seek", "python.run"],
+  "actions": ["selection.locate", "code.locate", "trace.seek", "code.run", "annotation.show", "source.explain", "source.restore"],
   "misconceptions": [
     {
       "id": "recursive-call-runs-in-place",
