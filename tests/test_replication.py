@@ -1,3 +1,6 @@
+
+
+
 """Contract test for the replica HTTP server.
 
 Runs an in-process ReplicaHttpServer and probes its public endpoints.
@@ -6,8 +9,8 @@ Stdlib-only; exits 0 on success and non-zero on failure.
 
 from __future__ import annotations
 
+import unittest
 import json
-import sys
 import tempfile
 import threading
 import urllib.error
@@ -16,22 +19,16 @@ from http.client import HTTPConnection
 from pathlib import Path
 
 
-_ROOT = Path(__file__).resolve().parents[2]
-_SRC = _ROOT / "src"
-for _entry in (_ROOT, _SRC):
-    if str(_entry) not in sys.path:
-        sys.path.insert(0, str(_entry))
-
-from picopg.server.replication import (  # noqa: E402
+from picopg.server.replication import (
     HANDSHAKE_CAPABILITIES,
     PROTOCOL_VERSION,
     ReplicaHttpServer,
 )
-from picopg.server.auth.model import PrincipalSession  # noqa: E402
-from picopg.server.drafts.protocol import DraftLogRule  # noqa: E402
-from picopg.server.playgrounds.releases import PlaygroundLogRule  # noqa: E402
-from picopg.server.submissions.logs import SubmissionLogRule  # noqa: E402
-from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
+from picopg.server.auth.model import PrincipalSession
+from picopg.server.drafts.protocol import DraftLogRule
+from picopg.server.playgrounds.releases import PlaygroundLogRule
+from picopg.server.submissions.logs import SubmissionLogRule
+from picopg.replica.file_store import FileReplicaLogStore
 
 
 def _start_server(
@@ -59,7 +56,8 @@ def _get(url: str, *, headers: dict[str, str] | None = None) -> tuple[int, dict[
         with urllib.request.urlopen(request, timeout=2) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
-        return error.code, dict(error.headers or {}), error.read() or b""
+        with error:
+            return error.code, dict(error.headers or {}), error.read() or b""
 
 
 def _stop(server: ReplicaHttpServer) -> None:
@@ -353,39 +351,41 @@ def _push_channel(tmp: Path) -> None:
         _stop(server)
 
 
-def main() -> int:
-    _identity_vector()
+class ReplicationTest(unittest.TestCase):
+    def test_record_identity_vector(self) -> None:
+        _identity_vector()
 
-    with tempfile.TemporaryDirectory() as raw_dir:
-        root = Path(raw_dir)
-        server, base_url = _handshake_and_auth(root)
-        try:
-            status, _, _ = _get(f"{base_url}/api/v1/replica/logs/work/head")
-            _expect(status == 401, f"protected route returned {status} without token")
+    def test_handshake_and_bearer_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            server, base_url = _handshake_and_auth(Path(raw_dir))
+            try:
+                status, _, _ = _get(f"{base_url}/api/v1/replica/logs/work/head")
+                _expect(status == 401, f"protected route returned {status} without token")
 
-            status, _, _ = _get(
-                f"{base_url}/api/v1/replica/logs/work/head",
-                headers={"Authorization": "Bearer secret"},
-            )
-            _expect(status == 200, f"protected route returned {status} with token")
-        finally:
-            _stop(server)
+                status, _, _ = _get(
+                    f"{base_url}/api/v1/replica/logs/work/head",
+                    headers={"Authorization": "Bearer secret"},
+                )
+                _expect(status == 200, f"protected route returned {status} with token")
+            finally:
+                _stop(server)
 
-    with tempfile.TemporaryDirectory() as raw_dir:
-        _bindings_enforcement(Path(raw_dir))
+    def test_bindings_are_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            _bindings_enforcement(Path(raw_dir))
 
-    with tempfile.TemporaryDirectory() as raw_dir:
-        _push_channel(Path(raw_dir))
+    def test_push_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            _push_channel(Path(raw_dir))
 
-    with tempfile.TemporaryDirectory() as raw_dir:
-        _append_and_broadcast(Path(raw_dir))
+    def test_append_and_broadcast(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            _append_and_broadcast(Path(raw_dir))
 
-    with tempfile.TemporaryDirectory() as raw_dir:
-        _principal_revision_access(Path(raw_dir))
-
-    print("server handshake, binding enforcement, Principal Revision sharing, push events and append_and_broadcast passed")
-    return 0
+    def test_principal_revision_access(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            _principal_revision_access(Path(raw_dir))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

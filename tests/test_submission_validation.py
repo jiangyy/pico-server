@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT), str(ROOT / "src")]
-
-from picopg.server.drafts.protocol import revision_log_id  # noqa: E402
-from picopg.server.submissions.worker import SubmissionRequestConsumer  # noqa: E402
-from picopg.replica import ReplicatedRecord, record_id_of  # noqa: E402
-from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
+from picopg.replica import ReplicatedRecord, record_id_of
+from picopg.replica.file_store import FileReplicaLogStore
+from picopg.server.drafts.protocol import revision_log_id
+from picopg.server.submissions.worker import SubmissionRequestConsumer
 
 
 def append(store, log_id, data, requires=()):

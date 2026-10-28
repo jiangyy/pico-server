@@ -1,3 +1,6 @@
+
+
+
 """Contract test for server-owned Draft comments.
 
 Runs an in-process PicoPGHttpServer and checks that an operator can append a comment
@@ -7,8 +10,8 @@ Stdlib-only; exits 0 on success and non-zero on failure.
 
 from __future__ import annotations
 
+import unittest
 import json
-import sys
 import tempfile
 import threading
 import urllib.error
@@ -17,15 +20,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-_ROOT = Path(__file__).resolve().parents[2]
-_SRC = _ROOT / "src"
-for _entry in (_ROOT, _SRC):
-    if str(_entry) not in sys.path:
-        sys.path.insert(0, str(_entry))
-
-from picopg.server.app import PicoPGHttpServer  # noqa: E402
-from picopg.server.review.comments import comment_log_id  # noqa: E402
-from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
+from picopg.server.app import PicoPGHttpServer
+from picopg.server.review.comments import comment_log_id
+from picopg.replica.file_store import FileReplicaLogStore
 
 
 def _start(tmp: Path) -> tuple[PicoPGHttpServer, str]:
@@ -70,7 +67,8 @@ def _call(
         with urllib.request.urlopen(request, timeout=2) as response:
             return response.status, json.loads(response.read() or b"null")
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read() or b"null")
+        with error:
+            return error.code, json.loads(error.read() or b"null")
 
 
 def _comments(base_url: str) -> None:
@@ -126,16 +124,15 @@ def _comments(base_url: str) -> None:
     _expect(status == 403, f"the comment Log accepted an append over the replica route ({status})")
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as raw_dir:
-        server, base_url = _start(Path(raw_dir))
-        try:
-            _comments(base_url)
-        finally:
-            _stop(server)
-    print("server-owned Draft comments: operator append, client read, client refusal passed")
-    return 0
+class CommentsTest(unittest.TestCase):
+    def test_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            server, base_url = _start(Path(raw_dir))
+            try:
+                _comments(base_url)
+            finally:
+                _stop(server)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

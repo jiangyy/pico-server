@@ -1,9 +1,12 @@
+
+
+
 """HTTP contract test for the operator Submission workbench projection."""
 
 from __future__ import annotations
 
+import unittest
 import json
-import sys
 import tempfile
 import threading
 import urllib.error
@@ -12,17 +15,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-_ROOT = Path(__file__).resolve().parents[2]
-_SRC = _ROOT / "src"
-for _entry in (_ROOT, _SRC):
-    if str(_entry) not in sys.path:
-        sys.path.insert(0, str(_entry))
-
-from picopg.server.app import PicoPGHttpServer  # noqa: E402
-from picopg.server.drafts.protocol import revision_log_id  # noqa: E402
-from picopg.server.submissions.logs import result_log as submission_result_log  # noqa: E402
-from picopg.replica import ReplicatedRecord, record_id_of  # noqa: E402
-from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
+from picopg.server.app import PicoPGHttpServer
+from picopg.server.drafts.protocol import revision_log_id
+from picopg.server.submissions.logs import result_log as submission_result_log
+from picopg.replica import ReplicatedRecord, record_id_of
+from picopg.replica.file_store import FileReplicaLogStore
 
 
 def _record(log_id, parent, requires, data):
@@ -50,7 +47,8 @@ def _request(
         with urllib.request.urlopen(request, timeout=2) as response:
             return response.status, json.loads(response.read() or b"null")
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read() or b"null")
+        with error:
+            return error.code, json.loads(error.read() or b"null")
 
 
 def _seed(store: FileReplicaLogStore) -> ReplicatedRecord:
@@ -86,75 +84,74 @@ def _seed(store: FileReplicaLogStore) -> ReplicatedRecord:
     return submission
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as raw_dir:
-        root = Path(raw_dir)
-        store = FileReplicaLogStore(root / "replica")
-        submission = _seed(store)
-        server = PicoPGHttpServer(
-            ("127.0.0.1", 0), store, "operator-token", root / "packages"
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        host, port = server.server_address
-        base_url = f"http://{host}:{port}"
-        request_id = quote(submission.id, safe="")
-        try:
-            status, payload = _request(base_url, "/api/v1/operator/submissions")
-            assert status == 200
-            listed = payload["submissions"]  # type: ignore[index]
-            assert len(listed) == 1
-            assert listed[0]["status"] == "completed"
-            assert listed[0]["requestRecordId"] == submission.id
+class SubmissionsTest(unittest.TestCase):
+    def test_submissions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            store = FileReplicaLogStore(root / "replica")
+            submission = _seed(store)
+            server = PicoPGHttpServer(
+                ("127.0.0.1", 0), store, "operator-token", root / "packages"
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            base_url = f"http://{host}:{port}"
+            request_id = quote(submission.id, safe="")
+            try:
+                status, payload = _request(base_url, "/api/v1/operator/submissions")
+                assert status == 200
+                listed = payload["submissions"]  # type: ignore[index]
+                assert len(listed) == 1
+                assert listed[0]["status"] == "completed"
+                assert listed[0]["requestRecordId"] == submission.id
 
-            status, detail = _request(
-                base_url, f"/api/v1/operator/submissions/{request_id}"
-            )
-            assert status == 200
-            assert detail["source"] == "print('exact revision')\n"  # type: ignore[index]
-            assert detail["comments"] == []  # type: ignore[index]
+                status, detail = _request(
+                    base_url, f"/api/v1/operator/submissions/{request_id}"
+                )
+                assert status == 200
+                assert detail["source"] == "print('exact revision')\n"  # type: ignore[index]
+                assert detail["comments"] == []  # type: ignore[index]
 
-            status, _ = _request(
-                base_url,
-                f"/api/v1/operator/submissions/{request_id}/comments",
-                method="POST",
-                body={"author": "teacher", "text": "Keep this exact result."},
-            )
-            assert status == 201
+                status, _ = _request(
+                    base_url,
+                    f"/api/v1/operator/submissions/{request_id}/comments",
+                    method="POST",
+                    body={"author": "teacher", "text": "Keep this exact result."},
+                )
+                assert status == 201
 
-            status, detail = _request(
-                base_url, f"/api/v1/operator/submissions/{request_id}"
-            )
-            assert status == 200
-            assert detail["comments"] == [{  # type: ignore[index]
-                "position": detail["comments"][0]["position"],  # type: ignore[index]
-                "author": "teacher",
-                "text": "Keep this exact result.",
-            }]
+                status, detail = _request(
+                    base_url, f"/api/v1/operator/submissions/{request_id}"
+                )
+                assert status == 200
+                assert detail["comments"] == [{  # type: ignore[index]
+                    "position": detail["comments"][0]["position"],  # type: ignore[index]
+                    "author": "teacher",
+                    "text": "Keep this exact result.",
+                }]
 
-            status, _ = _request(
-                base_url, "/api/v1/operator/submissions", token="wrong"
-            )
-            assert status == 401
-            status, _ = _request(
-                base_url, "/api/v1/operator/submissions/missing"
-            )
-            assert status == 404
-            status, invalid = _request(
-                base_url,
-                f"/api/v1/operator/submissions/{request_id}/comments",
-                method="POST",
-                body={"author": "teacher", "text": "   "},
-            )
-            assert status == 400
-            assert invalid["error"]["code"] == "submission.invalid"  # type: ignore[index]
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-    print("operator Submission list, exact Revision and targeted comment passed")
-    return 0
+                status, _ = _request(
+                    base_url, "/api/v1/operator/submissions", token="wrong"
+                )
+                assert status == 401
+                status, _ = _request(
+                    base_url, "/api/v1/operator/submissions/missing"
+                )
+                assert status == 404
+                status, invalid = _request(
+                    base_url,
+                    f"/api/v1/operator/submissions/{request_id}/comments",
+                    method="POST",
+                    body={"author": "teacher", "text": "   "},
+                )
+                assert status == 400
+                assert invalid["error"]["code"] == "submission.invalid"  # type: ignore[index]
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

@@ -1,37 +1,30 @@
 from __future__ import annotations
 
-import sys
 import tempfile
+import unittest
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[2]
-SRC = ROOT / "src"
-for entry in (ROOT, SRC):
-    if str(entry) not in sys.path:
-        sys.path.insert(0, str(entry))
-
-from picopg.server.auth.model import (  # noqa: E402
+from picopg.replica import Position, ReplicatedRecord, record_id_of
+from picopg.replica.file_store import FileReplicaLogStore
+from picopg.server.auth.model import (
     PrincipalLogAuthorization,
     PrincipalSession,
     StaticReplicaDirectory,
 )
-from picopg.server.drafts.protocol import (  # noqa: E402
+from picopg.server.drafts.authority import DraftAuthority
+from picopg.server.drafts.protocol import (
     DraftLogRule,
     decision_log_id,
     request_log_id,
     revision_log_id,
 )
-from picopg.server.drafts.authority import DraftAuthority  # noqa: E402
-from picopg.server.drafts.worker import DraftRequestConsumer  # noqa: E402
-from picopg.server.playgrounds.releases import PlaygroundLogRule  # noqa: E402
-from picopg.server.submissions.logs import (  # noqa: E402
+from picopg.server.drafts.worker import DraftRequestConsumer
+from picopg.server.playgrounds.releases import PlaygroundLogRule
+from picopg.server.submissions.logs import (
     SubmissionLogRule,
     result_log as submission_result_log,
 )
-from picopg.server.submissions.worker import SubmissionRequestConsumer  # noqa: E402
-from picopg.replica import Position, ReplicatedRecord, record_id_of  # noqa: E402
-from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
+from picopg.server.submissions.worker import SubmissionRequestConsumer
 
 
 def record(
@@ -239,18 +232,28 @@ def branch_revisions_can_be_submitted(root: Path) -> None:
     assert result.requires == (request, revision)
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as raw:
-        draft_rejections_are_durable(Path(raw))
-    with tempfile.TemporaryDirectory() as raw:
-        draft_transitions_and_faults_are_visible(Path(raw))
-    with tempfile.TemporaryDirectory() as raw:
-        branch_revisions_can_be_submitted(Path(raw))
-    replica_grants_are_fenced()
-    assert submission_result_log("principal/user/submission/A/requests") == "principal/user/submission/A/results"
-    print("durable Draft rejection, replica fencing and Submission result routing passed")
-    return 0
+class WorkersTest(unittest.TestCase):
+    def test_draft_rejections_are_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            draft_rejections_are_durable(Path(raw))
+
+    def test_draft_transitions_and_faults_are_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            draft_transitions_and_faults_are_visible(Path(raw))
+
+    def test_branch_revisions_can_be_submitted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            branch_revisions_can_be_submitted(Path(raw))
+
+    def test_replica_grants_are_fenced(self) -> None:
+        replica_grants_are_fenced()
+
+    def test_submission_results_follow_their_requests(self) -> None:
+        self.assertEqual(
+            submission_result_log("principal/user/submission/A/requests"),
+            "principal/user/submission/A/results",
+        )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

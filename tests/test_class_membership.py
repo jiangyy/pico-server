@@ -1,9 +1,12 @@
+
+
+
 """Class roster authority and teacher Submission access."""
 
 from __future__ import annotations
 
+import unittest
 import json
-import sys
 import tempfile
 import threading
 import urllib.error
@@ -12,17 +15,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-ROOT = Path(__file__).resolve().parents[2]
-SRC = ROOT / "src"
-for entry in (ROOT, SRC):
-    if str(entry) not in sys.path:
-        sys.path.insert(0, str(entry))
-
-from picopg.server.app import PicoPGHttpServer  # noqa: E402
-from picopg.server.auth.model import PrincipalSession  # noqa: E402
-from picopg.server.drafts.protocol import revision_log_id  # noqa: E402
-from picopg.replica import ReplicatedRecord, record_id_of  # noqa: E402
-from picopg.replica.file_store import FileReplicaLogStore  # noqa: E402
+from picopg.server.app import PicoPGHttpServer
+from picopg.server.auth.model import PrincipalSession
+from picopg.server.drafts.protocol import revision_log_id
+from picopg.replica import ReplicatedRecord, record_id_of
+from picopg.replica.file_store import FileReplicaLogStore
 
 
 def _record(log_id, parent, requires, data):
@@ -74,132 +71,132 @@ def _request(
         with urllib.request.urlopen(request, timeout=2) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read())
+        with error:
+            return error.code, json.loads(error.read())
 
 
-def main() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        store = FileReplicaLogStore(root / "replica")
-        s1 = _submission(store, "s1", "s1-device")
-        _submission(store, "s2", "s2-device")
-        s3 = _submission(store, "s3", "s3-device")
-        sessions = tuple(
-            PrincipalSession.create(principal, "device", f"{principal}-token", {}, ())
-            for principal in ("t1", "t2", "s1", "s2", "s3")
-        )
-        server = PicoPGHttpServer(
-            ("127.0.0.1", 0),
-            store,
-            "operator-token",
-            root / "packages",
-            principal_sessions=sessions,
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        host, port = server.server_address
-        base_url = f"http://{host}:{port}"
-        try:
-            status, _ = _request(
-                base_url,
-                "/api/v1/operator/classes/python-1",
+class ClassMembershipTest(unittest.TestCase):
+    def test_class_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = FileReplicaLogStore(root / "replica")
+            s1 = _submission(store, "s1", "s1-device")
+            _submission(store, "s2", "s2-device")
+            s3 = _submission(store, "s3", "s3-device")
+            sessions = tuple(
+                PrincipalSession.create(principal, "device", f"{principal}-token", {}, ())
+                for principal in ("t1", "t2", "s1", "s2", "s3")
+            )
+            server = PicoPGHttpServer(
+                ("127.0.0.1", 0),
+                store,
                 "operator-token",
-                method="POST",
-                value={"teachers": ["t1"], "students": ["s2", "s1"]},
+                root / "packages",
+                principal_sessions=sessions,
             )
-            assert status == 201
-            directory = server.class_rosters.directory()
-            assert directory.students_of("t1") == frozenset(("s1", "s2"))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            base_url = f"http://{host}:{port}"
+            try:
+                status, _ = _request(
+                    base_url,
+                    "/api/v1/operator/classes/python-1",
+                    "operator-token",
+                    method="POST",
+                    value={"teachers": ["t1"], "students": ["s2", "s1"]},
+                )
+                assert status == 201
+                directory = server.class_rosters.directory()
+                assert directory.students_of("t1") == frozenset(("s1", "s2"))
 
-            status, listed = _request(
-                base_url, "/api/v1/teacher/submissions", "t1-token"
-            )
-            assert status == 200
-            assert {item["principalId"] for item in listed["submissions"]} == {"s1", "s2"}
-            assert _request(
-                base_url, "/api/v1/teacher/submissions", "t2-token"
-            ) == (200, {"submissions": []})
+                status, listed = _request(
+                    base_url, "/api/v1/teacher/submissions", "t1-token"
+                )
+                assert status == 200
+                assert {item["principalId"] for item in listed["submissions"]} == {"s1", "s2"}
+                assert _request(
+                    base_url, "/api/v1/teacher/submissions", "t2-token"
+                ) == (200, {"submissions": []})
 
-            s1_id = quote(s1.id, safe="")
-            s3_id = quote(s3.id, safe="")
-            status, detail = _request(
-                base_url, f"/api/v1/teacher/submissions/{s1_id}", "t1-token"
-            )
-            assert status == 200
-            assert detail["source"] == "print('s1')\n"
-            assert _request(
-                base_url, f"/api/v1/teacher/submissions/{s3_id}", "t1-token"
-            )[0] == 404
+                s1_id = quote(s1.id, safe="")
+                s3_id = quote(s3.id, safe="")
+                status, detail = _request(
+                    base_url, f"/api/v1/teacher/submissions/{s1_id}", "t1-token"
+                )
+                assert status == 200
+                assert detail["source"] == "print('s1')\n"
+                assert _request(
+                    base_url, f"/api/v1/teacher/submissions/{s3_id}", "t1-token"
+                )[0] == 404
 
-            status, _ = _request(
-                base_url,
-                f"/api/v1/teacher/submissions/{s1_id}/comments",
-                "t1-token",
-                method="POST",
-                value={"text": "Good."},
-            )
-            assert status == 201
-            assert _request(
-                base_url,
-                f"/api/v1/teacher/submissions/{s1_id}/comments",
-                "t1-token",
-                method="POST",
-                value={"author": "forged", "text": "No."},
-            )[0] == 400
-            _, detail = _request(
-                base_url, f"/api/v1/teacher/submissions/{s1_id}", "t1-token"
-            )
-            assert detail["comments"][0]["author"] == "t1"
+                status, _ = _request(
+                    base_url,
+                    f"/api/v1/teacher/submissions/{s1_id}/comments",
+                    "t1-token",
+                    method="POST",
+                    value={"text": "Good."},
+                )
+                assert status == 201
+                assert _request(
+                    base_url,
+                    f"/api/v1/teacher/submissions/{s1_id}/comments",
+                    "t1-token",
+                    method="POST",
+                    value={"author": "forged", "text": "No."},
+                )[0] == 400
+                _, detail = _request(
+                    base_url, f"/api/v1/teacher/submissions/{s1_id}", "t1-token"
+                )
+                assert detail["comments"][0]["author"] == "t1"
 
-            status, _ = _request(
-                base_url,
-                "/api/v1/operator/classes/python-1",
-                "operator-token",
-                method="POST",
-                value={"teachers": ["t1"], "students": ["s3"]},
-            )
-            assert status == 201
-            assert _request(
-                base_url, f"/api/v1/teacher/submissions/{s1_id}", "t1-token"
-            )[0] == 404
-            assert _request(
-                base_url, f"/api/v1/teacher/submissions/{s3_id}", "t1-token"
-            )[0] == 200
+                status, _ = _request(
+                    base_url,
+                    "/api/v1/operator/classes/python-1",
+                    "operator-token",
+                    method="POST",
+                    value={"teachers": ["t1"], "students": ["s3"]},
+                )
+                assert status == 201
+                assert _request(
+                    base_url, f"/api/v1/teacher/submissions/{s1_id}", "t1-token"
+                )[0] == 404
+                assert _request(
+                    base_url, f"/api/v1/teacher/submissions/{s3_id}", "t1-token"
+                )[0] == 200
 
-            assert _request(
-                base_url,
-                "/api/v1/operator/classes/python-2",
-                "operator-token",
-                method="POST",
-                value={"teachers": ["unknown"], "students": []},
-            )[0] == 400
-            assert _request(
-                base_url,
-                "/api/v1/operator/classes/Bad",
-                "operator-token",
-                method="POST",
-                value={"teachers": ["t1"], "students": []},
-            )[0] == 400
-            assert _request(
-                base_url,
-                "/api/v1/operator/classes/python-2",
-                "wrong",
-                method="POST",
-                value={"teachers": ["t1"], "students": []},
-            )[0] == 401
-            roster_log = quote("class/python-1/roster", safe="")
-            assert _request(
-                base_url,
-                f"/api/v1/replica/logs/{roster_log}/records",
-                "t1-token",
-            )[0] == 403
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-
-    print("class roster projection and teacher authorization passed")
+                assert _request(
+                    base_url,
+                    "/api/v1/operator/classes/python-2",
+                    "operator-token",
+                    method="POST",
+                    value={"teachers": ["unknown"], "students": []},
+                )[0] == 400
+                assert _request(
+                    base_url,
+                    "/api/v1/operator/classes/Bad",
+                    "operator-token",
+                    method="POST",
+                    value={"teachers": ["t1"], "students": []},
+                )[0] == 400
+                assert _request(
+                    base_url,
+                    "/api/v1/operator/classes/python-2",
+                    "wrong",
+                    method="POST",
+                    value={"teachers": ["t1"], "students": []},
+                )[0] == 401
+                roster_log = quote("class/python-1/roster", safe="")
+                assert _request(
+                    base_url,
+                    f"/api/v1/replica/logs/{roster_log}/records",
+                    "t1-token",
+                )[0] == 403
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()
