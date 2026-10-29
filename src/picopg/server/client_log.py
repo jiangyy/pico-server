@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 client_logger = logging.getLogger("picopg.client")
 
-LEVELS = frozenset({"warn", "error", "uncaught", "unhandled"})
+LEVELS = frozenset({"warn", "error", "uncaught", "unhandled", "csp"})
 MAX_TEXT = 8_000
 MAX_PAGE = 300
 PER_MINUTE = 30
