@@ -32,6 +32,7 @@ from picopg.server.auth.model import (
     StaticReplicaDirectory,
     permits_log,
 )
+from picopg.server.analysis import validate_evidence_size
 
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -287,6 +288,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             ReplicatedRecord.from_value(record, log_id=log_id)
             for record in records_value
         )
+        validate_evidence_size(log_id, records)
         result = self.server.append_and_broadcast(log_id, expected, records)
         self.send_json(
             409 if result.kind == "changed" else 200,

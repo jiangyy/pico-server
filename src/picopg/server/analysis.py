@@ -1,6 +1,13 @@
-"""Authorization for student-owned learning-event logs."""
+"""Authorization and limits for student-owned learning-event logs."""
+
+import json
+
+from picopg.replica import ReplicatedRecord
 
 from picopg.server.common.ids import decode_component, encode_component
+
+
+MAX_EVIDENCE_BYTES = 64 * 1024
 
 
 class LearningAnalysisLogRule:
@@ -67,3 +74,23 @@ def evidence_scope(log_id: str) -> tuple[str, str]:
         decode_component(parts[1], "principalId"),
         decode_component(parts[3], "replicaId"),
     )
+
+
+def validate_evidence_size(
+    log_id: str, records: tuple[ReplicatedRecord, ...]
+) -> None:
+    try:
+        evidence_scope(log_id)
+    except ValueError:
+        return
+    for record in records:
+        encoded = json.dumps(
+            record.to_value()["data"],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > MAX_EVIDENCE_BYTES:
+            raise ValueError(
+                f"Evidence exceeds {MAX_EVIDENCE_BYTES} bytes"
+            )

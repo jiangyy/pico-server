@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from http.client import HTTPConnection
 from pathlib import Path
+from urllib.parse import quote
 
 
 from picopg.server.replication import (
@@ -26,6 +27,7 @@ from picopg.server.replication import (
 )
 from picopg.server.auth.model import PrincipalSession
 from picopg.server.drafts.protocol import DraftLogRule
+from picopg.server.analysis import LearningAnalysisLogRule, evidence_log_id
 from picopg.server.playgrounds.releases import PlaygroundLogRule
 from picopg.server.submissions.logs import SubmissionLogRule
 from picopg.replica.file_store import FileReplicaLogStore
@@ -41,7 +43,7 @@ def _start_server(
     server = ReplicaHttpServer(
         ("127.0.0.1", 0), store, token, bindings=bindings,
         principal_sessions=principal_sessions,
-        principal_log_rules=(PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule()),
+        principal_log_rules=(PlaygroundLogRule(), DraftLogRule(), SubmissionLogRule(), LearningAnalysisLogRule()),
     )
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -222,6 +224,45 @@ def _append_and_broadcast(tmp: Path) -> None:
         _stop(server)
 
 
+def _evidence_size_limit(tmp: Path) -> None:
+    from picopg.replica import ReplicatedRecord, record_id_of
+
+    session = PrincipalSession.create("user", "A", "token-a", {}, ["analysis"])
+    server, base_url = _start_server(tmp, principal_sessions=(session,))
+    log_id = evidence_log_id("user", "A")
+    data = {"payload": "x" * (64 * 1024)}
+    record = ReplicatedRecord(
+        id=record_id_of(log_id, None, (), data),
+        log_id=log_id,
+        parent=None,
+        requires=(),
+        data=data,
+    )
+    body = json.dumps({
+        "expectedHead": None,
+        "records": [record.to_value()],
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/api/v1/replica/logs/{quote(log_id, safe='')}/records",
+        data=body,
+        method="POST",
+        headers={"Authorization": "Bearer token-a", "Content-Type": "application/json"},
+    )
+    try:
+        try:
+            urllib.request.urlopen(request, timeout=2)
+        except urllib.error.HTTPError as error:
+            with error:
+                response = json.loads(error.read())
+            _expect(error.code == 400, f"oversized Evidence returned {error.code}")
+            _expect(response["error"]["code"] == "request.invalid", f"unexpected error {response}")
+        else:
+            raise AssertionError("oversized Evidence was accepted")
+        _expect(server.store.head(log_id) is None, "oversized Evidence reached the store")
+    finally:
+        _stop(server)
+
+
 def _principal_revision_access(tmp: Path) -> None:
     from picopg.replica import record_id_of, ReplicatedRecord
 
@@ -381,6 +422,10 @@ class ReplicationTest(unittest.TestCase):
     def test_append_and_broadcast(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             _append_and_broadcast(Path(raw_dir))
+
+    def test_evidence_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            _evidence_size_limit(Path(raw_dir))
 
     def test_principal_revision_access(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
