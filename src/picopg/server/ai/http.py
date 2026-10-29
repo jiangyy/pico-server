@@ -76,6 +76,9 @@ def _permitted(handler: PicoRequestHandler) -> bool:
     if not handler.server.ai_access.allows(replica.principal_id):
         handler.error(403, "ai.not_permitted", "AI is not enabled for this principal")
         return False
+    if not handler.server.ai_budget.admit(replica.principal_id):
+        handler.error(429, "ai.limited", "AI request limit reached; try again later")
+        return False
     return True
 
 

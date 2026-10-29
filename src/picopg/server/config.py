@@ -15,6 +15,7 @@ from picopg.server.ai import (
     CourseSkillRepository,
     OpenAiCompatibleChatModel,
 )
+from picopg.server.ai.budget import AiBudget
 from picopg.server.auth.model import PrincipalAccount, PrincipalSession
 from picopg.server.submissions.git_tags import GitSubmissionTagWriter
 from picopg.server.submissions.worker import SubmissionTagWriter
@@ -168,7 +169,19 @@ def load_token(data_dir: Path, argument: str | None) -> str:
     return token
 
 
-def load_course_ai() -> CourseAi | None:
+def load_ai_budget() -> AiBudget:
+    """PICOPG_AI_HOURLY：每个账号每小时的模型请求数（默认 120）；PICOPG_AI_DAILY_TOKENS：全站每天的 token 上限。"""
+    def positive(name: str) -> int | None:
+        value = os.environ.get(name)
+        if not value:
+            return None
+        if not value.isdigit() or int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        return int(value)
+    return AiBudget(positive("PICOPG_AI_HOURLY") or 120, positive("PICOPG_AI_DAILY_TOKENS"))
+
+
+def load_course_ai(budget: AiBudget | None = None) -> CourseAi | None:
     base_url = os.environ.get("PICOPG_AI_BASE_URL")
     model = os.environ.get("PICOPG_AI_MODEL")
     if base_url is None and model is None:
@@ -176,10 +189,12 @@ def load_course_ai() -> CourseAi | None:
     if not base_url or not model:
         raise ValueError("PICOPG_AI_BASE_URL and PICOPG_AI_MODEL must be set together")
     chat = OpenAiCompatibleChatModel(base_url, model, os.environ.get("PICOPG_AI_API_KEY"))
+    if budget is not None:
+        chat.on_usage = budget.spend
     return CourseAiService(chat, CourseSkillRepository(SKILLS))
 
 
-def load_course_agent() -> CourseAgent | None:
+def load_course_agent(budget: AiBudget | None = None) -> CourseAgent | None:
     """与课程 AI 同一个模型；PICOPG_AI_EFFORT 可选（如 low），推理模型据此少想一点、答得更快。"""
     base_url = os.environ.get("PICOPG_AI_BASE_URL")
     model = os.environ.get("PICOPG_AI_MODEL")
@@ -188,4 +203,6 @@ def load_course_agent() -> CourseAgent | None:
     chat = OpenAiCompatibleChatModel(
         base_url, model, os.environ.get("PICOPG_AI_API_KEY"), os.environ.get("PICOPG_AI_EFFORT") or None,
     )
+    if budget is not None:
+        chat.on_usage = budget.spend
     return CourseAgentService(chat, CourseSkillRepository(SKILLS))

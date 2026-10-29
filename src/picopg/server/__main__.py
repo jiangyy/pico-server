@@ -9,6 +9,7 @@ from picopg.server.ai.access import AiAccess
 from picopg.server.app import build_server
 from picopg.server.client_log import write_client_log_to
 from picopg.server.config import (
+    load_ai_budget,
     load_bindings,
     load_course_agent,
     load_course_ai,
@@ -69,8 +70,9 @@ def main(argv: list[str] | None = None) -> int:
         bindings = load_bindings(arguments.binding, arguments.binding_config)
         principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
-        course_ai = load_course_ai()
-        course_agent = load_course_agent()
+        ai_budget = load_ai_budget()
+        course_ai = load_course_ai(ai_budget)
+        course_agent = load_course_agent(ai_budget)
         ai_access = AiAccess.from_setting(os.environ.get("PICOPG_AI_PRINCIPALS"))
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)
@@ -88,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         course_ai=course_ai,
         course_agent=course_agent,
         ai_access=ai_access,
+        ai_budget=ai_budget,
     )
     host, port = server.server_address
     logger.info(

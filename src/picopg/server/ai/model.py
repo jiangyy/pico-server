@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Protocol
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,8 @@ class OpenAiCompatibleChatModel:
         self.model = model
         self.api_key = api_key
         self.effort = effort
+        # 每次补全用掉的 token 数，交给费用上限记账。
+        self.on_usage: Callable[[int], None] | None = None
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         content = self._message({
@@ -53,9 +56,13 @@ class OpenAiCompatibleChatModel:
         body = json.dumps({"model": self.model, **request}, ensure_ascii=False).encode("utf-8")
         try:
             with urlopen(Request(self.url, body, headers, method="POST"), timeout=timeout) as response:
-                message = json.loads(response.read().decode("utf-8"))["choices"][0]["message"]
+                reply = json.loads(response.read().decode("utf-8"))
+            message = reply["choices"][0]["message"]
         except Exception as error:
             raise CourseAiError("model request failed") from error
+        usage = reply.get("usage")
+        if self.on_usage is not None and isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+            self.on_usage(usage["total_tokens"])
         if not isinstance(message, dict):
             raise CourseAiError("model returned no message")
         return message

@@ -8,6 +8,7 @@ from picopg.replica import ReplicaLogStore
 from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.ai import CourseAgent, CourseAi
 from picopg.server.ai.access import AiAccess
+from picopg.server.ai.budget import AiBudget
 from picopg.server.ai.http import dispatch_ai
 from picopg.server.analysis import LearningAnalysisLogRule
 from picopg.server.auth.http import dispatch_session
@@ -69,6 +70,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         course_ai: CourseAi | None = None,
         course_agent: CourseAgent | None = None,
         ai_access: AiAccess | None = None,
+        ai_budget: AiBudget | None = None,
     ) -> None:
         self.workers = None
         sessions = tuple(principal_sessions)
@@ -131,6 +133,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.course_agent = course_agent
         # 学生代码会发给模型：默认谁都不发，由运营者按账号打开。
         self.ai_access = ai_access or AiAccess()
+        self.ai_budget = ai_budget or AiBudget()
         self.client_log_limiter = ClientLogLimiter()
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
@@ -227,6 +230,7 @@ def build_server(
     course_ai: CourseAi | None = None,
     course_agent: CourseAgent | None = None,
     ai_access: AiAccess | None = None,
+    ai_budget: AiBudget | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
     return PicoPGHttpServer(
@@ -243,4 +247,5 @@ def build_server(
         course_ai=course_ai,
         course_agent=course_agent,
         ai_access=ai_access,
+        ai_budget=ai_budget,
     )
