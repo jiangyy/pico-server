@@ -27,6 +27,8 @@ from picopg.server.client_log import ClientLogLimiter, dispatch_client_log
 from picopg.server.classroom.roster import ClassRosterRepository
 from picopg.server.common.workers import ServerWorkerThread
 from picopg.server.drafts.protocol import DraftLogRule
+from picopg.server.lessons import LessonIndex
+from picopg.server.lessons.http import dispatch_lessons
 from picopg.server.drafts.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log
 from picopg.server.playgrounds.http import dispatch_playground
 from picopg.server.playgrounds.packages import FilePackageStore, PackageAdapter
@@ -139,6 +141,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
             self, FilePackageStore(package_root), package_adapter
         )
         self.comments = CommentPublisher(self)
+        self.lessons = LessonIndex(self.playgrounds)
         self.submissions = SubmissionReader(self.store)
         self.class_rosters = ClassRosterRepository(
             self,
@@ -212,6 +215,8 @@ class PicoRequestHandler(ReplicaRequestHandler):
         if dispatch_review(self, path):
             return
         if dispatch_playground(self, path):
+            return
+        if dispatch_lessons(self, path):
             return
         super()._dispatch()
 
