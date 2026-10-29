@@ -62,7 +62,7 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
         on_text: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         system = self.SYSTEM
-        skill = self._skill(playground_id)
+        skill = self._skill(playground_id, version_id)
         if skill is not None:
             system += "\n\n本课的讲解要点（JSON）：\n" + json.dumps(skill, ensure_ascii=False, separators=(",", ":"))
         chat = [{"role": "system", "content": system}, *(_chat_message(message) for message in messages)]
@@ -76,9 +76,9 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
         chat = [{"role": "system", "content": self.TUTOR}, *(_chat_message(message) for message in messages)]
         return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text))
 
-    def _skill(self, playground_id: str) -> dict[str, object] | None:
+    def _skill(self, playground_id: str, version_id: str) -> dict[str, object] | None:
         try:
-            skill = self.skills.read(playground_id)
+            skill = self.skills.read(playground_id, version_id)
         except CourseAiError:
             return None
         return {key: value for key, value in skill.items() if key not in ("actions", "course")}

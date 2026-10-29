@@ -5,6 +5,8 @@ import json
 import tempfile
 import threading
 import unittest
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 from picopg.replica.file_store import FileReplicaLogStore
@@ -14,6 +16,7 @@ from picopg.server.ai.access import AiAccess
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
 from picopg.server.config import SKILLS
+from picopg.server.playgrounds.packages import FilePackageStore, version_id
 
 
 class FakeCourseAi:
@@ -150,6 +153,29 @@ class CourseAiServiceTest(unittest.TestCase):
         bad_model = SequencedModel(['{"text":"答案","primary":{"action":"source.replace","label":"替换"}}'] * 2)
         with self.assertRaises(CourseAiError, msg="forbidden actions must be rejected after one retry"):
             CourseAiService(bad_model, self.skills).reply("sudoku", "v1", REQUEST)
+
+    def test_packaged_skill_wins_and_missing_skill_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            packages = FilePackageStore(root / "packages")
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("course/hanoi.skill.json", json.dumps({
+                    "course": "hanoi", "actions": ["code.run"], "teaches": "包里的版本",
+                }))
+            payload = output.getvalue()
+            packaged_version = version_id(payload)
+            packages.put("hanoi", packaged_version, payload)
+            repository = CourseSkillRepository(SKILLS, packages)
+            self.assertEqual(repository.read("hanoi", packaged_version)["teaches"], "包里的版本")
+
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("course/other.json", "{}")
+            payload = output.getvalue()
+            legacy_version = version_id(payload)
+            packages.put("hanoi", legacy_version, payload)
+            self.assertNotEqual(repository.read("hanoi", legacy_version)["teaches"], "包里的版本")
 
 
 if __name__ == "__main__":

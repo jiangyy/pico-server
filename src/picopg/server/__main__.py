@@ -71,8 +71,8 @@ def main(argv: list[str] | None = None) -> int:
         principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
         ai_budget = load_ai_budget()
-        course_ai = load_course_ai(ai_budget)
-        course_agent = load_course_agent(ai_budget)
+        course_ai = load_course_ai(ai_budget, arguments.data / "packages")
+        course_agent = load_course_agent(ai_budget, arguments.data / "packages")
         ai_access = AiAccess.from_setting(os.environ.get("PICOPG_AI_PRINCIPALS"))
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)

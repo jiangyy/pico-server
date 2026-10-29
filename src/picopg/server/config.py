@@ -17,6 +17,7 @@ from picopg.server.ai import (
 )
 from picopg.server.ai.budget import AiBudget
 from picopg.server.auth.model import PrincipalAccount, PrincipalSession
+from picopg.server.playgrounds.packages import FilePackageStore
 from picopg.server.submissions.git_tags import GitSubmissionTagWriter
 from picopg.server.submissions.worker import SubmissionTagWriter
 
@@ -181,7 +182,7 @@ def load_ai_budget() -> AiBudget:
     return AiBudget(positive("PICOPG_AI_HOURLY") or 120, positive("PICOPG_AI_DAILY_TOKENS"))
 
 
-def load_course_ai(budget: AiBudget | None = None) -> CourseAi | None:
+def load_course_ai(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAi | None:
     base_url = os.environ.get("PICOPG_AI_BASE_URL")
     model = os.environ.get("PICOPG_AI_MODEL")
     if base_url is None and model is None:
@@ -191,10 +192,10 @@ def load_course_ai(budget: AiBudget | None = None) -> CourseAi | None:
     chat = OpenAiCompatibleChatModel(base_url, model, os.environ.get("PICOPG_AI_API_KEY"))
     if budget is not None:
         chat.on_usage = budget.spend
-    return CourseAiService(chat, CourseSkillRepository(SKILLS))
+    return CourseAiService(chat, _course_skills(package_root))
 
 
-def load_course_agent(budget: AiBudget | None = None) -> CourseAgent | None:
+def load_course_agent(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAgent | None:
     """与课程 AI 同一个模型；PICOPG_AI_EFFORT 可选（如 low），推理模型据此少想一点、答得更快。"""
     base_url = os.environ.get("PICOPG_AI_BASE_URL")
     model = os.environ.get("PICOPG_AI_MODEL")
@@ -205,4 +206,9 @@ def load_course_agent(budget: AiBudget | None = None) -> CourseAgent | None:
     )
     if budget is not None:
         chat.on_usage = budget.spend
-    return CourseAgentService(chat, CourseSkillRepository(SKILLS))
+    return CourseAgentService(chat, _course_skills(package_root))
+
+
+def _course_skills(package_root: Path | None) -> CourseSkillRepository:
+    packages = None if package_root is None else FilePackageStore(package_root)
+    return CourseSkillRepository(SKILLS, packages)

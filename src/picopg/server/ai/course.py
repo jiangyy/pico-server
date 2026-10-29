@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 import re
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.model import ChatModel, CourseAiError
+from picopg.server.playgrounds.packages import (
+    FilePackageStore,
+    PackageError,
+    PackageNotFound,
+    validate_version_id,
+)
 
 
 class CourseAi(Protocol):
@@ -13,10 +21,14 @@ class CourseAi(Protocol):
 
 
 class CourseSkillRepository:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, packages: FilePackageStore | None = None) -> None:
         self.root = root
+        self.packages = packages
 
-    def read(self, playground_id: str) -> dict[str, object]:
+    def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]:
+        packaged = self._packaged(playground_id, version_id)
+        if packaged is not None:
+            return _skill_value(packaged, playground_id)
         path = self.root / f"{playground_id}.json"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -24,12 +36,32 @@ class CourseSkillRepository:
             raise CourseAiError(f"course AI is not configured for {playground_id!r}") from error
         except (OSError, json.JSONDecodeError) as error:
             raise CourseAiError(f"course AI skill is invalid for {playground_id!r}") from error
-        if not isinstance(value, dict) or value.get("course") != playground_id:
-            raise CourseAiError(f"course AI skill does not match {playground_id!r}")
-        actions = value.get("actions")
-        if not isinstance(actions, list) or any(not isinstance(item, str) for item in actions):
-            raise CourseAiError(f"course AI skill actions are invalid for {playground_id!r}")
-        return value
+        return _skill_value(value, playground_id)
+
+    def _packaged(self, playground_id: str, version_id: str | None) -> object | None:
+        if self.packages is None or version_id is None:
+            return None
+        try:
+            validate_version_id(version_id)
+        except PackageError:
+            return None
+        try:
+            payload = self.packages.read(playground_id, version_id)
+        except PackageNotFound:
+            return None
+        except PackageError as error:
+            raise CourseAiError(f"course package is invalid for {playground_id!r}") from error
+        try:
+            with zipfile.ZipFile(BytesIO(payload)) as archive:
+                content = archive.read(f"course/{playground_id}.skill.json")
+        except KeyError:
+            return None
+        except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+            raise CourseAiError(f"course package skill is unreadable for {playground_id!r}") from error
+        try:
+            return json.loads(content.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CourseAiError(f"course package skill is invalid for {playground_id!r}") from error
 
 
 class CourseAiService:
@@ -50,7 +82,7 @@ class CourseAiService:
         self.skills = skills
 
     def reply(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]:
-        skill = self.skills.read(playground_id)
+        skill = self.skills.read(playground_id, version_id)
         focused = _focused_skill(skill, request)
         messages = [
             {"role": "system", "content": self.SYSTEM},
@@ -99,6 +131,15 @@ def _focused_skill(skill: dict[str, object], request: dict[str, object]) -> dict
         key: value for key, value in skill.items()
         if key not in ("misconceptions", "actions")
     } | {"misconceptions": matched, "actions": skill["actions"]}
+
+
+def _skill_value(value: object, playground_id: str) -> dict[str, object]:
+    if not isinstance(value, dict) or value.get("course") != playground_id:
+        raise CourseAiError(f"course AI skill does not match {playground_id!r}")
+    actions = value.get("actions")
+    if not isinstance(actions, list) or any(not isinstance(item, str) for item in actions):
+        raise CourseAiError(f"course AI skill actions are invalid for {playground_id!r}")
+    return value
 
 
 def _reply_value(content: str, skill: dict[str, object], request: dict[str, object]) -> dict[str, object]:
