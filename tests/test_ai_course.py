@@ -10,6 +10,7 @@ from pathlib import Path
 from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.ai.course import CourseAiService, CourseSkillRepository
 from picopg.server.ai.model import CourseAiError
+from picopg.server.ai.access import AiAccess
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
 from picopg.server.config import SKILLS
@@ -74,6 +75,7 @@ class CourseAiRouteTest(unittest.TestCase):
                 root / "packages",
                 principal_sessions=[session],
                 course_ai=fake,
+                ai_access=AiAccess(["student"]),
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -85,6 +87,11 @@ class CourseAiRouteTest(unittest.TestCase):
                 assert fake.requests == [("sudoku", "v1", REQUEST)]
                 status, error = post(connection, "wrong-token", body)
                 assert status == 401 and error["error"]["code"] == "auth.required"
+                server.ai_access = AiAccess(["someone-else"])
+                status, error = post(connection, "student-token", body)
+                assert status == 403 and error["error"]["code"] == "ai.not_permitted"
+                assert len(fake.requests) == 1, "a principal without AI never reaches the model"
+                server.ai_access = AiAccess(["student"])
                 invalid = {**body, "request": {**REQUEST, "context": {"source": "x"}}}
                 status, error = post(connection, "student-token", invalid)
                 assert status == 400 and error["error"]["code"] == "ai.request.invalid"

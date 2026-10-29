@@ -11,6 +11,7 @@ from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.ai.agent import CourseAgentService, agent_request
 from picopg.server.ai.course import CourseSkillRepository
 from picopg.server.ai.model import CourseAiError
+from picopg.server.ai.access import AiAccess
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
 from picopg.server.config import SKILLS
@@ -105,7 +106,7 @@ class AgentRouteTest(unittest.TestCase):
             session = PrincipalSession.create("student", "device", "student-token", {}, ["playgrounds"])
             server = PicoPGHttpServer(
                 ("127.0.0.1", 0), FileReplicaLogStore(root / "replica"), "operator-token", root / "packages",
-                principal_sessions=[session], course_agent=FakeAgent(),
+                principal_sessions=[session], course_agent=FakeAgent(), ai_access=AiAccess(["student"]),
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
+from picopg.server.ai.access import AiAccess
 from picopg.server.app import build_server
 from picopg.server.client_log import write_client_log_to
 from picopg.server.config import (
@@ -69,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
         course_ai = load_course_ai()
         course_agent = load_course_agent()
+        ai_access = AiAccess.from_setting(os.environ.get("PICOPG_AI_PRINCIPALS"))
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)
         return 2
@@ -84,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         submission_tag_writer=submission_tag_writer,
         course_ai=course_ai,
         course_agent=course_agent,
+        ai_access=ai_access,
     )
     host, port = server.server_address
     logger.info(
@@ -92,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if course_ai is None:
         logger.info("course AI disabled; clients will use their offline answers")
+    elif not ai_access.everyone and not ai_access.principals:
+        logger.info("course AI configured but PICOPG_AI_PRINCIPALS is empty; nobody's code is sent to the model")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

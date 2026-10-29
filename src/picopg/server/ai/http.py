@@ -20,8 +20,7 @@ def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
         if handler.command != "POST":
             handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        if handler.authenticated_replica() is None:
-            handler.error(401, "auth.required", "valid Session required")
+        if not _permitted(handler):
             return True
         if handler.server.course_ai is None:
             handler.error(503, "ai.unavailable", "course AI is not configured")
@@ -46,8 +45,7 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
         if handler.command != "POST":
             handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        if handler.authenticated_replica() is None:
-            handler.error(401, "auth.required", "valid Session required")
+        if not _permitted(handler):
             return True
         if handler.server.course_agent is None:
             handler.error(503, "ai.unavailable", "course agent is not configured")
@@ -67,6 +65,17 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
     except Exception:
         logger.exception("course agent request failed")
         handler.error(500, "server.failure", "server failure")
+    return True
+
+
+def _permitted(handler: PicoRequestHandler) -> bool:
+    replica = handler.authenticated_replica()
+    if replica is None:
+        handler.error(401, "auth.required", "valid Session required")
+        return False
+    if not handler.server.ai_access.allows(replica.principal_id):
+        handler.error(403, "ai.not_permitted", "AI is not enabled for this principal")
+        return False
     return True
 
 
