@@ -73,6 +73,7 @@ class CourseAgentServiceTest(unittest.TestCase):
         sent, tools = model.calls[0]
         self.assertEqual(sent[0]["role"], "system")
         self.assertIn("本课的讲解要点", sent[0]["content"])
+        self.assertIn("调用 grade 收尾", sent[0]["content"])
         self.assertEqual(sent[2], {
             "role": "assistant", "content": "", "reasoning_content": "先标出来",
             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "act", "arguments": "{\"action\":\"code.run\"}"}}],
