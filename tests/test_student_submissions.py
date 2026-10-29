@@ -126,10 +126,12 @@ class StudentSubmissionsTest(unittest.TestCase):
                     "submission-a",
                     "submission-b",
                 ]
-                assert submissions[0]["comments"] == [{
+                [comment] = submissions[0]["comments"]
+                assert {key: comment[key] for key in ("author", "text")} == {
                     "author": "teacher",
                     "text": "Only the first Submission.",
-                }]
+                }
+                assert comment["createdAt"].endswith("Z"), "the comment carries the server time it was written"
                 assert submissions[1]["comments"] == []
                 assert all("replicaId" not in item for item in submissions)
                 assert all(item["id"] for item in submissions)

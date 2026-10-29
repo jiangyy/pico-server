@@ -22,11 +22,14 @@ def history_value(
             "playgroundId": submission.playground_id,
             "status": submission.status,
             "comments": [
-                {"author": comment.author, "text": comment.text}
+                {"author": comment.author, "text": comment.text,
+                 **({} if comment.created_at is None else {"createdAt": comment.created_at})}
                 for comment in draft_comments
                 if comment.submission_request == submission.request
             ],
         }
+        if submission.submitted_at is not None:
+            value["submittedAt"] = submission.submitted_at
         if submission.tag is not None:
             value["tag"] = submission.tag
         if submission.message is not None:

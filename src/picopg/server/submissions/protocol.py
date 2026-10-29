@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from picopg.server.drafts.protocol import decode_revision
 from picopg.server.common.reads import find_record
 from picopg.server.submissions.logs import request_scope
-from picopg.server.common.validation import require_non_blank_position, require_non_blank_text
+from picopg.server.common.validation import optional_time, require_non_blank_position, require_non_blank_text
 from picopg.replica import Position, ReplicaLogStore, ReplicatedRecord
 
 
@@ -24,6 +24,8 @@ class SubmissionRequest:
     submission_id: str
     playground_id: str
     revision: Position
+    # 学生的设备发起提交的时间，随请求不可变；这个字段加入之前的旧请求没有。
+    submitted_at: str | None = field(default=None, kw_only=True)
 
 
 def decode_request(record: ReplicatedRecord) -> SubmissionRequest:
@@ -46,7 +48,8 @@ def decode_request(record: ReplicatedRecord) -> SubmissionRequest:
     if revision not in record.requires:
         raise SubmissionError("Submission does not require its Revision")
     return SubmissionRequest(
-        record.position, principal_id, replica_id, submission_id, playground_id, revision
+        record.position, principal_id, replica_id, submission_id, playground_id, revision,
+        submitted_at=optional_time(data.get("submittedAt"), "submittedAt", error_type=SubmissionError),
     )
 
 

@@ -114,7 +114,7 @@ class SubmissionReader:
         if result is None:
             return Submission(
                 request.position, principal_id, replica_id, submission_id,
-                playground_id, revision, "requested",
+                playground_id, revision, "requested", submitted_at=decoded.submitted_at,
             )
         result_data = result.data
         if not isinstance(result_data, Mapping):
@@ -123,7 +123,7 @@ class SubmissionReader:
         if kind == "submission.failed":
             return Submission(
                 request.position, principal_id, replica_id, submission_id,
-                playground_id, revision, "failed",
+                playground_id, revision, "failed", submitted_at=decoded.submitted_at,
                 message=require_non_blank_text(
                     result_data.get("message"),
                     "message",
@@ -144,7 +144,7 @@ class SubmissionReader:
             raise SubmissionError("Submission result names another Revision")
         return Submission(
             request.position, principal_id, replica_id, submission_id,
-            playground_id, revision, "completed",
+            playground_id, revision, "completed", submitted_at=decoded.submitted_at,
             tag=require_non_blank_text(
                 result_data.get("tag"),
                 "tag",

@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Mapping, Protocol, Union
 
 from picopg.server.common.ids import encode_component
 from picopg.server.common.reads import PaginationStalled, read_all
-from picopg.server.common.validation import require_non_blank_position, require_non_blank_text
+from picopg.server.common.validation import optional_time, require_non_blank_position, require_non_blank_text, utc_now
 from picopg.replica import Position, ReplicaLogStore, ReplicatedRecord, record_id_of
 
 
@@ -42,6 +43,8 @@ class Comment:
     submission_id: str | None = None
     submission_request: Position | None = None
     revision: Position | None = None
+    # 评语写下的服务端时间；这个字段加入之前的旧评语没有。
+    created_at: str | None = None
 
 
 class CommentServer(Protocol):
@@ -62,10 +65,11 @@ def _draft_id(value: object) -> str:
 class CommentPublisher:
     """Appends comments to the Draft's comment Log, which Clients only read."""
 
-    def __init__(self, server: CommentServer) -> None:
+    def __init__(self, server: CommentServer, clock: Callable[[], str] = utc_now) -> None:
         self._server = server
         self._store = server.store
         self._lock = threading.Lock()
+        self._clock = clock
 
     def add(self, principal_id: str, draft_id: str, author: str, text: str) -> Position:
         return self._add(principal_id, draft_id, author, text)
@@ -119,6 +123,8 @@ class CommentPublisher:
             "draftId": draft_id,
             "author": author,
             "text": text,
+            # 写入时定下、之后随记录不可变；画像的时间窗口与“最近的评语”都以它为准。
+            "createdAt": self._clock(),
         }
         targets = (submission_id, submission_request, revision)
         if any(target is not None for target in targets):
@@ -206,4 +212,5 @@ def _decode(record: ReplicatedRecord, draft_id: str) -> Comment:
         submission_id,
         submission_request,
         revision,
+        optional_time(data.get("createdAt"), "createdAt", error_type=CommentError),
     )

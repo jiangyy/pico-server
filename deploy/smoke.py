@@ -483,8 +483,12 @@ def prepare(
             item for item in history["submissions"]
             if isinstance(item, dict) and item.get("id") == submission.id
         ), None)
-        expected_comment = {"author": "deployment-smoke", "text": comment_text}
-        if student_item is None or expected_comment not in student_item.get("comments", []):
+        # 评语还带着 createdAt 等字段；这里只认作者与正文。
+        delivered = [
+            (comment.get("author"), comment.get("text"))
+            for comment in (student_item or {}).get("comments", []) if isinstance(comment, dict)
+        ]
+        if student_item is None or ("deployment-smoke", comment_text) not in delivered:
             raise RuntimeError("teacher comment did not reach student Submission history")
         _json(opener, base_url, "/api/v1/operator/session", method="DELETE")
     finally:
@@ -556,12 +560,15 @@ def verify(
         item for item in history["submissions"]
         if isinstance(item, dict) and item.get("id") == state.request_record_id
     ), None)
-    expected_comment = {"author": "deployment-smoke", "text": state.comment_text}
+    delivered = [
+        (comment.get("author"), comment.get("text"))
+        for comment in (student_item or {}).get("comments", []) if isinstance(comment, dict)
+    ]
     if (
         student_item is None
         or student_item.get("status") != "completed"
         or student_item.get("tag") != state.tag
-        or expected_comment not in student_item.get("comments", [])
+        or ("deployment-smoke", state.comment_text) not in delivered
     ):
         raise RuntimeError("Submission or teacher comment did not survive restart")
 
