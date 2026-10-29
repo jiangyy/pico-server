@@ -47,3 +47,17 @@ class CommentTimeTest(unittest.TestCase):
             assert comment.created_at == "2026-10-29T06:00:00.000Z"
             later = CommentPublisher(FakeServer(store), clock=lambda: "2030-01-01T00:00:00.000Z")
             assert later.comments("s", "hanoi")[0].created_at == "2026-10-29T06:00:00.000Z", "reading never re-stamps a fact"
+
+
+class CommentReadRuleTest(unittest.TestCase):
+    def test_each_device_writes_its_own_read_receipts_and_the_students_other_devices_read_them(self) -> None:
+        from picopg.server.submissions.logs import SubmissionLogRule
+
+        rule = SubmissionLogRule()
+        replicas = frozenset({"A", "B"})
+        assert rule.access("s", "A", replicas, "principal/s/submission/A/reads") == "append"
+        assert rule.access("s", "A", replicas, "principal/s/submission/B/reads") == "read"
+        assert rule.access("s", "A", replicas, "principal/s/submission/C/reads") is None, "not this student's device"
+        assert rule.access("s", "A", replicas, "principal/t/submission/A/reads") is None, "never another student's"
+        assert rule.access("s", "A", replicas, "principal/s/submission/B/requests") is None, "other devices' requests stay private as before"
+        assert rule.owner("principal/s/submission/A/reads") == ("s", "A")

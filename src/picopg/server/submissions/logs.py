@@ -21,8 +21,14 @@ class SubmissionLogRule:
             or parts[0] != "principal"
             or parts[1] != encode_component(principal_id, "principalId")
             or parts[2] != "submission"
-            or parts[3] != encode_component(replica_id, "replicaId")
         ):
+            return None
+        # 评语已读回执：本设备追加，同一学生的其他设备只读，合起来才知道哪些评语看过了。
+        if parts[4] == "reads":
+            if parts[3] == encode_component(replica_id, "replicaId"):
+                return "append"
+            return "read" if parts[3] in {encode_component(replica, "replicaId") for replica in replicas} else None
+        if parts[3] != encode_component(replica_id, "replicaId"):
             return None
         if parts[4] == "requests":
             return "append"
@@ -36,7 +42,7 @@ class SubmissionLogRule:
             len(parts) == 5
             and parts[0] == "principal"
             and parts[2] == "submission"
-            and parts[4] == "requests"
+            and parts[4] in ("requests", "reads")
         ):
             return parts[1], parts[3]
         return None
