@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from picopg.server.app import build_server
+from picopg.server.client_log import write_client_log_to
 from picopg.server.config import (
     load_bindings,
     load_course_agent,
@@ -60,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    write_client_log_to(arguments.data / "logs" / "client.log")
     token = load_token(arguments.data, arguments.token)
     try:
         bindings = load_bindings(arguments.binding, arguments.binding_config)

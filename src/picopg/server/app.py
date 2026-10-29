@@ -21,6 +21,7 @@ from picopg.server.auth.model import (
 )
 from picopg.server.auth.registry import FileSessionRegistry
 from picopg.server.classroom.http import dispatch_classroom
+from picopg.server.client_log import ClientLogLimiter, dispatch_client_log
 from picopg.server.classroom.roster import ClassRosterRepository
 from picopg.server.common.workers import ServerWorkerThread
 from picopg.server.drafts.protocol import DraftLogRule
@@ -126,6 +127,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.secure_cookies = secure_cookies
         self.course_ai = course_ai
         self.course_agent = course_agent
+        self.client_log_limiter = ClientLogLimiter()
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
         )
@@ -191,6 +193,8 @@ class PicoRequestHandler(ReplicaRequestHandler):
         if dispatch_session(self, path):
             return
         if dispatch_ai(self, path):
+            return
+        if dispatch_client_log(self, path):
             return
         if dispatch_submissions(self, path):
             return
