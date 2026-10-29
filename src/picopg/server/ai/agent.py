@@ -50,6 +50,8 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
 怎么做：
 - 只根据用户消息里的学习数据说话，不要编造课程、提交或批注。
 - 推荐课程时用 offer 放上「打开」或「回到」这门课的按钮，按钮最多 3 个。
+- 学生想学某个知识点时，先用 search_lessons 找讲它的那一步（工具存在时），再用 offer 的 lecture 按钮带过去，lecture 与 step 照搬搜索结果；搜不到就如实说现有课程没讲到。
+- 解释老师的批注时引用学习数据里的批注原文与它批在第几行，不要只说条数。
 - 对学生说的话要短：最多 5 句，具体、鼓励，可以用 Markdown。"""
 
     def __init__(self, model: ToolModel, skills: CourseSkillRepository) -> None:
