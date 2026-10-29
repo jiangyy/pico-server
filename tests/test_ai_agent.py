@@ -22,7 +22,7 @@ class RecordingModel:
         self.replies = iter(replies)
         self.calls = []
 
-    def step(self, messages, tools):
+    def step(self, messages, tools, on_text=None):
         self.calls.append((messages, tools))
         return next(self.replies)
 
@@ -36,10 +36,16 @@ MESSAGES = [
 ]
 
 class FakeAgent:
-    def step(self, playground_id, version_id, messages, tools):
+    def step(self, playground_id, version_id, messages, tools, on_text=None):
+        if on_text is not None:
+            if playground_id == "broken":
+                on_text("说到一半")
+                raise CourseAiError("model request failed")
+            for piece in ("先看", "**第 2 行**"):
+                on_text(piece)
         return {"content": f"{playground_id}:{len(messages)}", "calls": []}
 
-    def tutor(self, messages, tools):
+    def tutor(self, messages, tools, on_text=None):
         return {"content": f"tutor:{len(messages)}", "calls": []}
 
 
@@ -126,6 +132,39 @@ class AgentRouteTest(unittest.TestCase):
                 self.assertEqual((status, error["error"]["code"]), (400, "ai.request.invalid"))
             finally:
                 connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def test_streamed_steps_send_text_then_the_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = PrincipalSession.create("student", "device", "student-token", {}, ["playgrounds"])
+            server = PicoPGHttpServer(
+                ("127.0.0.1", 0), FileReplicaLogStore(root / "replica"), "operator-token", root / "packages",
+                principal_sessions=[session], course_agent=FakeAgent(), ai_access=AiAccess(["student"]),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def stream(playground_id):
+                connection = http.client.HTTPConnection(*server.server_address)
+                body = {"playgroundId": playground_id, "versionId": "v1", "messages": MESSAGES, "tools": TOOLS}
+                connection.request("POST", "/api/v1/ai/agent", json.dumps(body).encode(), {
+                    "Authorization": "Bearer student-token", "Content-Type": "application/json", "Accept": "application/x-ndjson",
+                })
+                response = connection.getresponse()
+                lines = [json.loads(line) for line in response.read().decode().splitlines()]
+                connection.close()
+                return response, lines
+
+            try:
+                response, lines = stream("hello")
+                self.assertEqual(response.getheader("X-Accel-Buffering"), "no")
+                self.assertEqual(lines, [{"text": "先看"}, {"text": "**第 2 行**"}, {"turn": {"content": "hello:3", "calls": []}}])
+                _, lines = stream("broken")
+                self.assertEqual(lines, [{"text": "说到一半"}, {"error": {"code": "ai.reply.invalid", "message": "model request failed"}}])
+            finally:
                 server.shutdown()
                 server.server_close()
                 thread.join()

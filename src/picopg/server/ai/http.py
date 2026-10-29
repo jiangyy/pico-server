@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from picopg.server.ai.agent import agent_request, tutor_request
@@ -50,12 +52,17 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
         if handler.server.course_agent is None:
             handler.error(503, "ai.unavailable", "course agent is not configured")
             return True
+        agent = handler.server.course_agent
         if path == "/api/v1/ai/tutor":
-            turn = handler.server.course_agent.tutor(*tutor_request(handler.read_json()))
+            messages, tools = tutor_request(handler.read_json())
+            run = lambda on_text: agent.tutor(messages, tools, on_text)  # noqa: E731
         else:
             playground_id, version_id, messages, tools = agent_request(handler.read_json())
-            turn = handler.server.course_agent.step(playground_id, version_id, messages, tools)
-        handler.send_json(200, turn, (("Cache-Control", "no-store"),))
+            run = lambda on_text: agent.step(playground_id, version_id, messages, tools, on_text)  # noqa: E731
+        if "application/x-ndjson" in (handler.headers.get("Accept") or ""):
+            _stream(handler, run)
+        else:
+            handler.send_json(200, run(None), (("Cache-Control", "no-store"),))
     except ValueError as error:
         handler.error(400, "ai.request.invalid", str(error))
     except CourseAiError as error:
@@ -66,6 +73,36 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
         logger.exception("course agent request failed")
         handler.error(500, "server.failure", "server failure")
     return True
+
+
+def _stream(handler: PicoRequestHandler, run: Callable[[Callable[[str], None] | None], dict[str, object]]) -> None:
+    """一行一个 JSON：正文片段 {"text"} 随模型到达，最后一行是这一步 {"turn"}，失败时是 {"error"}。
+    响应头发出后不能再改状态码，所以中途失败也写成一行。"""
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    # nginx 默认攒满缓冲区才转发；这个头让它逐行放行。
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.end_headers()
+    handler.close_connection = True
+
+    def line(value: dict[str, object]) -> None:
+        handler.wfile.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
+        handler.wfile.flush()
+
+    try:
+        turn = run(lambda text: line({"text": text}))
+    except (BrokenPipeError, ConnectionResetError):
+        raise ResponseSent() from None
+    except CourseAiError as error:
+        line({"error": {"code": "ai.reply.invalid", "message": str(error)}})
+        raise ResponseSent() from None
+    except Exception:
+        logger.exception("course agent stream failed")
+        line({"error": {"code": "server.failure", "message": "server failure"}})
+        raise ResponseSent() from None
+    line({"turn": turn})
+    raise ResponseSent()
 
 
 def _permitted(handler: PicoRequestHandler) -> bool:

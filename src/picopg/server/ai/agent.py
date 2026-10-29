@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository
@@ -12,9 +13,13 @@ class CourseAgent(Protocol):
     def step(
         self, playground_id: str, version_id: str,
         messages: list[dict[str, object]], tools: list[dict[str, object]],
+        on_text: Callable[[str], None] | None = None,
     ) -> dict[str, object]: ...
 
-    def tutor(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> dict[str, object]: ...
+    def tutor(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]],
+        on_text: Callable[[str], None] | None = None,
+    ) -> dict[str, object]: ...
 
 
 MAX_MESSAGES = 240
@@ -54,18 +59,22 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
     def step(
         self, playground_id: str, version_id: str,
         messages: list[dict[str, object]], tools: list[dict[str, object]],
+        on_text: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         system = self.SYSTEM
         skill = self._skill(playground_id)
         if skill is not None:
             system += "\n\n本课的讲解要点（JSON）：\n" + json.dumps(skill, ensure_ascii=False, separators=(",", ":"))
         chat = [{"role": "system", "content": system}, *(_chat_message(message) for message in messages)]
-        reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools])
+        reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text)
         return _turn(reply)
 
-    def tutor(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> dict[str, object]:
+    def tutor(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]],
+        on_text: Callable[[str], None] | None = None,
+    ) -> dict[str, object]:
         chat = [{"role": "system", "content": self.TUTOR}, *(_chat_message(message) for message in messages)]
-        return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools]))
+        return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text))
 
     def _skill(self, playground_id: str) -> dict[str, object] | None:
         try:
