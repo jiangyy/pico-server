@@ -134,6 +134,17 @@ class CourseAgentServiceTest(unittest.TestCase):
         self.assertIn('学生画像（JSON；用来决定教什么、问什么，不要念给学生听）：\n{"concepts":[{"concept":"for","status":"shaky"}]}', with_profile)
         self.assertNotIn("学生画像", without)
 
+    def test_a_comment_draft_reads_the_code_lesson_and_profile_without_tools(self) -> None:
+        model = RecordingModel([{"content": "  **做对了**：第 1 行。  "}])
+        text = CourseAgentService(model, self.skills).draft_comment("sudoku", "v1", "a = 1\nprint(a)\n", {"concepts": []})
+        self.assertEqual(text, "**做对了**：第 1 行。")
+        sent, tools = model.calls[0]
+        self.assertEqual(tools, [])
+        self.assertTrue(sent[0]["content"].startswith("你在帮初中 Python 老师起草"))
+        self.assertIn("本课的讲解要点", sent[0]["content"])
+        self.assertIn("学生画像", sent[0]["content"])
+        self.assertEqual(sent[1]["content"], "学生提交的代码：\n1| a = 1\n2| print(a)")
+
     def test_tutor_uses_the_platform_prompt(self) -> None:
         # 导师用同一个模型，换成平台层的系统提示，不带课程。
         tutor_model = RecordingModel([{"content": "先把汉诺塔收个尾。"}])

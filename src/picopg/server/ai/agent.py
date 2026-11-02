@@ -23,6 +23,8 @@ class CourseAgent(Protocol):
         on_text: Callable[[str], None] | None = None, learner: dict[str, object] | None = None,
     ) -> dict[str, object]: ...
 
+    def draft_comment(self, playground_id: str, version_id: str, source: str, learner: dict[str, object] | None = None) -> str: ...
+
 
 MAX_MESSAGES = 240
 MAX_CONTENT = 60_000
@@ -74,9 +76,19 @@ class CourseAgentService:
 - 系统提示最后有学生画像时，问学得怎么样、接下来学什么，都以它为据：先说 shaky 的概念和反复出现的误区，再说 due 里该复习的、open 里没做完的练习；用概念的中文名，不说 id 和状态值。
 - 说清楚为止，一般 3 到 8 句：具体、鼓励，可以用 Markdown。"""
 
+    DRAFT = """你在帮初中 Python 老师起草一条对学生作业提交的评语，老师会改过再发给学生。
+你看不到运行结果，只能读代码；拿不准的地方用「可以运行看看……」提醒，不要断言。
+按下面的格式写，每项一句，总共不超过 120 字，只输出评语正文：
+**做对了**：具体到哪一行、哪个想法。
+**问题**：哪一行、为什么；没有明显问题就写一个可以改进的地方。
+**怎么改**：给方向或提示，不给完整答案。
+最后一句简短的鼓励。
+附有学生画像时，留意本次代码是否又出现画像里的误区或不牢的概念，有就点出来。"""
+
     def __init__(self, model: ToolModel, skills: CourseSkillRepository, teaching: list[TeachingSkill] | None = None) -> None:
         self.model = model
         self.skills = skills
+        self._teaching = teaching
         self.teaching = load_teaching() if teaching is None else teaching
 
     def step(
@@ -96,7 +108,8 @@ class CourseAgentService:
         """稳定的部分在前（core、本课要点），随本轮变化的 skill 在后，模型服务的前缀缓存才命中。"""
         names = {str(tool["name"]) for tool in tools}
         said = _said(messages)
-        matched = [skill for skill in self.teaching if skill.applies(names, said)]
+        teaching = load_teaching() if self._teaching is None else self.teaching
+        matched = [skill for skill in teaching if skill.applies(names, said)]
         parts = [skill.body for skill in matched if skill.when == "always"]
         course = self._skill(playground_id, version_id)
         if course is not None:
@@ -110,6 +123,19 @@ class CourseAgentService:
     ) -> dict[str, object]:
         chat = [{"role": "system", "content": self.TUTOR + _learner(learner)}, *(_chat_message(message) for message in messages)]
         return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text))
+
+    def draft_comment(self, playground_id: str, version_id: str, source: str, learner: dict[str, object] | None = None) -> str:
+        """老师批改时的草稿：不带工具，一步写完。"""
+        system = self.DRAFT
+        course = self._skill(playground_id, version_id)
+        if course is not None:
+            system += "\n\n本课的讲解要点（JSON）：\n" + json.dumps(course, ensure_ascii=False, separators=(",", ":"))
+        numbered = "\n".join(f"{index}| {line}" for index, line in enumerate(source.splitlines()[:400], 1))
+        chat = [{"role": "system", "content": system + _learner(learner)}, {"role": "user", "content": f"学生提交的代码：\n{numbered}"}]
+        text = _turn(self.model.step(chat, [], None))["content"]
+        if not text.strip():
+            raise CourseAiError("model returned an empty draft")
+        return text.strip()
 
     def _skill(self, playground_id: str, version_id: str) -> dict[str, object] | None:
         try:
