@@ -42,9 +42,19 @@ class SubmissionRequestConsumer:
         self._on_result = on_result or (lambda _log_id, _head: None)
 
     def run_once(self) -> int:
+        """一个学生的日志出错不挡住其他学生：都处理完再把第一个错误交给 worker 记录并稍后重试。"""
         with self._lock:
             request_logs = tuple(sorted(self._request_logs))
-        return sum(self._run_log(log_id) for log_id in request_logs)
+        handled = 0
+        failure: Exception | None = None
+        for log_id in request_logs:
+            try:
+                handled += self._run_log(log_id)
+            except Exception as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
+        return handled
 
     def add_request_log(self, log_id: str) -> None:
         if not is_request_log(log_id):

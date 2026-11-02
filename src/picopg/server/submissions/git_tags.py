@@ -42,11 +42,14 @@ class GitSubmissionTagWriter:
                 raise ValueError("submission tag already exists with different source")
             return tag
 
-        parent = self._run(repository, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+        # 刚 git init 的仓库没有 HEAD：第一份提交成为根提交。
+        head = self._run(repository, "rev-parse", "--verify", "--quiet", "HEAD", check=False)
+        parent = head.stdout.decode().strip() if head.returncode == 0 else None
         blob = self._run(repository, "hash-object", "-w", "--stdin", input=source.encode("utf-8")).stdout.decode().strip()
         with tempfile.TemporaryDirectory(prefix="picopg-git-index-") as temporary:
             environment = {"GIT_INDEX_FILE": str(Path(temporary) / "index")}
-            self._run(repository, "read-tree", parent, environment=environment)
+            if parent is not None:
+                self._run(repository, "read-tree", parent, environment=environment)
             self._run(
                 repository,
                 "update-index",
@@ -69,8 +72,7 @@ class GitSubmissionTagWriter:
             repository,
             "commit-tree",
             tree,
-            "-p",
-            parent,
+            *(() if parent is None else ("-p", parent)),
             "-m",
             message,
             environment=identity,
