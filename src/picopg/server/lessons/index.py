@@ -55,6 +55,14 @@ class LessonIndex:
                 break
         return results
 
+    def knowledge(self) -> dict[str, object] | None:
+        """各课程包随大纲带来的知识地图里版本最新的一份；概念 id 从不复用，新版本兼容旧证据。"""
+        maps = [
+            outline["knowledge"] for release in self.playgrounds.catalog()
+            if (outline := self._outline(release)) is not None and isinstance(outline.get("knowledge"), dict)
+        ]
+        return max(maps, key=lambda value: value.get("version", 0) if isinstance(value.get("version"), int) else 0, default=None)
+
     def _outline(self, release: PlaygroundRelease) -> dict[str, object] | None:
         key = (release.playground_id, release.version_id)
         with self.lock:

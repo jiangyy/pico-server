@@ -36,7 +36,11 @@ MESSAGES = [
 ]
 
 class FakeAgent:
-    def step(self, playground_id, version_id, messages, tools, on_text=None):
+    def __init__(self):
+        self.learners = []
+
+    def step(self, playground_id, version_id, messages, tools, on_text=None, learner=None):
+        self.learners.append(learner)
         if on_text is not None:
             if playground_id == "broken":
                 on_text("说到一半")
@@ -45,7 +49,8 @@ class FakeAgent:
                 on_text(piece)
         return {"content": f"{playground_id}:{len(messages)}", "calls": []}
 
-    def tutor(self, messages, tools, on_text=None):
+    def tutor(self, messages, tools, on_text=None, learner=None):
+        self.learners.append(learner)
         return {"content": f"tutor:{len(messages)}", "calls": []}
 
 
@@ -119,6 +124,16 @@ class CourseAgentServiceTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 agent_request(invalid)
 
+    def test_the_learner_profile_goes_last_in_the_system_prompt(self) -> None:
+        model = RecordingModel([{"content": "好"}, {"content": "好"}])
+        service = CourseAgentService(model, self.skills)
+        service.step("sudoku", "v1", MESSAGES[:1], [], learner={"concepts": [{"concept": "for", "status": "shaky"}]})
+        service.step("sudoku", "v1", MESSAGES[:1], [])
+        with_profile, without = (call[0][0]["content"] for call in model.calls)
+        self.assertTrue(with_profile.startswith(without), "the stable prefix is unchanged")
+        self.assertIn('学生画像（JSON；用来决定教什么、问什么，不要念给学生听）：\n{"concepts":[{"concept":"for","status":"shaky"}]}', with_profile)
+        self.assertNotIn("学生画像", without)
+
     def test_tutor_uses_the_platform_prompt(self) -> None:
         # 导师用同一个模型，换成平台层的系统提示，不带课程。
         tutor_model = RecordingModel([{"content": "先把汉诺塔收个尾。"}])
@@ -131,9 +146,10 @@ class AgentRouteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             session = PrincipalSession.create("student", "device", "student-token", {}, ["playgrounds"])
+            agent = FakeAgent()
             server = PicoPGHttpServer(
                 ("127.0.0.1", 0), FileReplicaLogStore(root / "replica"), "operator-token", root / "packages",
-                principal_sessions=[session], course_agent=FakeAgent(), ai_access=AiAccess(["student"]),
+                principal_sessions=[session], course_agent=agent, ai_access=AiAccess(["student"]),
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -147,6 +163,10 @@ class AgentRouteTest(unittest.TestCase):
                 )
                 response = connection.getresponse()
                 self.assertEqual((response.status, json.loads(response.read())), (200, {"content": "tutor:1", "calls": []}))
+                # 服务端按提问的学生算出画像：课程里只给本课相关的部分，导师拿到全部与到期复习。
+                course, tutor = agent.learners
+                self.assertEqual(set(course), {"concepts", "misconceptions", "habits", "due", "open"})
+                self.assertEqual((tutor["version"], tutor["due"]), (1, []))
                 status, error = post(connection, "wrong-token", body)
                 self.assertEqual((status, error["error"]["code"]), (401, "auth.required"))
                 status, error = post(connection, "student-token", {**body, "tools": "act"})

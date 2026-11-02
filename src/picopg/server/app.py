@@ -27,6 +27,7 @@ from picopg.server.client_log import ClientLogLimiter, dispatch_client_log
 from picopg.server.classroom.roster import ClassRosterRepository
 from picopg.server.common.workers import ServerWorkerThread
 from picopg.server.drafts.protocol import DraftLogRule
+from picopg.server.learner import LearnerProfiles
 from picopg.server.lessons import LessonIndex
 from picopg.server.lessons.http import dispatch_lessons
 from picopg.server.drafts.worker import DraftRequestConsumer, draft_request_logs, is_draft_request_log
@@ -142,6 +143,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         )
         self.comments = CommentPublisher(self)
         self.lessons = LessonIndex(self.playgrounds)
+        self.learners = LearnerProfiles(self.store, self.lessons.knowledge)
         self.submissions = SubmissionReader(self.store)
         self.class_rosters = ClassRosterRepository(
             self,

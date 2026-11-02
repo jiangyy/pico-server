@@ -79,6 +79,14 @@ class LessonIndexTest(unittest.TestCase):
         assert self.index.search("今天天气") == []
         assert self.index.search("   ") == []
 
+    def test_the_newest_knowledge_map_shipped_with_any_course_wins(self) -> None:
+        assert self.index.knowledge() is None, "packages published before maps were shipped carry none"
+        catalog = FakeCatalog({
+            "hanoi": package("hanoi", {**HANOI, "knowledge": {"version": 2, "concepts": []}}),
+            "data-structures": package("data-structures", {**DICTS, "knowledge": {"version": 3, "concepts": []}}),
+        })
+        assert LessonIndex(catalog).knowledge()["version"] == 3
+
     def test_outlines_are_read_once_per_version(self) -> None:
         self.index.search("递归")
         reads = self.catalog.reads

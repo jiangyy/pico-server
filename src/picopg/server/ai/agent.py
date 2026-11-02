@@ -15,12 +15,12 @@ class CourseAgent(Protocol):
     def step(
         self, playground_id: str, version_id: str,
         messages: list[dict[str, object]], tools: list[dict[str, object]],
-        on_text: Callable[[str], None] | None = None,
+        on_text: Callable[[str], None] | None = None, learner: dict[str, object] | None = None,
     ) -> dict[str, object]: ...
 
     def tutor(
         self, messages: list[dict[str, object]], tools: list[dict[str, object]],
-        on_text: Callable[[str], None] | None = None,
+        on_text: Callable[[str], None] | None = None, learner: dict[str, object] | None = None,
     ) -> dict[str, object]: ...
 
 
@@ -71,6 +71,7 @@ class CourseAgentService:
 - 问学得怎么样时，根据提交、完成与批注说出具体进展：做得好的地方、还要加强的一个点、下一步可以怎么练。
 - 学生想学某个知识点时，先用两三句话和一个小例子讲清它是什么、为什么有用，再用 search_lessons 找讲它的那一步（工具存在时），用 offer 的 lecture 按钮带过去，lecture 与 step 照搬搜索结果；搜不到就如实说现有课程没讲到。
 - 解释老师的批注时引用学习数据里的批注原文与它批在第几行，不要只说条数。
+- 系统提示最后有学生画像时，问学得怎么样、接下来学什么，都以它为据：先说 shaky 的概念和反复出现的误区，再说 due 里该复习的、open 里没做完的练习；用概念的中文名，不说 id 和状态值。
 - 说清楚为止，一般 3 到 8 句：具体、鼓励，可以用 Markdown。"""
 
     def __init__(self, model: ToolModel, skills: CourseSkillRepository, teaching: list[TeachingSkill] | None = None) -> None:
@@ -81,9 +82,9 @@ class CourseAgentService:
     def step(
         self, playground_id: str, version_id: str,
         messages: list[dict[str, object]], tools: list[dict[str, object]],
-        on_text: Callable[[str], None] | None = None,
+        on_text: Callable[[str], None] | None = None, learner: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        system = self.system(playground_id, version_id, messages, tools)
+        system = self.system(playground_id, version_id, messages, tools) + _learner(learner)
         chat = [{"role": "system", "content": system}, *(_chat_message(message) for message in messages)]
         reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text)
         return _turn(reply)
@@ -105,9 +106,9 @@ class CourseAgentService:
 
     def tutor(
         self, messages: list[dict[str, object]], tools: list[dict[str, object]],
-        on_text: Callable[[str], None] | None = None,
+        on_text: Callable[[str], None] | None = None, learner: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        chat = [{"role": "system", "content": self.TUTOR}, *(_chat_message(message) for message in messages)]
+        chat = [{"role": "system", "content": self.TUTOR + _learner(learner)}, *(_chat_message(message) for message in messages)]
         return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text))
 
     def _skill(self, playground_id: str, version_id: str) -> dict[str, object] | None:
@@ -116,6 +117,13 @@ class CourseAgentService:
         except CourseAiError:
             return None
         return {key: value for key, value in skill.items() if key not in ("actions", "course")}
+
+
+def _learner(learner: dict[str, object] | None) -> str:
+    """画像随学生的新证据变化，放在系统提示的最后，前面的部分仍能命中前缀缓存。"""
+    if not learner:
+        return ""
+    return "\n\n学生画像（JSON；用来决定教什么、问什么，不要念给学生听）：\n" + json.dumps(learner, ensure_ascii=False, separators=(",", ":"))
 
 
 def _said(messages: list[dict[str, object]]) -> str:

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from picopg.server.ai.agent import agent_request, tutor_request
 from picopg.server.ai.model import CourseAiError
+from picopg.server.learner import due, for_course
 from picopg.server.replication import ResponseSent, logger
 
 if TYPE_CHECKING:
@@ -22,7 +24,7 @@ def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
         if handler.command != "POST":
             handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        if not _permitted(handler):
+        if _permitted(handler) is None:
             return True
         if handler.server.course_ai is None:
             handler.error(503, "ai.unavailable", "course AI is not configured")
@@ -47,7 +49,8 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
         if handler.command != "POST":
             handler.error(405, "method.not_allowed", "method not allowed")
             return True
-        if not _permitted(handler):
+        principal = _permitted(handler)
+        if principal is None:
             return True
         if handler.server.course_agent is None:
             handler.error(503, "ai.unavailable", "course agent is not configured")
@@ -55,10 +58,12 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
         agent = handler.server.course_agent
         if path == "/api/v1/ai/tutor":
             messages, tools = tutor_request(handler.read_json())
-            run = lambda on_text: agent.tutor(messages, tools, on_text)  # noqa: E731
+            learner = _learner(handler, principal, None)
+            run = lambda on_text: agent.tutor(messages, tools, on_text, learner=learner)  # noqa: E731
         else:
             playground_id, version_id, messages, tools = agent_request(handler.read_json())
-            run = lambda on_text: agent.step(playground_id, version_id, messages, tools, on_text)  # noqa: E731
+            learner = _learner(handler, principal, playground_id)
+            run = lambda on_text: agent.step(playground_id, version_id, messages, tools, on_text, learner=learner)  # noqa: E731
         if "application/x-ndjson" in (handler.headers.get("Accept") or ""):
             _stream(handler, run)
         else:
@@ -105,18 +110,32 @@ def _stream(handler: PicoRequestHandler, run: Callable[[Callable[[str], None] | 
     raise ResponseSent()
 
 
-def _permitted(handler: PicoRequestHandler) -> bool:
+def _permitted(handler: PicoRequestHandler) -> str | None:
+    """允许时返回提问的学生。"""
     replica = handler.authenticated_replica()
     if replica is None:
         handler.error(401, "auth.required", "valid Session required")
-        return False
+        return None
     if not handler.server.ai_access.allows(replica.principal_id):
         handler.error(403, "ai.not_permitted", "AI is not enabled for this principal")
-        return False
+        return None
     if not handler.server.ai_budget.admit(replica.principal_id):
         handler.error(429, "ai.limited", "AI request limit reached; try again later")
-        return False
-    return True
+        return None
+    return replica.principal_id
+
+
+def _learner(handler: PicoRequestHandler, principal: str, course: str | None) -> dict[str, object] | None:
+    """学生画像：课程里只给本课相关的部分，导师给全部。算不出来时照常回答，只是不带画像。"""
+    try:
+        profile = handler.server.learners.profile(principal)
+        now = datetime.now(timezone.utc)
+        if course is None:
+            return {**profile, "due": due(profile, now)}
+        return for_course(profile, course, handler.server.lessons.knowledge(), now)
+    except Exception:
+        logger.exception("learner profile failed")
+        return None
 
 
 def _request_value(value: object) -> tuple[str, str, dict[str, object]]:
