@@ -73,13 +73,30 @@ class CourseAgentServiceTest(unittest.TestCase):
         sent, tools = model.calls[0]
         self.assertEqual(sent[0]["role"], "system")
         self.assertIn("本课的讲解要点", sent[0]["content"])
-        self.assertIn("调用 grade 收尾", sent[0]["content"])
+        self.assertIn("说到哪，就让学生看到哪", sent[0]["content"])
         self.assertEqual(sent[2], {
             "role": "assistant", "content": "", "reasoning_content": "先标出来",
             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "act", "arguments": "{\"action\":\"code.run\"}"}}],
         })
         self.assertEqual(sent[3], {"role": "tool", "tool_call_id": "c1", "content": "{\"outcome\":\"done\"}"})
         self.assertEqual(tools, [{"type": "function", "function": TOOLS[0]}])
+
+    def test_teaching_skills_load_by_tools_and_what_the_student_said(self) -> None:
+        # core 总在；练习与批改随工具出现；笔记只在学生要整理时加载；会变的 skill 排在本课要点之后。
+        service = CourseAgentService(RecordingModel([]), self.skills)
+        tool = lambda name: {"name": name, "description": "", "parameters": {}}  # noqa: E731
+        plain = service.system("sudoku", "v1", MESSAGES, [tool("ask_to_write")])
+        self.assertIn("## 提问与练习", plain)
+        self.assertNotIn("## 批改交回的练习", plain)
+        self.assertNotIn("## 整理知识点", plain)
+        grading = service.system("sudoku", "v1", MESSAGES, [tool("ask_to_write"), tool("grade")])
+        self.assertTrue(grading.startswith(plain))
+        self.assertIn("**怎么改**", grading)
+        asked = [{"role": "user", "content": "学生：帮我整理一下今天的知识点\n\n编辑器里的代码：\n1| x = 1"}]
+        self.assertIn("## 整理知识点", service.system("sudoku", "v1", asked, []))
+        # 代码里出现的词不算学生说的话。
+        code = [{"role": "user", "content": "学生：这行什么意思\n\n编辑器里的代码：\n1| # 复习"}]
+        self.assertNotIn("## 整理知识点", service.system("sudoku", "v1", code, []))
 
     def test_courses_without_a_skill_still_work(self) -> None:
         bare = RecordingModel([{"content": "好的"}])

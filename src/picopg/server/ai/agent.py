@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository
@@ -26,23 +28,38 @@ MAX_MESSAGES = 240
 MAX_CONTENT = 60_000
 MAX_TOOLS = 16
 MAX_TOOL_BYTES = 32_000
+TEACHING = Path(__file__).with_name("teaching")
+
+
+@dataclass(frozen=True)
+class TeachingSkill:
+    """teaching/<序号>-<名字>.md：头部 when 决定何时加载——always、tool <工具名>、ask <学生原话的正则>。"""
+
+    name: str
+    when: str
+    body: str
+
+    def applies(self, tools: set[str], said: str) -> bool:
+        kind, _, value = self.when.partition(" ")
+        if kind == "always":
+            return True
+        if kind == "tool":
+            return value in tools
+        return kind == "ask" and re.search(value, said) is not None
+
+
+def load_teaching(root: Path = TEACHING) -> list[TeachingSkill]:
+    """按文件名的序号排列：不随本轮变化的在前；未匹配的 skill 不占 token。"""
+    skills = []
+    for path in sorted(root.glob("*.md")):
+        head, body = path.read_text(encoding="utf-8").removeprefix("---\n").split("\n---\n", 1)
+        when = dict(line.split(": ", 1) for line in head.splitlines())["when"]
+        skills.append(TeachingSkill(path.stem.split("-", 1)[-1], when, body.strip()))
+    return skills
 
 
 class CourseAgentService:
     """无状态的一步：对话与工具由客户端带来（工具在学生的会话里执行），这里只加系统提示与课程 skill 并调用模型。"""
-
-    SYSTEM = """你是 Pico 的 Python 助教，就在学生的 IDE 里，面对的是初中生。你可以用工具操作这个 IDE：
-read 读取代码、运行结果和变量；act 调用编辑器、调试器、终端、可视化等组件的动作；teach 播放一段你写的讲解讲稿；ask_to_write 请学生动手写代码；grade 给交回的练习下结构化结论。
-
-怎么做：
-- 先看事实再说话。代码、输出、变量值都来自用户消息里的上下文或 read 的结果，不要编造。
-- 能演示就不要只用嘴说：用 code.locate 或 trace.seek 带学生看到具体的行和步骤；用 annotation.show 在代码上画框（mark）或写短批注（note，40 字以内）；
-  需要改代码演示时用 source.explain 写一份完整的临时代码，再 act code.run 运行并读结果。对话结束时学生原来的代码会自动恢复。
-- 问题需要连贯的分步讲解（像老师一边讲一边写代码）时，用 teach 写一份讲稿；讲稿开始播放后这一轮就结束了。
-- 想让学生自己练：先用一两句话布置一个具体的小任务，再调用 ask_to_write。学生写好后会把代码发回来：
-  先 act code.run 运行，再 read 输出，用标注指出具体的行，然后调用 grade 收尾：verdict 是 pass、partial 或 fail，text 说明做对了什么、哪里有问题、下一步怎么改。不要直接给出完整答案。
-- 对学生说的话要短：一次只讲一件事，最多 5 句，可以用 Markdown 和 `代码`。
-- 工具失败时读返回的原因，换参数或换办法，不要重复同样的调用。"""
 
     TUTOR = """你是 Pico，学生在整个学习平台上的导师，面对的是初中生。你看得到这个学生的全部课程、打开过的课、提交与老师的批注，以及知识地图。
 你负责：接下来学什么、学得怎么样、老师的批注说了什么、某门课练什么。具体某一行代码的问题，请学生打开那门课问课程里的 AI。
@@ -56,22 +73,35 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
 - 解释老师的批注时引用学习数据里的批注原文与它批在第几行，不要只说条数。
 - 说清楚为止，一般 3 到 8 句：具体、鼓励，可以用 Markdown。"""
 
-    def __init__(self, model: ToolModel, skills: CourseSkillRepository) -> None:
+    def __init__(self, model: ToolModel, skills: CourseSkillRepository, teaching: list[TeachingSkill] | None = None) -> None:
         self.model = model
         self.skills = skills
+        self.teaching = load_teaching() if teaching is None else teaching
 
     def step(
         self, playground_id: str, version_id: str,
         messages: list[dict[str, object]], tools: list[dict[str, object]],
         on_text: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
-        system = self.SYSTEM
-        skill = self._skill(playground_id, version_id)
-        if skill is not None:
-            system += "\n\n本课的讲解要点（JSON）：\n" + json.dumps(skill, ensure_ascii=False, separators=(",", ":"))
+        system = self.system(playground_id, version_id, messages, tools)
         chat = [{"role": "system", "content": system}, *(_chat_message(message) for message in messages)]
         reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text)
         return _turn(reply)
+
+    def system(
+        self, playground_id: str, version_id: str,
+        messages: list[dict[str, object]], tools: list[dict[str, object]],
+    ) -> str:
+        """稳定的部分在前（core、本课要点），随本轮变化的 skill 在后，模型服务的前缀缓存才命中。"""
+        names = {str(tool["name"]) for tool in tools}
+        said = _said(messages)
+        matched = [skill for skill in self.teaching if skill.applies(names, said)]
+        parts = [skill.body for skill in matched if skill.when == "always"]
+        course = self._skill(playground_id, version_id)
+        if course is not None:
+            parts.append("本课的讲解要点（JSON）：\n" + json.dumps(course, ensure_ascii=False, separators=(",", ":")))
+        parts += [skill.body for skill in matched if skill.when != "always"]
+        return "\n\n".join(parts)
 
     def tutor(
         self, messages: list[dict[str, object]], tools: list[dict[str, object]],
@@ -86,6 +116,14 @@ read 读取代码、运行结果和变量；act 调用编辑器、调试器、�
         except CourseAiError:
             return None
         return {key: value for key, value in skill.items() if key not in ("actions", "course")}
+
+
+def _said(messages: list[dict[str, object]]) -> str:
+    """学生最近一次说的话：用户消息的第一段（其后是客户端附上的代码与快照）。"""
+    for message in reversed(messages):
+        if message["role"] == "user":
+            return str(message["content"]).split("\n\n", 1)[0]
+    return ""
 
 
 def tutor_request(value: object) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
