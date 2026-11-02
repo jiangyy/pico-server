@@ -53,3 +53,42 @@ python3 deploy/backup.py restore --archive /path/to/snapshot.tar.gz --target /tm
 Verify `/tmp/picopg-restored`, stop the service, move the current `data` directory aside, move the verified restore into its place, start the service, and run `deploy/restart-smoke.sh`. Keep the old directory until the classroom data has been checked.
 
 `./run-tests.sh tests.test_backup` performs a local create/restore comparison and verifies path-traversal refusal. It does not replace an off-host restore drill.
+
+## Pilot checklist (one class)
+
+Run through this before the first lesson and again after every release. Each item names how to check it.
+
+### Release order
+
+1. Deploy the server first, then publish **every** course from the web repository (`node scripts/publish.mjs --all`, then `scripts/upload.mjs`). Packages carry the knowledge map in their outline; until one is published the learner profile has no concept labels and does not migrate old concept ids.
+2. Rebuild and copy `dist/` (it includes `/teacher/`), then run `deploy/restart-smoke.sh`.
+
+### Accounts and the class
+
+- One account per student and one per teacher in `config/principals.json`. Teachers need no capabilities. Access codes are random and handed out on paper, never reused.
+- Write the class roster through the operator endpoint (it replaces the whole roster each time):
+
+  ```sh
+  curl -fsS -X POST "$PICOPG_SMOKE_BASE_URL/api/v1/operator/classes/<class-id>" \
+    -H "Authorization: Bearer $PICOPG_REPLICA_TOKEN" -H "Content-Type: application/json" \
+    -d '{"teachers": ["<teacher>"], "students": ["<student>", "..."]}'
+  ```
+
+- Check: the teacher signs in at `/teacher/`, sees the class under 班级学情, and sees no other class's students.
+
+### AI
+
+- `PICOPG_AI_BASE_URL`, `PICOPG_AI_MODEL`, `PICOPG_AI_API_KEY` set in `server.env`; `PICOPG_AI_PRINCIPALS` lists the pilot students **and the teacher** (comment drafts use the same gate).
+- `PICOPG_AI_HOURLY` (requests per principal, default 120) and `PICOPG_AI_DAILY_TOKENS` (whole server) set to what the pilot may spend.
+- Confirm the model provider's content filtering and where it stores prompts; students' code and questions are sent to it.
+- Rehearse with a real model, 10–20 times each: a question answered with `ask_student` and judged with `assess`; a practice handed in, failed, fixed and handed in again; "帮我整理一下知识点"; an AI comment draft in the teacher workbench. The AI must not read the learner profile out to the student.
+
+### Students and guardians
+
+- Written notice to guardians, signed before accounts are handed out: what is recorded (code, questions, answers, practice results), that code and questions are sent to the named model provider, who can see it (the class teacher), how long it is kept, and how to ask for deletion.
+- Tell students that the AI can be wrong and that the teacher reads their conversations' results.
+
+### During the pilot
+
+- Daily: `journalctl --user -u picopg` for `learner profile failed`, `course agent` and `ai.limited` lines.
+- Weekly: backup off-host (see above), and look at 班级学情 with the teacher — whether shaky/solid matches what the teacher sees in class is the check on the profile rules.
