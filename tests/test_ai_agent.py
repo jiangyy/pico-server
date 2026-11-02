@@ -91,7 +91,10 @@ class CourseAgentServiceTest(unittest.TestCase):
         self.assertNotIn("## 整理知识点", plain)
         grading = service.system("sudoku", "v1", MESSAGES, [tool("ask_to_write"), tool("grade")])
         self.assertTrue(grading.startswith(plain))
-        self.assertIn("**怎么改**", grading)
+        self.assertIn("misconception", grading)
+        answering = service.system("sudoku", "v1", MESSAGES, [tool("ask_to_write"), tool("assess")])
+        self.assertIn("## 判定学生的回答", answering)
+        self.assertNotIn("## 判定学生的回答", grading)
         asked = [{"role": "user", "content": "学生：帮我整理一下今天的知识点\n\n编辑器里的代码：\n1| x = 1"}]
         self.assertIn("## 整理知识点", service.system("sudoku", "v1", asked, []))
         # 代码里出现的词不算学生说的话。
