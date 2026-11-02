@@ -149,7 +149,12 @@ def _learner(learner: dict[str, object] | None) -> str:
     """画像随学生的新证据变化，放在系统提示的最后，前面的部分仍能命中前缀缓存。"""
     if not learner:
         return ""
-    return "\n\n学生画像（JSON；用来决定教什么、问什么，不要念给学生听）：\n" + json.dumps(learner, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "\n\n学生画像（JSON；用来决定教什么、问什么，不要念给学生听）。"
+        "status：shaky 不牢、learning 在学、solid 掌握；misconceptions：反复出现的误区；open：没做完的练习；due：该复习的概念；"
+        "habits.askedBeforeSubmit：交练习前平均问 AI 几次（低说明先自己试，是好习惯）；habits.attemptsToPass：平均第几次交才通过。\n"
+        + json.dumps(learner, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 def _said(messages: list[dict[str, object]]) -> str:

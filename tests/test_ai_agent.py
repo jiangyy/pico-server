@@ -131,7 +131,9 @@ class CourseAgentServiceTest(unittest.TestCase):
         service.step("sudoku", "v1", MESSAGES[:1], [])
         with_profile, without = (call[0][0]["content"] for call in model.calls)
         self.assertTrue(with_profile.startswith(without), "the stable prefix is unchanged")
-        self.assertIn('学生画像（JSON；用来决定教什么、问什么，不要念给学生听）：\n{"concepts":[{"concept":"for","status":"shaky"}]}', with_profile)
+        self.assertIn("学生画像（JSON；用来决定教什么、问什么，不要念给学生听）", with_profile)
+        self.assertIn("askedBeforeSubmit：交练习前平均问 AI 几次（低说明先自己试，是好习惯）", with_profile, "the fields are explained")
+        self.assertTrue(with_profile.endswith('\n{"concepts":[{"concept":"for","status":"shaky"}]}'))
         self.assertNotIn("学生画像", without)
 
     def test_a_comment_draft_reads_the_code_lesson_and_profile_without_tools(self) -> None:
