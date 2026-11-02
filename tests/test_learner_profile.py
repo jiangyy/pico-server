@@ -7,6 +7,7 @@ from picopg.replica import ReplicatedRecord, record_id_of
 from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.analysis import evidence_log_id
 from picopg.server.learner import LearnerProfiles, due, for_course, profile_of
+from picopg.server.learner.profile import Learner
 
 KNOWLEDGE = {
     "version": 2,
@@ -130,6 +131,27 @@ class ProfileRulesTest(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in piece["misconceptions"]], ["assignment-is-equation"])
 
 
+class BoundedLearnerTest(unittest.TestCase):
+    def test_memory_stays_bounded_however_long_a_student_learns(self) -> None:
+        learner = Learner(KNOWLEDGE)
+        for index in range(10_000):
+            at = f"2026-11-01T{index % 24:02d}:{index % 60:02d}:00Z"
+            learner.feed(evidence({"kind": "script.step", "script": "x", "step": index, "concepts": ["for"]}, session=f"s{index}"))
+            learner.feed(answer("pass" if index % 3 else "fail", ["for"], at))
+            learner.feed(evidence({"kind": "ai.practice", "stage": "assigned", "task": f"t{index}", "concepts": ["for"]}))
+        self.assertLessEqual(len(learner.states["for"].outcomes), 10)
+        self.assertLessEqual(len(learner.steps), 200)
+        self.assertLessEqual(len(learner.open_practice), 50)
+        self.assertEqual(len(learner.recent(1000)), 100)
+        self.assertEqual(rows(learner.profile())["for"]["answers"], {"pass": 6666, "fail": 3334}, "counts stay exact")
+
+    def test_devices_can_be_read_in_any_order(self) -> None:
+        laptop = [graded("pass", ["for"], "2026-11-01T10:00:00Z"), answer("pass", ["for"], "2026-11-01T12:00:00Z")]
+        phone = [graded("fail", ["for"], "2026-11-01T11:00:00Z")]
+        self.assertEqual(profile_of(laptop + phone, KNOWLEDGE), profile_of(phone + laptop, KNOWLEDGE))
+        self.assertEqual(rows(profile_of(laptop + phone, KNOWLEDGE))["for"]["status"], "learning", "the 11:00 failure sits between the passes")
+
+
 class LearnerProfilesTest(unittest.TestCase):
     def test_profiles_read_every_device_and_cache_until_new_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -155,6 +177,20 @@ class LearnerProfilesTest(unittest.TestCase):
             append("laptop", graded("pass", ["for"], "2026-11-01T12:00:00Z"))
             self.assertEqual(rows(profiles.profile("student"))["for"]["status"], "learning", "one pass after a failure is not mastery yet")
             self.assertEqual(profiles.profile("nobody")["concepts"], [])
+
+            # 增量读到的与从头算的一样；学生被挤出内存后再用到时从头重建，结果不变。
+            for index in range(300):
+                append("phone", answer("fail" if index % 7 == 0 else "pass", ["for", "break"], f"2026-11-02T{index // 60:02d}:{index % 60:02d}:00Z"))
+                if index % 50 == 0:
+                    profiles.profile("student")
+            fresh = LearnerProfiles(store, lambda: KNOWLEDGE)
+            self.assertEqual(profiles.profile("student"), fresh.profile("student"))
+            small = LearnerProfiles(store, lambda: KNOWLEDGE, students=1)
+            before = small.profile("student")
+            small.profile("other")
+            self.assertEqual(list(small.entries), ["other"])
+            self.assertEqual(small.profile("student"), before)
+            self.assertEqual(len(small.activity("student")), 100)
 
 
 if __name__ == "__main__":
