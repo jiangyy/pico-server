@@ -74,6 +74,7 @@ def profile_of(evidence: Iterable[Mapping[str, object]], knowledge: Mapping[str,
     misconceptions: dict[str, dict[str, object]] = {}
     steps: dict[tuple[str, str, int], list[str]] = {}
     open_practice: dict[str, dict[str, object]] = {}
+    last_active: str | None = None
     habits = {
         "questions": 0, "explains": 0, "answers": Counter(), "predictions": Counter(),
         "passedPractice": 0, "attemptsToPass": [], "askedBeforeSubmit": [], "errors": Counter(),
@@ -104,6 +105,7 @@ def profile_of(evidence: Iterable[Mapping[str, object]], knowledge: Mapping[str,
         if not isinstance(data, Mapping):
             continue
         at = record.get("recordedAt") if isinstance(record.get("recordedAt"), str) else None
+        last_active = max(last_active or "", at or "") or None
         subject = record.get("subject") if isinstance(record.get("subject"), Mapping) else {}
         course = str(subject.get("playgroundId", ""))
         session = str((record.get("source") or {}).get("session", "")) if isinstance(record.get("source"), Mapping) else ""
@@ -150,6 +152,7 @@ def profile_of(evidence: Iterable[Mapping[str, object]], knowledge: Mapping[str,
     return {
         "version": 1,
         "knowledge": concepts.version,
+        "lastActive": last_active,
         "concepts": rows,
         "misconceptions": kept,
         "habits": {
@@ -199,6 +202,22 @@ def _row(concept: str, item: _Concept, concepts: Concepts) -> dict[str, object]:
         days = REVIEW_DAYS[min(len(passes) - 2, len(REVIEW_DAYS) - 1)]
         row["reviewDue"] = (_parse(passes[-1]) + timedelta(days=days)).isoformat()
     return row
+
+
+ACTIVITY_KINDS = ("ai.question", "ai.answer", "ai.practice", "script.prediction")
+
+
+def activity_of(evidence: Iterable[Mapping[str, object]], limit: int) -> list[dict[str, object]]:
+    """学生主动的交互：提问、回答与判定、练习的布置与批改、预测题；最近的在前。"""
+    found = []
+    for record in evidence:
+        payload = record.get("payload")
+        data = payload.get("data") if isinstance(payload, Mapping) and payload.get("schema") == "session.activity" else None
+        if not isinstance(data, Mapping) or data.get("kind") not in ACTIVITY_KINDS:
+            continue
+        subject = record.get("subject") if isinstance(record.get("subject"), Mapping) else {}
+        found.append({"at": record.get("recordedAt"), "course": subject.get("playgroundId"), **data})
+    return found[::-1][:limit]
 
 
 def due(profile: Mapping[str, object], now: datetime) -> list[str]:

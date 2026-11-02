@@ -25,6 +25,7 @@ class ClassRosterError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ClassRoster:
+    class_id: str
     teachers: frozenset[str]
     students: frozenset[str]
 
@@ -40,6 +41,9 @@ class TeachingDirectory:
             if teacher in roster.teachers
             for student in roster.students
         )
+
+    def classes_of(self, teacher: str) -> tuple[ClassRoster, ...]:
+        return tuple(roster for roster in self.rosters if teacher in roster.teachers)
 
 class ClassRosterServer(Protocol):
     @property
@@ -109,7 +113,7 @@ class ClassRosterRepository:
             except PaginationStalled as error:
                 raise RuntimeError("class roster Log returned an empty continuation page") from error
             if records:
-                rosters.append(_decode(records[-1]))
+                rosters.append(_decode(class_id, records[-1]))
         return TeachingDirectory(tuple(rosters))
 
 
@@ -140,7 +144,7 @@ def _class_id_from_log(log_id: str) -> str | None:
     return class_id if _CLASS_ID.fullmatch(class_id) is not None else None
 
 
-def _decode(record: ReplicatedRecord) -> ClassRoster:
+def _decode(class_id: str, record: ReplicatedRecord) -> ClassRoster:
     data = record.data
     if not isinstance(data, Mapping) or set(data) != {"type", "teachers", "students"}:
         raise ClassRosterError("class roster body is invalid")
@@ -150,4 +154,4 @@ def _decode(record: ReplicatedRecord) -> ClassRoster:
     students = frozenset(_members(data.get("students"), "students"))
     if teachers.intersection(students):
         raise ClassRosterError("teachers and students must be disjoint")
-    return ClassRoster(teachers, students)
+    return ClassRoster(class_id, teachers, students)
