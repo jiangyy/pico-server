@@ -62,6 +62,9 @@ Run through this before the first lesson and again after every release. Each ite
 
 1. Deploy the server first, then publish **every** course from the web repository (`node scripts/publish.mjs --all`, then `scripts/upload.mjs`). Packages carry the knowledge map in their outline; until one is published the learner profile has no concept labels and does not migrate old concept ids.
 2. Rebuild and copy `dist/` (it includes `/teacher/`), then run `deploy/restart-smoke.sh`.
+3. Before every release, run `npm run smoke:pilot` in the web repository. It starts this server from source and drives two devices of one student and a teacher through publish, update, offline edits and the divergence choice, learning evidence to profile, submission to Git tag, review, and a restart.
+
+The submission repositories in `config/submissions.json` only need `git init`; the first submission becomes the root commit.
 
 ### Accounts and the class
 
