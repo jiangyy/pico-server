@@ -86,6 +86,27 @@ class CourseAgentServiceTest(unittest.TestCase):
         self.assertEqual(sent[3], {"role": "tool", "tool_call_id": "c1", "content": "{\"outcome\":\"done\"}"})
         self.assertEqual(tools, [{"type": "function", "function": TOOLS[0]}])
 
+    def test_tool_calls_written_as_text_are_recovered_and_never_streamed(self) -> None:
+        # 有的模型把调用写成正文 functions.名字({...})：本轮工具里有这个名字、参数是 JSON 对象的，当作真的调用；
+        # 边生成边给学生看的文字在这串字开始的地方截断。
+        written = '回到第 6 行。functions.act({"action": "code.run", "args": {"at": {"line": 6}}})'
+
+        class StreamingModel(RecordingModel):
+            def step(self, messages, tools, on_text=None):
+                for end in (8, 20, len(written)):
+                    on_text(written[:end])
+                return super().step(messages, tools, on_text)
+
+        streamed = []
+        model = StreamingModel([{"content": written}])
+        turn = CourseAgentService(model, self.skills).step("sudoku", "v1", MESSAGES, TOOLS, streamed.append)
+        self.assertEqual(turn["content"], "回到第 6 行。")
+        self.assertEqual([(call["name"], json.loads(call["arguments"])) for call in turn["calls"]],
+                         [("act", {"action": "code.run", "args": {"at": {"line": 6}}})])
+        self.assertTrue(all("functions" not in text for text in streamed), streamed)
+        unknown = CourseAgentService(RecordingModel([{"content": 'functions.nope({"a": 1})'}]), self.skills).step("sudoku", "v1", MESSAGES, TOOLS)
+        self.assertEqual((unknown["content"], unknown["calls"]), ('functions.nope({"a": 1})', []), "a name that is not a tool stays text")
+
     def test_teaching_skills_load_by_tools_and_what_the_student_said(self) -> None:
         # core 总在；练习与批改随工具出现；笔记只在学生要整理时加载；会变的 skill 排在本课要点之后。
         service = CourseAgentService(RecordingModel([]), self.skills)

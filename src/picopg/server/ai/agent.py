@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,8 +99,8 @@ class CourseAgentService:
     ) -> dict[str, object]:
         system = self.system(playground_id, version_id, messages, tools) + _learner(learner)
         chat = [{"role": "system", "content": system}, *(_chat_message(message) for message in messages)]
-        reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text)
-        return _turn(reply)
+        reply = self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], _hiding_calls(on_text))
+        return _turn(reply, {str(tool["name"]) for tool in tools})
 
     def system(
         self, playground_id: str, version_id: str,
@@ -122,7 +123,7 @@ class CourseAgentService:
         on_text: Callable[[str], None] | None = None, learner: dict[str, object] | None = None,
     ) -> dict[str, object]:
         chat = [{"role": "system", "content": self.TUTOR + _learner(learner)}, *(_chat_message(message) for message in messages)]
-        return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], on_text))
+        return _turn(self.model.step(chat, [{"type": "function", "function": tool} for tool in tools], _hiding_calls(on_text)), {str(tool["name"]) for tool in tools})
 
     def draft_comment(self, playground_id: str, version_id: str, source: str, learner: dict[str, object] | None = None) -> str:
         """老师批改时的草稿：不带工具，一步写完。"""
@@ -244,7 +245,38 @@ def _chat_message(message: dict[str, object]) -> dict[str, object]:
     return chat
 
 
-def _turn(reply: dict[str, object]) -> dict[str, object]:
+# 有的模型把工具调用写成正文 functions.名字({...})，而不是 tool_calls。
+_WRITTEN_CALL = re.compile(r"functions\.([A-Za-z_]\w*)\s*\(\s*(\{.*?\})\s*\)", re.S)
+_WRITTEN_CALL_START = re.compile(r"functions\.\w*(\s*\(.*)?$", re.S)
+
+
+def _hiding_calls(on_text: Callable[[str], None] | None) -> Callable[[str], None] | None:
+    """边生成边给学生看的文字，不带写成正文的调用（包括还没写完的那一截）。"""
+    if on_text is None:
+        return None
+    return lambda text: on_text(_WRITTEN_CALL_START.sub("", _WRITTEN_CALL.sub("", text)).rstrip())
+
+
+def _recover_calls(content: str, names: set[str]) -> tuple[str, list[dict[str, object]]]:
+    """名字是本轮的工具、参数是 JSON 对象的写成正文的调用，当作真的调用并从正文里删掉。"""
+    calls: list[dict[str, object]] = []
+
+    def take(match: re.Match[str]) -> str:
+        name, arguments = match.group(1), match.group(2)
+        try:
+            parsed = json.loads(arguments)
+        except ValueError:
+            return match.group(0)
+        if name not in names or not isinstance(parsed, dict):
+            return match.group(0)
+        calls.append({"id": f"written-{uuid.uuid4().hex[:12]}", "name": name, "arguments": arguments})
+        return ""
+
+    stripped = _WRITTEN_CALL.sub(take, content)
+    return (stripped.strip(), calls) if calls else (content, calls)
+
+
+def _turn(reply: dict[str, object], names: set[str] | None = None) -> dict[str, object]:
     content = reply.get("content")
     calls = []
     for call in reply.get("tool_calls") or []:
@@ -256,7 +288,10 @@ def _turn(reply: dict[str, object]) -> dict[str, object]:
             "name": str(function.get("name", "")),
             "arguments": function.get("arguments") if isinstance(function.get("arguments"), str) else "{}",
         })
-    turn: dict[str, object] = {"content": content if isinstance(content, str) else "", "calls": calls}
+    text = content if isinstance(content, str) else ""
+    if not calls and names:
+        text, calls = _recover_calls(text, names)
+    turn: dict[str, object] = {"content": text, "calls": calls}
     reasoning = reply.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
         turn["reasoning"] = reasoning
