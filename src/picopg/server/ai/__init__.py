@@ -1,6 +1,6 @@
 from picopg.server.ai.agent import CourseAgent, CourseAgentService
 from picopg.server.ai.course import CourseAi, CourseAiService, CourseSkillRepository
-from picopg.server.ai.model import CourseAiError, OpenAiCompatibleChatModel
+from picopg.server.ai.model import CourseAiError, FallbackModel, OpenAiCompatibleChatModel
 
 __all__ = [
     "CourseAgent",
@@ -9,5 +9,6 @@ __all__ = [
     "CourseAiError",
     "CourseAiService",
     "CourseSkillRepository",
+    "FallbackModel",
     "OpenAiCompatibleChatModel",
 ]

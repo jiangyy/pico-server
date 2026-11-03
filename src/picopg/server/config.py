@@ -13,6 +13,7 @@ from picopg.server.ai import (
     CourseAi,
     CourseAiService,
     CourseSkillRepository,
+    FallbackModel,
     OpenAiCompatibleChatModel,
 )
 from picopg.server.ai.budget import AiBudget
@@ -182,31 +183,52 @@ def load_ai_budget() -> AiBudget:
     return AiBudget(positive("PICOPG_AI_HOURLY") or 120, positive("PICOPG_AI_DAILY_TOKENS"))
 
 
-def load_course_ai(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAi | None:
-    base_url = os.environ.get("PICOPG_AI_BASE_URL")
-    model = os.environ.get("PICOPG_AI_MODEL")
-    if base_url is None and model is None:
+def _csv(name: str) -> list[str]:
+    """逗号分隔的环境变量；空值返回 []，空段（如没填的 key）保留原位置。"""
+    value = os.environ.get(name)
+    return [] if not value else [part.strip() for part in value.split(",")]
+
+
+def _ai_models(effort: str | None = None) -> list[OpenAiCompatibleChatModel] | None:
+    """PICOPG_AI_BASE_URL / _MODEL / _API_KEY 的逗号列表一一对应多个 provider，按顺序回退。"""
+    base_urls = _csv("PICOPG_AI_BASE_URL")
+    models = _csv("PICOPG_AI_MODEL")
+    keys = _csv("PICOPG_AI_API_KEY")
+    if not base_urls and not models:
         return None
-    if not base_url or not model:
-        raise ValueError("PICOPG_AI_BASE_URL and PICOPG_AI_MODEL must be set together")
-    chat = OpenAiCompatibleChatModel(base_url, model, os.environ.get("PICOPG_AI_API_KEY"))
+    if not base_urls or not models or len(base_urls) != len(models):
+        raise ValueError("PICOPG_AI_BASE_URL and PICOPG_AI_MODEL must name the same number of providers")
+    if keys and len(keys) != len(models):
+        raise ValueError("PICOPG_AI_API_KEY must name the same number of providers")
+    return [
+        OpenAiCompatibleChatModel(base_url, model, keys[index] if keys else None, effort)
+        for index, (base_url, model) in enumerate(zip(base_urls, models))
+    ]
+
+
+def _fallback(models: list[OpenAiCompatibleChatModel]) -> OpenAiCompatibleChatModel | FallbackModel:
+    return models[0] if len(models) == 1 else FallbackModel(models)
+
+
+def load_course_ai(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAi | None:
+    models = _ai_models()
+    if models is None:
+        return None
     if budget is not None:
-        chat.on_usage = budget.spend
-    return CourseAiService(chat, _course_skills(package_root))
+        for model in models:
+            model.on_usage = budget.spend
+    return CourseAiService(_fallback(models), _course_skills(package_root))
 
 
 def load_course_agent(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAgent | None:
     """与课程 AI 同一个模型；PICOPG_AI_EFFORT 可选（如 low），推理模型据此少想一点、答得更快。"""
-    base_url = os.environ.get("PICOPG_AI_BASE_URL")
-    model = os.environ.get("PICOPG_AI_MODEL")
-    if not base_url or not model:
+    models = _ai_models(os.environ.get("PICOPG_AI_EFFORT") or None)
+    if models is None:
         return None
-    chat = OpenAiCompatibleChatModel(
-        base_url, model, os.environ.get("PICOPG_AI_API_KEY"), os.environ.get("PICOPG_AI_EFFORT") or None,
-    )
     if budget is not None:
-        chat.on_usage = budget.spend
-    return CourseAgentService(chat, _course_skills(package_root))
+        for model in models:
+            model.on_usage = budget.spend
+    return CourseAgentService(_fallback(models), _course_skills(package_root))
 
 
 def _course_skills(package_root: Path | None) -> CourseSkillRepository:

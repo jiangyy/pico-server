@@ -144,3 +144,39 @@ def _merge_call(calls: dict[int, dict[str, object]], delta: dict[str, object]) -
     for key in ("name", "arguments"):
         if isinstance(function.get(key), str):
             target[key] += function[key]
+
+
+class FallbackModel:
+    """按顺序尝试多个模型：一个报 CourseAiError（连不上、没返回内容）就换下一个。
+
+    # ponytail: 流式 step 中途失败时，on_text 已经发出的片段收不回，下一个模型会重讲一遍；
+    # 主流故障（503、连不上）都发生在第一个字节之前，这个上限先接受。
+    """
+
+    def __init__(self, models: list[OpenAiCompatibleChatModel]) -> None:
+        if not models:
+            raise ValueError("fallback needs at least one model")
+        self.models = models
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        last: CourseAiError | None = None
+        for model in self.models:
+            try:
+                return model.complete(messages)
+            except CourseAiError as error:
+                last = error
+        raise CourseAiError("all configured models failed") from last
+
+    def step(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+        on_text: Callable[[str], None] | None = None,
+    ) -> dict[str, object]:
+        last: CourseAiError | None = None
+        for model in self.models:
+            try:
+                return model.step(messages, tools, on_text)
+            except CourseAiError as error:
+                last = error
+        raise CourseAiError("all configured models failed") from last
