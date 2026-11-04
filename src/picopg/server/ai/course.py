@@ -66,8 +66,8 @@ class CourseSkillRepository:
 
 class CourseAiService:
     SYSTEM = (
-        "你是面向初中生的 Python 学习助手。只使用给定事实，一次只解释一件事，"
-        "结尾给一个小问题；不要直接贴完整答案。只输出 JSON："
+        "你是面向初中生的 Python 学习助手。只使用给定事实，按学生的问题选择讲解范围；"
+        "先讲清楚，只有确实有助于理解时才提问；练习不直接贴完整答案。只输出 JSON："
         '{"title":"标题","text":"正文","primary":{"action":"动作 id","label":"按钮文字",'
         '"args":{}},"actions":[]}。primary、actions 和动作 label 可以省略；动作不能只写 id 字符串。'
         'trace.seek 的 args 是 {"step":当前步整数}；code.locate 是 {"line":源码行号}；'

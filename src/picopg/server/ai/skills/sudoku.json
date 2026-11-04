@@ -2,7 +2,7 @@
   "course": "sudoku",
   "concepts": ["search", "nested", "break", "bool", "for", "function", "debug"],
   "teaches": "用两层循环穷举两个空格，用 is_valid 检查约束，用标记变量停下外层循环。",
-  "answerStyle": "一次只说一件事，不贴完整答案，结尾给一个小问题。",
+  "answerStyle": "具体代码问题聚焦一个关键点；整体介绍先讲目标、约束和搜索思路。练习不直接贴完整答案，仅在有助于确认理解时提问。",
   "actions": ["selection.locate", "code.locate", "trace.seek", "code.run", "annotation.show", "source.explain", "source.restore"],
   "misconceptions": [
     {
