@@ -54,6 +54,7 @@ class StreamingModelTest(unittest.TestCase):
         assert message == {
             "role": "assistant", "content": "先看**第 2 行**", "reasoning_content": "想一想",
             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "act", "arguments": "{\"action\":\"code.run\"}"}}],
+            "usage": {"total_tokens": 42},
         }
         assert spent == [42]
 

@@ -90,12 +90,15 @@ class OpenAiCompatibleChatModel:
         self._spent(reply.get("usage"))
         if not isinstance(message, dict):
             raise CourseAiError("model returned no message")
+        if isinstance(reply.get("usage"), dict):
+            message["usage"] = reply["usage"]
         return message
 
     def _stream(self, request: dict[str, object], on_text: Callable[[str], None], *, timeout: float) -> dict[str, object]:
         content: list[str] = []
         reasoning: list[str] = []
         calls: dict[int, dict[str, object]] = {}
+        usage: dict[str, object] | None = None
         try:
             with urlopen(self._request({**request, "stream": True, "stream_options": {"include_usage": True}}), timeout=timeout) as response:
                 for raw in response:
@@ -106,6 +109,8 @@ class OpenAiCompatibleChatModel:
                     if data == "[DONE]":
                         break
                     chunk = json.loads(data)
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
                     self._spent(chunk.get("usage"))
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
@@ -130,6 +135,8 @@ class OpenAiCompatibleChatModel:
             message["tool_calls"] = [calls[index] for index in sorted(calls)]
         if reasoning:
             message["reasoning_content"] = "".join(reasoning)
+        if usage is not None:
+            message["usage"] = usage
         return message
 
 

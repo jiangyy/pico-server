@@ -86,6 +86,14 @@ class CourseAgentServiceTest(unittest.TestCase):
         self.assertEqual(sent[3], {"role": "tool", "tool_call_id": "c1", "content": "{\"outcome\":\"done\"}"})
         self.assertEqual(tools, [{"type": "function", "function": TOOLS[0]}])
 
+    def test_step_returns_token_usage_when_provided_by_model(self) -> None:
+        model = RecordingModel([{
+            "role": "assistant", "content": "看第 2 行。",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        }])
+        turn = CourseAgentService(model, self.skills).step("sudoku", "v1", MESSAGES, TOOLS)
+        self.assertEqual(turn["usage"], {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})
+
     def test_tool_calls_written_as_text_are_recovered_and_never_streamed(self) -> None:
         # 有的模型把调用写成正文 functions.名字({...})：本轮工具里有这个名字、参数是 JSON 对象的，当作真的调用；
         # 边生成边给学生看的文字在这串字开始的地方截断。

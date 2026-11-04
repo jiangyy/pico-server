@@ -295,6 +295,15 @@ def _turn(reply: dict[str, object], names: set[str] | None = None) -> dict[str, 
     reasoning = reply.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
         turn["reasoning"] = reasoning
+    usage = reply.get("usage")
+    if isinstance(usage, dict):
+        parsed = {
+            k: usage[k]
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if isinstance(usage.get(k), int)
+        }
+        if parsed:
+            turn["usage"] = parsed
     if not turn["content"].strip() and not calls:
         raise CourseAiError("model returned neither text nor tool calls")
     return turn
