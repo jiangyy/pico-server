@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 from picopg.replica import ReplicaLogStore
 from picopg.replica.file_store import FileReplicaLogStore
-from picopg.server.ai import CourseAgent, CourseAi
+from picopg.server.ai import CourseAgent, CourseAi, CourseHint
 from picopg.server.ai.access import AiAccess
 from picopg.server.ai.budget import AiBudget
 from picopg.server.ai.http import dispatch_ai
@@ -74,6 +74,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         course_agent: CourseAgent | None = None,
         ai_access: AiAccess | None = None,
         ai_budget: AiBudget | None = None,
+        course_hint: CourseHint | None = None,
     ) -> None:
         self.workers = None
         sessions = tuple(principal_sessions)
@@ -134,6 +135,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.secure_cookies = secure_cookies
         self.course_ai = course_ai
         self.course_agent = course_agent
+        self.course_hint = course_hint
         # 学生代码会发给模型：默认谁都不发，由运营者按账号打开。
         self.ai_access = ai_access or AiAccess()
         self.ai_budget = ai_budget or AiBudget()
@@ -238,6 +240,7 @@ def build_server(
     course_agent: CourseAgent | None = None,
     ai_access: AiAccess | None = None,
     ai_budget: AiBudget | None = None,
+    course_hint: CourseHint | None = None,
 ) -> PicoPGHttpServer:
     store = FileReplicaLogStore(data_dir / "replica")
     return PicoPGHttpServer(
@@ -255,4 +258,5 @@ def build_server(
         course_agent=course_agent,
         ai_access=ai_access,
         ai_budget=ai_budget,
+        course_hint=course_hint,
     )

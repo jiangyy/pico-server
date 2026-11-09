@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from picopg.server.ai.agent import agent_request, tutor_request
+from picopg.server.ai.hint import hint_request
 from picopg.server.ai.model import CourseAiError
 from picopg.server.learner import due, for_course
 from picopg.server.replication import ResponseSent, logger
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
 def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
     if path in ("/api/v1/ai/agent", "/api/v1/ai/tutor"):
         return _dispatch_agent(handler, path)
+    if path == "/api/v1/ai/hint":
+        return _dispatch_hint(handler)
     if path != "/api/v1/ai/course":
         return False
     try:
@@ -76,6 +79,32 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
         pass
     except Exception:
         logger.exception("course agent request failed")
+        handler.error(500, "server.failure", "server failure")
+    return True
+
+
+def _dispatch_hint(handler: PicoRequestHandler) -> bool:
+    """助教在该开口的时刻请模型写提示：客户端给证据，这里补课程的规则与函数含义。"""
+    try:
+        if handler.command != "POST":
+            handler.error(405, "method.not_allowed", "method not allowed")
+            return True
+        if _permitted(handler) is None:
+            return True
+        if handler.server.course_hint is None:
+            handler.error(503, "ai.unavailable", "course hint is not configured")
+            return True
+        playground_id, version_id, evidence, focus = hint_request(handler.read_json())
+        hint = handler.server.course_hint.hint(playground_id, version_id, evidence, focus)
+        handler.send_json(200, hint, (("Cache-Control", "no-store"),))
+    except ValueError as error:
+        handler.error(400, "ai.request.invalid", str(error))
+    except CourseAiError as error:
+        handler.error(502, "ai.reply.invalid", str(error))
+    except ResponseSent:
+        pass
+    except Exception:
+        logger.exception("course hint request failed")
         handler.error(500, "server.failure", "server failure")
     return True
 

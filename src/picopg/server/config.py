@@ -12,6 +12,8 @@ from picopg.server.ai import (
     CourseAgentService,
     CourseAi,
     CourseAiService,
+    CourseHint,
+    CourseHintService,
     CourseSkillRepository,
     FallbackModel,
     OpenAiCompatibleChatModel,
@@ -189,10 +191,10 @@ def _csv(name: str) -> list[str]:
     return [] if not value else [part.strip() for part in value.split(",")]
 
 
-def _ai_models(effort: str | None = None) -> list[OpenAiCompatibleChatModel] | None:
-    """PICOPG_AI_BASE_URL / _MODEL / _API_KEY 的逗号列表一一对应多个 provider，按顺序回退。"""
+def _ai_models(effort: str | None = None, names: list[str] | None = None) -> list[OpenAiCompatibleChatModel] | None:
+    """PICOPG_AI_BASE_URL / _MODEL / _API_KEY 的逗号列表一一对应多个 provider，按顺序回退；names 换掉各 provider 的模型名。"""
     base_urls = _csv("PICOPG_AI_BASE_URL")
-    models = _csv("PICOPG_AI_MODEL")
+    models = names or _csv("PICOPG_AI_MODEL")
     keys = _csv("PICOPG_AI_API_KEY")
     if not base_urls and not models:
         return None
@@ -229,6 +231,17 @@ def load_course_agent(budget: AiBudget | None = None, package_root: Path | None 
         for model in models:
             model.on_usage = budget.spend
     return CourseAgentService(_fallback(models), _course_skills(package_root))
+
+
+def load_course_hint(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseHint | None:
+    """同一组 provider；PICOPG_AI_HINT_MODEL 可选，按位置换成推理模型（如 deepseek-reasoner），提示要推理盘子在哪，不能说错。"""
+    models = _ai_models(names=_csv("PICOPG_AI_HINT_MODEL") or None)
+    if models is None:
+        return None
+    if budget is not None:
+        for model in models:
+            model.on_usage = budget.spend
+    return CourseHintService(_fallback(models), _course_skills(package_root))
 
 
 def _course_skills(package_root: Path | None) -> CourseSkillRepository:
