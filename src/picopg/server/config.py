@@ -12,6 +12,8 @@ from picopg.server.ai import (
     CourseAgentService,
     CourseAi,
     CourseAiService,
+    CourseDiagnose,
+    CourseDiagnoseService,
     CourseHint,
     CourseHintService,
     CourseSkillRepository,
@@ -242,6 +244,26 @@ def load_course_hint(budget: AiBudget | None = None, package_root: Path | None =
         for model in models:
             model.on_usage = budget.spend
     return CourseHintService(_fallback(models), _course_skills(package_root))
+
+
+def _diagnose_models() -> list[OpenAiCompatibleChatModel] | None:
+    """PICOPG_AI_DIAGNOSE_MODEL 可选，按位置换模型名；没给时和提示同一组（PICOPG_AI_HINT_MODEL）：诊断要推理 bug 在哪。"""
+    return _ai_models(names=_csv("PICOPG_AI_DIAGNOSE_MODEL") or _csv("PICOPG_AI_HINT_MODEL") or None)
+
+
+def diagnose_model() -> OpenAiCompatibleChatModel | FallbackModel | None:
+    models = _diagnose_models()
+    return None if models is None else _fallback(models)
+
+
+def load_course_diagnose(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseDiagnose | None:
+    models = _diagnose_models()
+    if models is None:
+        return None
+    if budget is not None:
+        for model in models:
+            model.on_usage = budget.spend
+    return CourseDiagnoseService(_fallback(models), _course_skills(package_root))
 
 
 def _course_skills(package_root: Path | None) -> CourseSkillRepository:
