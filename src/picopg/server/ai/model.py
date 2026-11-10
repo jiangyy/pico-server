@@ -175,7 +175,7 @@ class FallbackModel:
             except CourseAiError as error:
                 last = error
                 continue
-            self.answered = model.model
+            self.answered = getattr(model, "model", None)
             return content
         raise CourseAiError("all configured models failed") from last
 
@@ -192,6 +192,6 @@ class FallbackModel:
             except CourseAiError as error:
                 last = error
                 continue
-            self.answered = model.model
+            self.answered = getattr(model, "model", None)
             return message
         raise CourseAiError("all configured models failed") from last
