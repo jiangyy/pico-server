@@ -64,6 +64,16 @@ class CourseSkillRepository:
             raise CourseAiError(f"course package skill is invalid for {playground_id!r}") from error
 
 
+class OneSkill:
+    """离线评测用：只有一份课程 skill，不管问哪门课都给它。"""
+
+    def __init__(self, skill: dict[str, object]) -> None:
+        self.skill = skill
+
+    def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]:
+        return self.skill
+
+
 class CourseAiService:
     SYSTEM = (
         "你是面向初中生的 Python 学习助手。只使用给定事实，按学生的问题选择讲解范围；"

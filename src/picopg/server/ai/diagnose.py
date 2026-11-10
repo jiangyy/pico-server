@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
 VERSION = "diagnose-v1"
@@ -140,16 +140,8 @@ def main() -> None:
     if model is None:
         raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    service = CourseDiagnoseService(model, _OneSkill(skill))  # type: ignore[arg-type]
+    service = CourseDiagnoseService(model, OneSkill(skill))  # type: ignore[arg-type]
     print(json.dumps(service.diagnose(str(skill.get("course")), "offline", json.load(sys.stdin)), ensure_ascii=False))
-
-
-class _OneSkill:
-    def __init__(self, skill: dict[str, object]) -> None:
-        self.skill = skill
-
-    def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]:
-        return self.skill
 
 
 if __name__ == "__main__":

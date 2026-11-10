@@ -10,7 +10,7 @@ import json
 import re
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
 SYSTEM = """你是坐在学生旁边的编程助教，学生在自学。规则已经判断出现在该你开口，下面给出依据和事实。
@@ -133,3 +133,23 @@ def hint_request(value: object) -> tuple[str, str, str, str | None]:
     if focus is not None and (not isinstance(focus, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", focus) is None):
         raise ValueError("focus is invalid")
     return playground_id, version_id, evidence, focus
+
+
+def main() -> None:
+    """离线评测用：python -m picopg.server.ai.hint <skill.json> < { "evidence", "focus" }，模型取 PICOPG_AI_* 环境变量。"""
+    import sys
+    from pathlib import Path
+
+    from picopg.server.config import load_course_hint
+
+    loaded = load_course_hint()
+    if loaded is None:
+        raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
+    skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    service = CourseHintService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined, arg-type]
+    request = json.load(sys.stdin)
+    print(json.dumps(service.hint(str(skill.get("course")), "offline", request["evidence"], request.get("focus")), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
