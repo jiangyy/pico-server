@@ -18,15 +18,15 @@ SYSTEM = """你是坐在学生旁边的编程助教，学生在自学。规则�
 先诊断：透过现象，找出学生没懂的那个概念。常见的是没懂某个函数调用的意思，例如它“把多少个什么，从哪里搬到哪里”。懂了这个概念，学生自己就能改对。
 
 然后只写两句话{first}：
-1. concept：说清学生写的那一层里调用的函数是什么意思，也就是调用一次会做成什么事；课程给出了函数含义时就用它，换成学生看得见的说法（盘子、柱子、个数），用 k、X、Y 这样的字母，不用具体数字。
+1. concept：说清学生没懂的那个东西。多数时候是他写的那一层里调用的函数是什么意思，也就是调用一次会做成什么事；课程给出了函数含义时就用它，换成学生看得见的说法（题目里的盘子、柱子、线、窗口、个数），用 k、X、Y 这样的字母，不用具体数字。他卡在 Python 写法上时，concept 说清那个写法的意思，例如“range(n) 依次给出 0 到 n-1”。
 2. reason：根据课程判定和“根源”，用具体的盘子、柱子、行号，说出出错那一行要做什么、为什么走不通、挡住它的东西是哪一行放上去的。
-不要写“看看”“想一想”“读读”“试试”“注意”这类叫学生去做什么的话；学生自己会看。不要给出改好的代码。
-证据里有“他的想法”时：他已经有自己的想法和没说出口的疑问。reason 要回答这个疑问，给一个和他的想法矛盾的事实，用他看得见的东西；能用他自己写过的代码就不用别的。
+不要写“看看”“想一想”“读读”“试试”“注意”这类叫学生去做什么的话；学生自己会看。不要给出改好的整段代码。
+证据里有“他的想法”时：他已经有自己的想法和没说出口的疑问。reason 先回答这个疑问，按那里说的方式回答；那里说可以给出写法时，只写他卡住的那一句。能用他自己写过的代码就不用别的。课程规则里的常见岔路，只在和这个疑问有关时才提。
 
 在“学生写的那一层”讲：学生改的是那一层的代码，问题也要在那一层说清楚，不要钻进更里面的调用。
 代码会把这一次调用的具体值贴在那一层的代码上（贴纸），你不用写贴纸。你还要写：
-- glosses：[{{ "line": 行号, "text": 这一次调用做成了什么事，以及产生第几步或“还没轮到” }}]，只写“学生写的那一层”里列出的行，每条不超过 25 个字。用具体的个数和柱子说出意思，例如“把 2 个盘从 A 搬到 B”，不要重复贴纸上的写法。
-- header：一句话，此刻在执行哪一次调用、它的意思，用具体的值。
+- glosses：[{{ "line": 行号, "text": 这一次调用做成了什么事，以及产生第几步或“还没轮到” }}]，只写“学生写的那一层”里列出的、和问题有关的行，最多 4 条，每条不超过 25 个字；程序在某一行报错停下时，那之后的行不写。用具体的个数和柱子说出意思，例如“把 2 个盘从 A 搬到 B”，不要重复贴纸上的写法。没有值得说的行就写 []。
+- header：一句话，此刻在执行哪一次调用、它的意思，用具体的值；问题是报错或 Python 写法时写 null。
 - diagnosis：给老师看的一句话，学生没懂什么。
 
 concept 不超过 30 个字，reason 不超过 60 个字。
@@ -90,7 +90,7 @@ def _written(content: str) -> dict[str, object]:
     try:
         value = json.loads(content[content.index("{"):content.rindex("}") + 1])
     except ValueError as error:
-        raise CourseAiError("model returned an invalid hint") from error
+        raise CourseAiError(f"model returned an invalid hint: {content[:200]!r}") from error
     if not isinstance(value, dict):
         raise CourseAiError("model returned an invalid hint")
     glosses = value.get("glosses")
@@ -112,6 +112,8 @@ def _problems(hint: dict[str, object], check_concept: bool) -> list[str]:
         problems.append(f"concept {len(concept)} 字，超过 30")
     if len(reason) > 60:
         problems.append(f"reason {len(reason)} 字，超过 60")
+    if len(hint.get("glosses", [])) > 4:  # type: ignore[arg-type]
+        problems.append(f"行旁说明 {len(hint['glosses'])} 条，超过 4 条")  # type: ignore[arg-type]
     for gloss in hint.get("glosses", []):  # type: ignore[union-attr]
         if len(gloss["text"]) > 25:
             problems.append(f"第 {gloss['line']} 行说明 {len(gloss['text'])} 字，超过 25")

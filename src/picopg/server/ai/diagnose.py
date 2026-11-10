@@ -15,7 +15,7 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = "diagnose-v1"
+VERSION = "diagnose-v2"
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 
 
