@@ -164,14 +164,19 @@ class FallbackModel:
         if not models:
             raise ValueError("fallback needs at least one model")
         self.models = models
+        # 最近一次是哪个模型答的；评测结果按它记模型。
+        self.answered: str | None = None
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         last: CourseAiError | None = None
         for model in self.models:
             try:
-                return model.complete(messages)
+                content = model.complete(messages)
             except CourseAiError as error:
                 last = error
+                continue
+            self.answered = model.model
+            return content
         raise CourseAiError("all configured models failed") from last
 
     def step(
@@ -183,7 +188,10 @@ class FallbackModel:
         last: CourseAiError | None = None
         for model in self.models:
             try:
-                return model.step(messages, tools, on_text)
+                message = model.step(messages, tools, on_text)
             except CourseAiError as error:
                 last = error
+                continue
+            self.answered = model.model
+            return message
         raise CourseAiError("all configured models failed") from last

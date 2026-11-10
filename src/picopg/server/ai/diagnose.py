@@ -141,7 +141,8 @@ def main() -> None:
         raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     service = CourseDiagnoseService(model, OneSkill(skill))  # type: ignore[arg-type]
-    print(json.dumps(service.diagnose(str(skill.get("course")), "offline", json.load(sys.stdin)), ensure_ascii=False))
+    diagnosis = service.diagnose(str(skill.get("course")), "offline", json.load(sys.stdin))
+    print(json.dumps({**diagnosis, "model": getattr(model, "answered", None) or getattr(model, "model", None)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -148,7 +148,9 @@ def main() -> None:
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     service = CourseHintService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined, arg-type]
     request = json.load(sys.stdin)
-    print(json.dumps(service.hint(str(skill.get("course")), "offline", request["evidence"], request.get("focus")), ensure_ascii=False))
+    hint = service.hint(str(skill.get("course")), "offline", request["evidence"], request.get("focus"))
+    model = loaded.model  # type: ignore[attr-defined]
+    print(json.dumps({**hint, "model": getattr(model, "answered", None) or getattr(model, "model", None)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
