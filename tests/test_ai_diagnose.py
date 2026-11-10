@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import http.client
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+
+from picopg.replica.file_store import FileReplicaLogStore
+from picopg.server.ai.access import AiAccess
+from picopg.server.app import PicoPGHttpServer
+from picopg.server.auth.model import PrincipalSession
 
 from picopg.server.ai.course import CourseSkillRepository
 from picopg.server.ai.diagnose import VERSION, CourseDiagnoseService, diagnose_request
@@ -68,6 +75,44 @@ class CourseDiagnoseServiceTest(unittest.TestCase):
             diagnose_request({**body, "deleted": "x"})
         with self.assertRaises(ValueError):
             diagnose_request({**body, "extra": 1})
+
+
+class FakeDiagnose:
+    def diagnose(self, playground_id, version_id, request):
+        return {**GOOD, "note": f"{playground_id}:{len(request['deleted'])}", "version": VERSION}
+
+
+class DiagnoseRouteTest(unittest.TestCase):
+    def test_diagnose_route(self) -> None:
+        body = {"playgroundId": "hanoi", "versionId": "v1", **REQUEST}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = PrincipalSession.create("student", "device", "student-token", {}, ["playgrounds"])
+            server = PicoPGHttpServer(
+                ("127.0.0.1", 0), FileReplicaLogStore(root / "replica"), "operator-token", root / "packages",
+                principal_sessions=[session], ai_access=AiAccess(["student"]), course_diagnose=FakeDiagnose(),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def post(token, value):
+                connection = http.client.HTTPConnection(*server.server_address)
+                try:
+                    connection.request("POST", "/api/v1/ai/diagnose", json.dumps(value).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            try:
+                self.assertEqual(post("student-token", body), (200, {**GOOD, "note": "hanoi:1", "version": VERSION}))
+                self.assertEqual(post("wrong-token", body)[0], 401)
+                status, error = post("student-token", {**body, "rejected": "x"})
+                self.assertEqual((status, error["error"]["code"]), (400, "ai.request.invalid"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 if __name__ == "__main__":
