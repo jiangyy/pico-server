@@ -15,7 +15,7 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = "follow-v1"
+VERSION = "follow-v2"
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 GAPS = ("plan", "expression", "execution")
 ACTIONS = ("edit", "run", "debug", "stop")
