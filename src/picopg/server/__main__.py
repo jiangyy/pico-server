@@ -14,6 +14,7 @@ from picopg.server.config import (
     load_course_agent,
     load_course_ai,
     load_course_diagnose,
+    load_course_follow,
     load_course_hint,
     load_principals,
     load_submission_tag_writer,
@@ -77,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         course_agent = load_course_agent(ai_budget, arguments.data / "packages")
         course_hint = load_course_hint(ai_budget, arguments.data / "packages")
         course_diagnose = load_course_diagnose(ai_budget, arguments.data / "packages")
+        course_follow = load_course_follow(ai_budget, arguments.data / "packages")
         ai_access = AiAccess.from_setting(os.environ.get("PICOPG_AI_PRINCIPALS"))
     except ValueError as error:
         logger.error("invalid server configuration: %s", error)
@@ -97,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         ai_budget=ai_budget,
         course_hint=course_hint,
         course_diagnose=course_diagnose,
+        course_follow=course_follow,
     )
     host, port = server.server_address
     logger.info(

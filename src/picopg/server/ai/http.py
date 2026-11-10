@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from picopg.server.ai.agent import agent_request, tutor_request
 from picopg.server.ai.diagnose import diagnose_request
+from picopg.server.ai.follow import follow_request
 from picopg.server.ai.hint import hint_request
 from picopg.server.ai.model import CourseAiError
 from picopg.server.learner import due, for_course
@@ -24,6 +25,8 @@ def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
         return _dispatch_hint(handler)
     if path == "/api/v1/ai/diagnose":
         return _dispatch_diagnose(handler)
+    if path == "/api/v1/ai/follow":
+        return _dispatch_follow(handler)
     if path != "/api/v1/ai/course":
         return False
     try:
@@ -133,6 +136,31 @@ def _dispatch_diagnose(handler: PicoRequestHandler) -> bool:
         pass
     except Exception:
         logger.exception("course diagnose request failed")
+        handler.error(500, "server.failure", "server failure")
+    return True
+
+
+def _dispatch_follow(handler: PicoRequestHandler) -> bool:
+    """助教的“跟”：客户端带上整条线程，这里补课程前缀，拿回下一份思路笔记。"""
+    try:
+        if handler.command != "POST":
+            handler.error(405, "method.not_allowed", "method not allowed")
+            return True
+        if _permitted(handler) is None:
+            return True
+        if handler.server.course_follow is None:
+            handler.error(503, "ai.unavailable", "course follow is not configured")
+            return True
+        playground_id, version_id, request = follow_request(handler.read_json())
+        handler.send_json(200, handler.server.course_follow.follow(playground_id, version_id, request), (("Cache-Control", "no-store"),))
+    except ValueError as error:
+        handler.error(400, "ai.request.invalid", str(error))
+    except CourseAiError as error:
+        handler.error(502, "ai.reply.invalid", str(error))
+    except ResponseSent:
+        pass
+    except Exception:
+        logger.exception("course follow request failed")
         handler.error(500, "server.failure", "server failure")
     return True
 

@@ -14,6 +14,8 @@ from picopg.server.ai import (
     CourseAiService,
     CourseDiagnose,
     CourseDiagnoseService,
+    CourseFollow,
+    CourseFollowService,
     CourseHint,
     CourseHintService,
     CourseSkillRepository,
@@ -254,6 +256,26 @@ def _diagnose_models() -> list[OpenAiCompatibleChatModel] | None:
 def diagnose_model() -> OpenAiCompatibleChatModel | FallbackModel | None:
     models = _diagnose_models()
     return None if models is None else _fallback(models)
+
+
+def _follow_models() -> list[OpenAiCompatibleChatModel] | None:
+    """PICOPG_AI_FOLLOW_MODEL 可选，按位置换模型名；没给时用对话的那组：每次尝试都要调一次，要快而便宜。"""
+    return _ai_models(names=_csv("PICOPG_AI_FOLLOW_MODEL") or None)
+
+
+def follow_model() -> OpenAiCompatibleChatModel | FallbackModel | None:
+    models = _follow_models()
+    return None if models is None else _fallback(models)
+
+
+def load_course_follow(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseFollow | None:
+    models = _follow_models()
+    if models is None:
+        return None
+    if budget is not None:
+        for model in models:
+            model.on_usage = budget.spend
+    return CourseFollowService(_fallback(models), _course_skills(package_root))
 
 
 def load_course_diagnose(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseDiagnose | None:
