@@ -67,6 +67,15 @@ class CourseHintServiceTest(unittest.TestCase):
         for part in ("## 课程规则\n盘子只能顺时针", "hanoi(n, src, dst)：把 n 个盘子", EVIDENCE, "## 第一句（课程给出"):
             self.assertIn(part, user["content"])
 
+    def test_code_to_teach_goes_in_the_example_not_the_reason(self) -> None:
+        example = "nums = [5, 8, 2]\nfor i in range(len(nums)):  # i 依次是 0、1、2\n    print(nums[i])  # 依次打印 5、8、2"
+        crammed = {**GOOD, "reason": "写成：\nfor i in range(len(height)):\n    pass"}
+        model = RecordingModel([json.dumps(crammed, ensure_ascii=False), json.dumps({**GOOD, "example": example}, ensure_ascii=False)])
+        hint = CourseHintService(model, self.skills).hint("hanoi", "v1", EVIDENCE, "hanoi")
+        self.assertEqual((hint["example"], hint["problems"]), (example, []))
+        self.assertIn("多行代码放进 example", model.calls[1][3]["content"])
+        self.assertIsNone(CourseHintService(RecordingModel([json.dumps(GOOD, ensure_ascii=False)]), self.skills).hint("hanoi", "v1", EVIDENCE, "hanoi")["example"])
+
     def test_a_hint_that_breaks_the_rules_is_sent_back_once(self) -> None:
         long = {**GOOD, "reason": "看看第 20 行。" + "很" * 60}
         model = RecordingModel([json.dumps(long, ensure_ascii=False), json.dumps(GOOD, ensure_ascii=False)])

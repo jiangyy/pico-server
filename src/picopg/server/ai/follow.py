@@ -15,7 +15,7 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = "follow-v2"
+VERSION = "follow-v3"
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 GAPS = ("plan", "expression", "execution")
 ACTIONS = ("edit", "run", "debug", "stop")
@@ -96,9 +96,16 @@ def _note(content: str) -> tuple[dict[str, object], list[str]]:
         isinstance(item, dict) and isinstance(item.get("attempt"), int) and (item.get("line") is None or isinstance(item.get("line"), int)) for item in basis
     ):
         problems.append("basis 要是 [{ attempt: 整数, line: 整数或 null }]")
+    lacks = value.get("lacks", [])
+    if not isinstance(lacks, list) or len(lacks) > 3 or not all(
+        isinstance(item, dict) and isinstance(item.get("what"), str) and isinstance(item.get("seen"), list)
+        and all(isinstance(piece, str) for piece in item["seen"]) for item in lacks
+    ):
+        problems.append("lacks 要是最多 3 条 [{ what, seen: [代码片段] }]")
     if problems:
         return {}, problems
     return {
+        "lacks": [{"what": item["what"], "seen": item["seen"]} for item in lacks],
         "doing": value["doing"], "question": value.get("question"), "gap": value["gap"],
         "belief": {"text": belief["text"], "lines": belief["lines"], "steps": belief["steps"]},  # type: ignore[index]
         "next": {"action": nxt["action"], "lines": nxt["lines"]},  # type: ignore[index]

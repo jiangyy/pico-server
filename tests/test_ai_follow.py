@@ -20,6 +20,7 @@ NOTE = {
     "doing": "在补 else", "belief": {"text": "认为问题在第 22、23 行", "lines": [22, 23], "steps": [6]},
     "question": "为什么红叉还在第 6 步", "gap": "execution", "next": {"action": "edit", "lines": [22]},
     "want": {"say": "wait", "why": "他还在试"}, "basis": [{"attempt": 7, "line": 22}],
+    "lacks": [{"what": "递归调用 hanoi(k, X, Y) 的意思", "seen": ["hanoi(n - 1, src, dst)"]}],
 }
 REQUEST = {"reference": "def hanoi(n, src, dst): ...", "thread": [{"role": "user", "content": "第 1 次尝试"}]}
 
@@ -51,6 +52,12 @@ class CourseFollowServiceTest(unittest.TestCase):
         self.assertIn("gap 只能是", model.calls[1][-1]["content"])
         with self.assertRaises(CourseAiError):
             CourseFollowService(RecordingModel(["no", "still no"]), OneSkill(SKILL)).follow("hanoi", "v1", REQUEST)
+
+    def test_lacks_must_name_a_piece_and_show_his_code(self) -> None:
+        model = RecordingModel([json.dumps({**NOTE, "lacks": ["for 循环"]}, ensure_ascii=False), json.dumps(NOTE, ensure_ascii=False)])
+        note = CourseFollowService(model, OneSkill(SKILL)).follow("hanoi", "v1", REQUEST)
+        self.assertEqual(note["lacks"], NOTE["lacks"])
+        self.assertIn("lacks", model.calls[-1][-1]["content"])
 
     def test_the_thread_must_alternate_and_end_with_the_student(self) -> None:
         body = {"playgroundId": "hanoi", "versionId": "v1", **REQUEST}

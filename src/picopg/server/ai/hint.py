@@ -27,10 +27,11 @@ SYSTEM = """你是坐在学生旁边的编程助教，学生在自学。规则�
 代码会把这一次调用的具体值贴在那一层的代码上（贴纸），你不用写贴纸。你还要写：
 - glosses：[{{ "line": 行号, "text": 这一次调用做成了什么事，以及产生第几步或“还没轮到” }}]，只写“学生写的那一层”里列出的、和问题有关的行，最多 5 条，每条不超过 25 个字；程序在某一行报错停下时，那之后的行不写。用具体的个数和柱子说出意思，例如“把 2 个盘从 A 搬到 B”，不要重复贴纸上的写法。没有值得说的行就写 []。
 - header：一句话，此刻在执行哪一次调用、它的意思，用具体的值；问题是报错或 Python 写法时写 null。
+- example：证据里“他还不会的”那一块和这次卡住有关时，在这里把它教完整：一段和这道题无关的小例子代码，不超过 6 行，换用别的变量名和数据，每行用 # 注释写出它这一次做了什么（具体的值）。不能是这道题的解法。不用教时写 null。
 - diagnosis：给老师看的一句话，学生没懂什么。
 
-concept 不超过 30 个字，reason 不超过 60 个字。
-只输出一个 JSON 对象：{{ "diagnosis", "concept", "reason", "header", "glosses" }}。"""
+concept 不超过 30 个字，reason 不超过 60 个字，都只写一行；要写多行代码时放进 example。
+只输出一个 JSON 对象：{{ "diagnosis", "concept", "reason", "header", "glosses", "example" }}。"""
 
 FILLER = re.compile("看看|想一想|想想|读读|试试|注意")
 
@@ -96,6 +97,7 @@ def _written(content: str) -> dict[str, object]:
     glosses = value.get("glosses")
     return {
         **{key: value[key] for key in ("diagnosis", "concept", "reason", "header") if isinstance(value.get(key), str)},
+        "example": value["example"].strip("\n") if isinstance(value.get("example"), str) and value["example"].strip() else None,
         "glosses": [
             {"line": item["line"], "text": item["text"]}
             for item in glosses if isinstance(item, dict) and isinstance(item.get("line"), int) and isinstance(item.get("text"), str)
@@ -112,6 +114,11 @@ def _problems(hint: dict[str, object], check_concept: bool) -> list[str]:
         problems.append(f"concept {len(concept)} 字，超过 30")
     if len(reason) > 60:
         problems.append(f"reason {len(reason)} 字，超过 60")
+    if "\n" in concept.strip() or "\n" in reason.strip():
+        problems.append("concept、reason 只写一行，多行代码放进 example")
+    example = hint.get("example")
+    if isinstance(example, str) and len(example.split("\n")) > 6:
+        problems.append(f"example {len(example.split(chr(10)))} 行，超过 6 行")
     if len(hint.get("glosses", [])) > 5:  # type: ignore[arg-type]
         problems.append(f"行旁说明 {len(hint['glosses'])} 条，超过 5 条")  # type: ignore[arg-type]
     for gloss in hint.get("glosses", []):  # type: ignore[union-attr]
