@@ -79,11 +79,11 @@ def _debrief(content: str) -> tuple[dict[str, object], list[str]]:
     better = value.get("better_code")
     if better is not None and not isinstance(better, str):
         problems.append("better_code 要么是代码，要么是 null")
-    review = {key: _code(value[key]) if key == "cleaner" else value[key].strip() for key in TEXTS if isinstance(value.get(key), str)}
-    review["better_code"] = _code(better) if isinstance(better, str) and better.strip() else None
+    debrief = {key: _code(value[key]) if key == "cleaner" else value[key].strip() for key in TEXTS if isinstance(value.get(key), str)}
+    debrief["better_code"] = _code(better) if isinstance(better, str) and better.strip() else None
     lectures, wrong = _lectures(value.get("lectures"))
-    review["lectures"] = lectures
-    return review, problems + wrong
+    debrief["lectures"] = lectures
+    return debrief, problems + wrong
 
 
 def _lectures(value: object) -> tuple[list[dict[str, object]], list[str]]:

@@ -33,19 +33,19 @@ class RecordingModel:
 class CourseDebriefServiceTest(unittest.TestCase):
     def test_code_comes_back_without_fences(self) -> None:
         model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
-        review = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
-        self.assertEqual(review["cleaner"], "def max_area(height):\n    return 0\n")
-        self.assertIsNone(review["better_code"])
-        self.assertEqual(review["version"], VERSION)
+        debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
+        self.assertEqual(debrief["cleaner"], "def max_area(height):\n    return 0\n")
+        self.assertIsNone(debrief["better_code"])
+        self.assertEqual(debrief["version"], VERSION)
         user = model.calls[0][1]["content"]
         self.assertIn("## 课程规则\n同一个下标不能用两次。", user)
         self.assertIn("对拍：208 组全部一致", user)
 
     def test_lectures_end_with_the_whole_solution(self) -> None:
         model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
-        review = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
-        self.assertEqual(review["lectures"][0]["steps"][1]["beats"][0]["write"], "def max_area(height):\n    return 0\n")
-        self.assertNotIn("write", review["lectures"][0]["steps"][0]["beats"][0])
+        debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
+        self.assertEqual(debrief["lectures"][0]["steps"][1]["beats"][0]["write"], "def max_area(height):\n    return 0\n")
+        self.assertNotIn("write", debrief["lectures"][0]["steps"][0]["beats"][0])
         unfinished = {**REVIEW, "lectures": [{"title": "t", "steps": [{"title": "s", "beats": [{"say": "只讲不写。"}]}]}]}
         model = RecordingModel([json.dumps(unfinished, ensure_ascii=False), json.dumps(REVIEW, ensure_ascii=False)])
         CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
