@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import json
+import unittest
+
+from picopg.server.ai.course import OneSkill
+from picopg.server.ai.model import CourseAiError
+from picopg.server.ai.review import VERSION, CourseReviewService, review_request
+
+SKILL = {"course": "water-container", "rules": "同一个下标不能用两次。"}
+REVIEW = {
+    "idea": "每个 i 当矮边，找最远的不比它矮的 k", "right": "水量只由矮的那根决定", "cleaner": "```python\ndef max_area(height):\n    return 0\n```",
+    "cleaner_why": "合成一段", "math": "max min(h_i,h_j)(j-i)", "better": "按高度从高到低", "better_code": None,
+    "complexity": "O(n²) → O(n log n)", "edges": "等高也对",
+}
+REQUEST = {"source": "def max_area(height):\n    return 0\n", "facts": "对拍：208 组全部一致", "reference": "def max_area(height): ..."}
+
+
+class RecordingModel:
+    def __init__(self, replies):
+        self.replies = iter(replies)
+        self.calls = []
+
+    def step(self, messages, tools, on_text=None):
+        self.calls.append([dict(message) for message in messages])
+        return {"content": next(self.replies)}
+
+
+class CourseReviewServiceTest(unittest.TestCase):
+    def test_code_comes_back_without_fences(self) -> None:
+        model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
+        review = CourseReviewService(model, OneSkill(SKILL)).review("water-container", "v1", REQUEST)
+        self.assertEqual(review["cleaner"], "def max_area(height):\n    return 0\n")
+        self.assertIsNone(review["better_code"])
+        self.assertEqual(review["version"], VERSION)
+        user = model.calls[0][1]["content"]
+        self.assertIn("## 课程规则\n同一个下标不能用两次。", user)
+        self.assertIn("对拍：208 组全部一致", user)
+
+    def test_a_missing_field_is_sent_back_once(self) -> None:
+        missing = {key: value for key, value in REVIEW.items() if key != "math"}
+        model = RecordingModel([json.dumps(missing, ensure_ascii=False), json.dumps(REVIEW, ensure_ascii=False)])
+        CourseReviewService(model, OneSkill(SKILL)).review("water-container", "v1", REQUEST)
+        self.assertIn("缺少 math", model.calls[1][-1]["content"])
+        model = RecordingModel([json.dumps(missing, ensure_ascii=False)] * 2)
+        with self.assertRaises(CourseAiError):
+            CourseReviewService(model, OneSkill(SKILL)).review("water-container", "v1", REQUEST)
+
+    def test_code_that_failed_its_run_is_sent_back(self) -> None:
+        model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
+        rejected = {"review": REVIEW, "result": "cleaner：对拍不一致：输入 [5, 5] 得 0，应该 5"}
+        CourseReviewService(model, OneSkill(SKILL)).review("water-container", "v1", {**REQUEST, "rejected": rejected})
+        self.assertIn("[5, 5] 得 0", model.calls[0][-1]["content"])
+
+    def test_request_shape(self) -> None:
+        body = {"playgroundId": "water-container", "versionId": "v1", **REQUEST}
+        self.assertEqual(review_request(body)[2]["facts"], REQUEST["facts"])
+        with self.assertRaises(ValueError):
+            review_request({**body, "extra": 1})
+        with self.assertRaises(ValueError):
+            review_request({**body, "rejected": {"review": REVIEW}})
+
+
+if __name__ == "__main__":
+    unittest.main()
