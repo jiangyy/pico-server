@@ -1,5 +1,5 @@
 """做对之后的复盘：客户端发来学生做对的代码和代码跑出来的事实（对拍、极端用例），请模型写思路判断、
-按他思路更干净的写法、数学抽象与更好的解法。代码由客户端运行验证，不过就把结果发回来重写。
+按他思路更干净的写法、数学抽象与更好的解法，以及边讲边写出代码的讲解（lectures）。代码由客户端运行验证，不过就把结果发回来重写。
 提示词是带版本号的文件 prompts/review-v<N>.md。
 """
 
@@ -14,7 +14,7 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = os.environ.get("PICOPG_REVIEW_PROMPT", "review-v1")
+VERSION = os.environ.get("PICOPG_REVIEW_PROMPT", "review-v2")
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 TEXTS = ("idea", "right", "cleaner", "cleaner_why", "math", "better", "complexity", "edges")
 
@@ -81,7 +81,37 @@ def _review(content: str) -> tuple[dict[str, object], list[str]]:
         problems.append("better_code 要么是代码，要么是 null")
     review = {key: _code(value[key]) if key == "cleaner" else value[key].strip() for key in TEXTS if isinstance(value.get(key), str)}
     review["better_code"] = _code(better) if isinstance(better, str) and better.strip() else None
-    return review, problems
+    lectures, wrong = _lectures(value.get("lectures"))
+    review["lectures"] = lectures
+    return review, problems + wrong
+
+
+def _lectures(value: object) -> tuple[list[dict[str, object]], list[str]]:
+    """每份 { title, steps: [{ title, beats: [{ say, write? }] }] }，最后一句要写出完整解法。"""
+    if not isinstance(value, list) or not 1 <= len(value) <= 2:
+        return [], ["lectures 要有 1–2 份讲解"]
+    lectures: list[dict[str, object]] = []
+    problems: list[str] = []
+    for number, lecture in enumerate(value, 1):
+        steps = lecture.get("steps") if isinstance(lecture, dict) else None
+        if not isinstance(lecture, dict) or not isinstance(lecture.get("title"), str) or not isinstance(steps, list) or not steps:
+            problems.append(f"第 {number} 份讲解要有 title 和 steps")
+            continue
+        shaped = []
+        for step in steps:
+            beats = step.get("beats") if isinstance(step, dict) else None
+            if not isinstance(beats, list) or not beats or not all(isinstance(beat, dict) and isinstance(beat.get("say"), str) for beat in beats):
+                problems.append(f"第 {number} 份讲解的每一步要有 beats，每句有 say")
+                break
+            shaped.append({
+                "title": step.get("title") if isinstance(step.get("title"), str) else None,
+                "beats": [{"say": beat["say"], **({"write": _code(beat["write"])} if isinstance(beat.get("write"), str) and beat["write"].strip() else {})} for beat in beats],
+            })
+        else:
+            if "write" not in shaped[-1]["beats"][-1]:
+                problems.append(f"第 {number} 份讲解的最后一句要写出完整解法（write）")
+            lectures.append({"title": lecture["title"], "steps": shaped})
+    return lectures, problems
 
 
 def _code(text: str) -> str:

@@ -12,6 +12,10 @@ REVIEW = {
     "idea": "每个 i 当矮边，找最远的不比它矮的 k", "right": "水量只由矮的那根决定", "cleaner": "```python\ndef max_area(height):\n    return 0\n```",
     "cleaner_why": "合成一段", "math": "max min(h_i,h_j)(j-i)", "better": "按高度从高到低", "better_code": None,
     "complexity": "O(n²) → O(n log n)", "edges": "等高也对",
+    "lectures": [{"title": "从高到低", "steps": [
+        {"title": "哪里在重复", "beats": [{"say": "每根线都重新扫一遍。"}]},
+        {"title": "存起来", "beats": [{"say": "先排序。", "write": "```python\ndef max_area(height):\n    return 0\n```"}]},
+    ]}],
 }
 REQUEST = {"source": "def max_area(height):\n    return 0\n", "facts": "对拍：208 组全部一致", "reference": "def max_area(height): ..."}
 
@@ -36,6 +40,16 @@ class CourseReviewServiceTest(unittest.TestCase):
         user = model.calls[0][1]["content"]
         self.assertIn("## 课程规则\n同一个下标不能用两次。", user)
         self.assertIn("对拍：208 组全部一致", user)
+
+    def test_lectures_end_with_the_whole_solution(self) -> None:
+        model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
+        review = CourseReviewService(model, OneSkill(SKILL)).review("water-container", "v1", REQUEST)
+        self.assertEqual(review["lectures"][0]["steps"][1]["beats"][0]["write"], "def max_area(height):\n    return 0\n")
+        self.assertNotIn("write", review["lectures"][0]["steps"][0]["beats"][0])
+        unfinished = {**REVIEW, "lectures": [{"title": "t", "steps": [{"title": "s", "beats": [{"say": "只讲不写。"}]}]}]}
+        model = RecordingModel([json.dumps(unfinished, ensure_ascii=False), json.dumps(REVIEW, ensure_ascii=False)])
+        CourseReviewService(model, OneSkill(SKILL)).review("water-container", "v1", REQUEST)
+        self.assertIn("最后一句要写出完整解法", model.calls[1][-1]["content"])
 
     def test_a_missing_field_is_sent_back_once(self) -> None:
         missing = {key: value for key, value in REVIEW.items() if key != "math"}

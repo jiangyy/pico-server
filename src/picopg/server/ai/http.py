@@ -10,6 +10,7 @@ from picopg.server.ai.agent import agent_request, tutor_request
 from picopg.server.ai.diagnose import diagnose_request
 from picopg.server.ai.follow import follow_request
 from picopg.server.ai.hint import hint_request
+from picopg.server.ai.review import review_request
 from picopg.server.ai.model import CourseAiError
 from picopg.server.learner import due, for_course
 from picopg.server.replication import ResponseSent, logger
@@ -27,6 +28,8 @@ def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
         return _dispatch_diagnose(handler)
     if path == "/api/v1/ai/follow":
         return _dispatch_follow(handler)
+    if path == "/api/v1/ai/review":
+        return _dispatch_review(handler)
     if path != "/api/v1/ai/course":
         return False
     try:
@@ -161,6 +164,31 @@ def _dispatch_follow(handler: PicoRequestHandler) -> bool:
         pass
     except Exception:
         logger.exception("course follow request failed")
+        handler.error(500, "server.failure", "server failure")
+    return True
+
+
+def _dispatch_review(handler: PicoRequestHandler) -> bool:
+    """做对之后的复盘：客户端发来做对的代码和代码跑出来的事实，拿回复盘与讲解；里面的代码由客户端运行验证。"""
+    try:
+        if handler.command != "POST":
+            handler.error(405, "method.not_allowed", "method not allowed")
+            return True
+        if _permitted(handler) is None:
+            return True
+        if handler.server.course_review is None:
+            handler.error(503, "ai.unavailable", "course review is not configured")
+            return True
+        playground_id, version_id, request = review_request(handler.read_json())
+        handler.send_json(200, handler.server.course_review.review(playground_id, version_id, request), (("Cache-Control", "no-store"),))
+    except ValueError as error:
+        handler.error(400, "ai.request.invalid", str(error))
+    except CourseAiError as error:
+        handler.error(502, "ai.reply.invalid", str(error))
+    except ResponseSent:
+        pass
+    except Exception:
+        logger.exception("course review request failed")
         handler.error(500, "server.failure", "server failure")
     return True
 
