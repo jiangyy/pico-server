@@ -18,8 +18,8 @@ from picopg.server.ai import (
     CourseFollowService,
     CourseHint,
     CourseHintService,
-    CourseReview,
-    CourseReviewService,
+    CourseDebrief,
+    CourseDebriefService,
     CourseSkillRepository,
     FallbackModel,
     OpenAiCompatibleChatModel,
@@ -280,7 +280,7 @@ def load_course_follow(budget: AiBudget | None = None, package_root: Path | None
     return CourseFollowService(_fallback(models), _course_skills(package_root))
 
 
-def load_course_review(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseReview | None:
+def load_course_debrief(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseDebrief | None:
     """和提示同一组模型：复盘要推理思路为什么对、写能跑通的代码。"""
     models = _ai_models(names=_csv("PICOPG_AI_HINT_MODEL") or None)
     if models is None:
@@ -288,7 +288,7 @@ def load_course_review(budget: AiBudget | None = None, package_root: Path | None
     if budget is not None:
         for model in models:
             model.on_usage = budget.spend
-    return CourseReviewService(_fallback(models), _course_skills(package_root))
+    return CourseDebriefService(_fallback(models), _course_skills(package_root))
 
 
 def load_course_diagnose(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseDiagnose | None:

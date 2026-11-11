@@ -1,6 +1,6 @@
 """做对之后的复盘：客户端发来学生做对的代码和代码跑出来的事实（对拍、极端用例），请模型写思路判断、
 按他思路更干净的写法、数学抽象与更好的解法，以及边讲边写出代码的讲解（lectures）。代码由客户端运行验证，不过就把结果发回来重写。
-提示词是带版本号的文件 prompts/review-v<N>.md。
+提示词是带版本号的文件 prompts/debrief-v<N>.md。
 """
 
 from __future__ import annotations
@@ -14,21 +14,21 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = os.environ.get("PICOPG_REVIEW_PROMPT", "review-v2")
+VERSION = os.environ.get("PICOPG_DEBRIEF_PROMPT", "debrief-v2")
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 TEXTS = ("idea", "right", "cleaner", "cleaner_why", "math", "better", "complexity", "edges")
 
 
-class CourseReview(Protocol):
-    def review(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]: ...
+class CourseDebrief(Protocol):
+    def debrief(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]: ...
 
 
-class CourseReviewService:
+class CourseDebriefService:
     def __init__(self, model: ToolModel, skills: CourseSkillRepository | OneSkill) -> None:
         self.model = model
         self.skills = skills
 
-    def review(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]:
+    def debrief(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]:
         """request：source 他做对的代码，facts 题目和代码算出的事实，reference 参考解或 null，rejected 上一版没验证过的代码和运行结果。"""
         skill = self._skill(playground_id, version_id)
         parts = [
@@ -44,22 +44,22 @@ class CourseReviewService:
         rejected = request.get("rejected")
         if isinstance(rejected, dict):
             chat += [
-                {"role": "assistant", "content": json.dumps(rejected["review"], ensure_ascii=False)},
+                {"role": "assistant", "content": json.dumps(rejected["debrief"], ensure_ascii=False)},
                 {"role": "user", "content": f"代码跑过了，有这些问题，请改好后重新输出整个 JSON：\n{rejected['result']}"},
             ]
         problems: list[str] = []
         for _ in range(2):
             content = self.model.step(chat, [], None).get("content")
             if not isinstance(content, str):
-                raise CourseAiError("model returned no review")
-            review, problems = _review(content)
+                raise CourseAiError("model returned no debrief")
+            debrief, problems = _debrief(content)
             if not problems:
-                return {**review, "version": VERSION}
+                return {**debrief, "version": VERSION}
             chat += [
                 {"role": "assistant", "content": content},
                 {"role": "user", "content": "有这些问题，请改好后重新输出整个 JSON：\n" + "\n".join(f"- {item}" for item in problems)},
             ]
-        raise CourseAiError("model returned an invalid review: " + "；".join(problems))
+        raise CourseAiError("model returned an invalid debrief: " + "；".join(problems))
 
     def _skill(self, playground_id: str, version_id: str) -> dict[str, object]:
         try:
@@ -68,7 +68,7 @@ class CourseReviewService:
             return {}
 
 
-def _review(content: str) -> tuple[dict[str, object], list[str]]:
+def _debrief(content: str) -> tuple[dict[str, object], list[str]]:
     try:
         value = json.loads(content[content.index("{"):content.rindex("}") + 1])
     except ValueError:
@@ -120,7 +120,7 @@ def _code(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip("\n") + "\n"
 
 
-def review_request(value: object) -> tuple[str, str, dict[str, object]]:
+def debrief_request(value: object) -> tuple[str, str, dict[str, object]]:
     if not isinstance(value, dict) or not {"playgroundId", "versionId", "source", "facts"} <= set(value) <= {"playgroundId", "versionId", "source", "facts", "reference", "rejected"}:
         raise ValueError("body must contain playgroundId, versionId, source and facts")
     playground_id, version_id = value["playgroundId"], value["versionId"]
@@ -134,13 +134,13 @@ def review_request(value: object) -> tuple[str, str, dict[str, object]]:
     if value.get("reference") is not None and (not isinstance(value["reference"], str) or len(value["reference"]) > 20000):
         raise ValueError("reference is invalid")
     rejected = value.get("rejected")
-    if rejected is not None and (not isinstance(rejected, dict) or set(rejected) != {"review", "result"} or not isinstance(rejected["result"], str)):
+    if rejected is not None and (not isinstance(rejected, dict) or set(rejected) != {"debrief", "result"} or not isinstance(rejected["result"], str)):
         raise ValueError("rejected is invalid")
     return playground_id, version_id, {key: value.get(key) for key in ("source", "facts", "reference", "rejected")}
 
 
 def main() -> None:
-    """离线评测用：python -m picopg.server.ai.review <skill.json> < { "source", "facts", "reference", "rejected" }，模型取 PICOPG_AI_* 环境变量。"""
+    """离线评测用：python -m picopg.server.ai.debrief <skill.json> < { "source", "facts", "reference", "rejected" }，模型取 PICOPG_AI_* 环境变量。"""
     import sys
 
     from picopg.server.config import load_course_hint
@@ -149,10 +149,10 @@ def main() -> None:
     if loaded is None:
         raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    service = CourseReviewService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined, arg-type]
-    review = service.review(str(skill.get("course")), "offline", json.load(sys.stdin))
+    service = CourseDebriefService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined, arg-type]
+    debrief = service.debrief(str(skill.get("course")), "offline", json.load(sys.stdin))
     model = loaded.model  # type: ignore[attr-defined]
-    print(json.dumps({**review, "model": getattr(model, "answered", None) or getattr(model, "model", None)}, ensure_ascii=False))
+    print(json.dumps({**debrief, "model": getattr(model, "answered", None) or getattr(model, "model", None)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
