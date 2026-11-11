@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import json
 import re
+import os
 from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = "follow-v3"
+VERSION = os.environ.get("PICOPG_FOLLOW_PROMPT", "follow-v4")
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 GAPS = ("plan", "expression", "execution")
 ACTIONS = ("edit", "run", "debug", "stop")
