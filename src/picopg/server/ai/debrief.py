@@ -14,7 +14,7 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = os.environ.get("PICOPG_DEBRIEF_PROMPT", "debrief-v2")
+VERSION = os.environ.get("PICOPG_DEBRIEF_PROMPT", "debrief-v3")
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 TEXTS = ("idea", "right", "cleaner", "cleaner_why", "math", "better", "complexity", "edges")
 
