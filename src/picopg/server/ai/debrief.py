@@ -48,13 +48,16 @@ class CourseDebriefService:
                 {"role": "user", "content": f"代码跑过了，有这些问题，请改好后重新输出整个 JSON：\n{rejected['result']}"},
             ]
         problems: list[str] = []
-        for _ in range(2):
+        for round in range(2):
             content = self.model.step(chat, [], None).get("content")
             if not isinstance(content, str):
                 raise CourseAiError("model returned no debrief")
             debrief, problems = _debrief(content)
-            if not problems:
+            # 讲得太快只请它改一次：第二次仍然一句写一大段，照样可以讲。
+            advice = [] if problems else _pace(debrief["lectures"], str(request["source"]))
+            if not problems and (not advice or round == 1):
                 return {**debrief, "version": VERSION}
+            problems = problems or advice
             chat += [
                 {"role": "assistant", "content": content},
                 {"role": "user", "content": "有这些问题，请改好后重新输出整个 JSON：\n" + "\n".join(f"- {item}" for item in problems)},
@@ -112,6 +115,25 @@ def _lectures(value: object) -> tuple[list[dict[str, object]], list[str]]:
                 problems.append(f"第 {number} 份讲解的最后一句要写出完整解法（write）")
             lectures.append({"title": lecture["title"], "steps": shaped})
     return lectures, problems
+
+
+def _pace(lectures: list[dict[str, object]], source: str) -> list[str]:
+    """代码要跟着讲解一点点出来：一句最多写出 5 行新代码，写代码的那一步至少两句。"""
+    advice: list[str] = []
+    for number, lecture in enumerate(lectures, 1):
+        code = source
+        for step in lecture["steps"]:  # type: ignore[union-attr]
+            beats = step["beats"]
+            writes = [beat for beat in beats if "write" in beat]
+            if writes and len(beats) < 2:
+                advice.append(f"第 {number} 份讲解的「{step['title'] or '某一步'}」只有一句就写了代码：拆成几句，先讲为什么，再一句写一两行")
+            for beat in writes:
+                before = set(code.split("\n"))
+                added = [line for line in beat["write"].split("\n") if line.strip() and line not in before]
+                if len(added) > 5:
+                    advice.append(f"第 {number} 份讲解「{beat['say'][:20]}……」一句写出了 {len(added)} 行新代码，拆成几句、每句一两行")
+                code = beat["write"]
+    return advice
 
 
 def _code(text: str) -> str:

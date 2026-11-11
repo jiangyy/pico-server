@@ -14,7 +14,7 @@ REVIEW = {
     "complexity": "O(n²) → O(n log n)", "edges": "等高也对",
     "lectures": [{"title": "从高到低", "steps": [
         {"title": "哪里在重复", "beats": [{"say": "每根线都重新扫一遍。"}]},
-        {"title": "存起来", "beats": [{"say": "先排序。", "write": "```python\ndef max_area(height):\n    return 0\n```"}]},
+        {"title": "存起来", "beats": [{"say": "高的先处理。"}, {"say": "先排序。", "write": "```python\ndef max_area(height):\n    return 0\n```"}]},
     ]}],
 }
 REQUEST = {"source": "def max_area(height):\n    return 0\n", "facts": "对拍：208 组全部一致", "reference": "def max_area(height): ..."}
@@ -44,12 +44,22 @@ class CourseDebriefServiceTest(unittest.TestCase):
     def test_lectures_end_with_the_whole_solution(self) -> None:
         model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
         debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
-        self.assertEqual(debrief["lectures"][0]["steps"][1]["beats"][0]["write"], "def max_area(height):\n    return 0\n")
+        self.assertEqual(debrief["lectures"][0]["steps"][1]["beats"][1]["write"], "def max_area(height):\n    return 0\n")
         self.assertNotIn("write", debrief["lectures"][0]["steps"][0]["beats"][0])
         unfinished = {**REVIEW, "lectures": [{"title": "t", "steps": [{"title": "s", "beats": [{"say": "只讲不写。"}]}]}]}
         model = RecordingModel([json.dumps(unfinished, ensure_ascii=False), json.dumps(REVIEW, ensure_ascii=False)])
         CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
         self.assertIn("最后一句要写出完整解法", model.calls[1][-1]["content"])
+
+    def test_a_lecture_that_writes_too_much_at_once_is_sent_back_once(self) -> None:
+        long = "def max_area(height):\n" + "".join(f"    x{k} = {k}\n" for k in range(7)) + "    return 0\n"
+        rushed = {**REVIEW, "lectures": [{"title": "t", "steps": [{"title": "一口气", "beats": [{"say": "全写了。", "write": long}]}]}]}
+        model = RecordingModel([json.dumps(rushed, ensure_ascii=False), json.dumps(rushed, ensure_ascii=False)])
+        debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
+        self.assertIn("一句写出了 7 行新代码", model.calls[1][-1]["content"])
+        self.assertIn("只有一句就写了代码", model.calls[1][-1]["content"])
+        self.assertEqual(len(model.calls), 2, "第二次仍然太快也照样交出")
+        self.assertEqual(debrief["lectures"][0]["steps"][0]["beats"][0]["write"], long)
 
     def test_a_missing_field_is_sent_back_once(self) -> None:
         missing = {key: value for key, value in REVIEW.items() if key != "math"}
