@@ -120,8 +120,8 @@ def _problems(hint: dict[str, object], check_concept: bool) -> list[str]:
     if "\n" in concept.strip() or "\n" in reason.strip():
         problems.append("concept、reason 只写一行，多行代码放进 example")
     example = hint.get("example")
-    if isinstance(example, str) and len(example.split("\n")) > 6:
-        problems.append(f"example {len(example.split(chr(10)))} 行，超过 6 行")
+    if isinstance(example, str) and len(example.split("\n")) > 8:
+        problems.append(f"example {len(example.split(chr(10)))} 行，超过 8 行")
     if len(hint.get("glosses", [])) > 5:  # type: ignore[arg-type]
         problems.append(f"行旁说明 {len(hint['glosses'])} 条，超过 5 条")  # type: ignore[arg-type]
     for gloss in hint.get("glosses", []):  # type: ignore[union-attr]
