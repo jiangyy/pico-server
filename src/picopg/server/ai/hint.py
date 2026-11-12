@@ -31,10 +31,11 @@ SYSTEM = """你是坐在学生旁边的编程助教，学生在自学。规则�
   · 他卡在 Python 写法上（证据里“他还不会的”那一块）：一段和这道题无关的小例子代码，不超过 6 行，照他的写法写：他代码里怎么写循环（例如 while 加 k=k-1）、怎么起名（例如 i、k、n、maxn）、怎么写条件，例子里就怎么写，只把要教的那一处写对；换一组小数据，每行用 # 注释写出它这一次做了什么（具体的值）。
   · 他不知道这一步怎么做（证据里要“代码框架”）：写他这个函数接下来那一段的框架，不超过 8 行，直接接在他的代码上：用他代码里已有的变量名和他的循环、判断写法，不用他没用过的函数、库和写法，不引入他还不知道的概念名（例如别突然出现 best[i][j]）；结构写出来，关键的一两处写成 `# TODO：要做什么`，留给他填。
   两种都不能是这道题的完整解法。
+- fixes：他代码里“知道就会”的写法错误（Python 写法、API、类型，例如 list 没有 .sum()、变量名写错、/ 得到浮点数而题目要分数串、copyh=h 只是别名、C 风格分号），按会先挡住程序的顺序，最多 3 个知识点：[{{ "why": 一句话说他该学会的知识点, "edits": [{{ "line": 行号, "old": 那一行现在的原文, "new": 改成什么（可以多行，例如在上面补一行 import） }}] }}]。同一个错出现在几行就列几处，一处不漏；只改写法，不改他的做法和算法，不替他写还没写的代码。没有时写 []。代码会先把这些改法直接显示在他的代码上，你的 concept、reason 只讲思路，不重复这些写法错误。
 - diagnosis：给老师看的一句话，学生没懂什么。
 
 concept 不超过 30 个字，reason 不超过 60 个字，都只写一行；要写多行代码时放进 example。
-只输出一个 JSON 对象：{{ "diagnosis", "concept", "reason", "header", "glosses", "example" }}。"""
+只输出一个 JSON 对象：{{ "diagnosis", "concept", "reason", "header", "glosses", "example", "fixes" }}。"""
 
 FILLER = re.compile("看看|想一想|想想|读读|试试|注意")
 
@@ -98,7 +99,16 @@ def _written(content: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise CourseAiError("model returned an invalid hint")
     glosses = value.get("glosses")
+    fixes = value.get("fixes")
     return {
+        "fixes": [
+            {"why": item["why"], "edits": [
+                {"line": edit["line"], "old": edit["old"], "new": edit["new"]}
+                for edit in item.get("edits", []) if isinstance(edit, dict) and isinstance(edit.get("line"), int)
+                and isinstance(edit.get("old"), str) and isinstance(edit.get("new"), str)
+            ]}
+            for item in fixes if isinstance(item, dict) and isinstance(item.get("why"), str) and isinstance(item.get("edits"), list)
+        ][:3] if isinstance(fixes, list) else [],
         **{key: value[key] for key in ("diagnosis", "concept", "reason", "header") if isinstance(value.get(key), str)},
         "example": value["example"].strip("\n") if isinstance(value.get("example"), str) and value["example"].strip() else None,
         "glosses": [
