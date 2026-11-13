@@ -14,7 +14,7 @@ from typing import Protocol
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 
-VERSION = os.environ.get("PICOPG_DEBRIEF_PROMPT", "debrief-v3")
+VERSION = os.environ.get("PICOPG_DEBRIEF_PROMPT", "debrief-v4")
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 TEXTS = ("idea", "right", "cleaner", "cleaner_why", "math", "better", "complexity", "edges")
 
@@ -78,7 +78,7 @@ def _debrief(content: str) -> tuple[dict[str, object], list[str]]:
         return {}, ["输出不是一个 JSON 对象"]
     if not isinstance(value, dict):
         return {}, ["输出不是一个 JSON 对象"]
-    problems = [f"缺少 {key}" for key in TEXTS if not isinstance(value.get(key), str) or not value[key].strip()]
+    problems = [f"缺少 {key}" for key in TEXTS if not isinstance(value.get(key), str) or (key != "edges" and not value[key].strip())]
     better = value.get("better_code")
     if better is not None and not isinstance(better, str):
         problems.append("better_code 要么是代码，要么是 null")

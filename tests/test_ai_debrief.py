@@ -31,6 +31,12 @@ class RecordingModel:
 
 
 class CourseDebriefServiceTest(unittest.TestCase):
+    def test_edges_may_be_left_empty(self) -> None:
+        model = RecordingModel([json.dumps({**REVIEW, "edges": ""}, ensure_ascii=False)])
+        debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
+        self.assertEqual(debrief["edges"], "")
+        self.assertEqual(len(model.calls), 1)
+
     def test_code_comes_back_without_fences(self) -> None:
         model = RecordingModel([json.dumps(REVIEW, ensure_ascii=False)])
         debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
