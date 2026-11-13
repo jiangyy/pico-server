@@ -78,12 +78,12 @@ class CourseHintServiceTest(unittest.TestCase):
 
     def test_know_how_fixes_come_back_with_every_edit_and_malformed_ones_are_dropped(self) -> None:
         fixes = [
-            {"why": "list 没有 .sum() 方法，求和用 sum(列表)", "edits": [{"line": 16, "old": "su=copyh.sum()", "new": "su=sum(copyh)"}, {"line": "x", "old": "a", "new": "b"}]},
+            {"why": "列表求和用 sum(copyh)", "review": "列表常用操作：len、sum、min、max、append", "edits": [{"line": 16, "old": "su=copyh.sum()", "new": "su=sum(copyh)"}, {"line": "x", "old": "a", "new": "b"}]},
             {"why": 3, "edits": []},
         ]
         model = RecordingModel([json.dumps({**GOOD, "fixes": fixes}, ensure_ascii=False)])
         hint = CourseHintService(model, self.skills).hint("hanoi", "v1", EVIDENCE, "hanoi")
-        self.assertEqual(hint["fixes"], [{"why": fixes[0]["why"], "edits": [fixes[0]["edits"][0]]}])
+        self.assertEqual(hint["fixes"], [{"why": fixes[0]["why"], "review": fixes[0]["review"], "edits": [fixes[0]["edits"][0]]}])
         self.assertIn("fixes", model.calls[0][0]["content"])
         self.assertEqual(CourseHintService(RecordingModel([json.dumps(GOOD, ensure_ascii=False)]), self.skills).hint("hanoi", "v1", EVIDENCE, "hanoi")["fixes"], [])
 
