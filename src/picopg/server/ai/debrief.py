@@ -90,7 +90,7 @@ def _debrief(content: str) -> tuple[dict[str, object], list[str]]:
 
 
 def _lectures(value: object) -> tuple[list[dict[str, object]], list[str]]:
-    """每份 { title, steps: [{ title, beats: [{ say, write? }] }] }，最后一句要写出完整解法。"""
+    """每份 { title, steps: [{ title, beats: [{ say, write? }] }] }，要写出代码；最后写出的那版是完整解法。"""
     if not isinstance(value, list) or not 1 <= len(value) <= 2:
         return [], ["lectures 要有 1–2 份讲解"]
     lectures: list[dict[str, object]] = []
@@ -111,8 +111,10 @@ def _lectures(value: object) -> tuple[list[dict[str, object]], list[str]]:
                 "beats": [{"say": beat["say"], **({"write": _code(beat["write"])} if isinstance(beat.get("write"), str) and beat["write"].strip() else {})} for beat in beats],
             })
         else:
-            if "write" not in shaped[-1]["beats"][-1]:
-                problems.append(f"第 {number} 份讲解的最后一句要写出完整解法（write）")
+            # 最后写出的代码要是完整解法；模型常在写完代码后再补一句解释（提示词也让它讲为什么），
+            # 那句不改代码，所以这里只查整份讲解写没写过代码，解法对不对由客户端跑用例来验。
+            if not any("write" in beat for step in shaped for beat in step["beats"]):
+                problems.append(f"第 {number} 份讲解要写出代码（write）")
             lectures.append({"title": lecture["title"], "steps": shaped})
     return lectures, problems
 

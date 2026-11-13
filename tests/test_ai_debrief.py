@@ -52,10 +52,19 @@ class CourseDebriefServiceTest(unittest.TestCase):
         debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
         self.assertEqual(debrief["lectures"][0]["steps"][1]["beats"][1]["write"], "def max_area(height):\n    return 0\n")
         self.assertNotIn("write", debrief["lectures"][0]["steps"][0]["beats"][0])
+        # 写完代码再补一句解释：代码没变，照样算数（完整解法由客户端跑用例验）。
+        trailing = {**REVIEW, "lectures": [{"title": "t", "steps": [{"title": "s", "beats": [
+            {"say": "先排序。", "write": "```python\ndef max_area(height):\n    return 0\n```"},
+            {"say": "这样就完成了。"},
+        ]}]}]}
+        model = RecordingModel([json.dumps(trailing, ensure_ascii=False)])
+        debrief = CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
+        self.assertEqual(len(model.calls), 1, "写完代码后的解释不该被退回")
+        self.assertEqual(debrief["lectures"][0]["steps"][0]["beats"][0]["write"], "def max_area(height):\n    return 0\n")
         unfinished = {**REVIEW, "lectures": [{"title": "t", "steps": [{"title": "s", "beats": [{"say": "只讲不写。"}]}]}]}
         model = RecordingModel([json.dumps(unfinished, ensure_ascii=False), json.dumps(REVIEW, ensure_ascii=False)])
         CourseDebriefService(model, OneSkill(SKILL)).debrief("water-container", "v1", REQUEST)
-        self.assertIn("最后一句要写出完整解法", model.calls[1][-1]["content"])
+        self.assertIn("要写出代码（write）", model.calls[1][-1]["content"])
 
     def test_a_lecture_that_writes_too_much_at_once_is_sent_back_once(self) -> None:
         long = "def max_area(height):\n" + "".join(f"    x{k} = {k}\n" for k in range(7)) + "    return 0\n"
