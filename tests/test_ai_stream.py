@@ -25,9 +25,12 @@ class Upstream(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        for chunk in CHUNKS:
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
+        try:
+            for chunk in CHUNKS:
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+        except BrokenPipeError:
+            pass
 
     def log_message(self, *args: object) -> None:
         pass
