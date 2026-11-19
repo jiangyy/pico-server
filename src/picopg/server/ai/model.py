@@ -5,7 +5,16 @@ import json
 from collections.abc import Callable
 from typing import Protocol
 from urllib.request import Request, urlopen
+
 from picopg.server.common.validation import is_int
+
+
+class Meter(Protocol):
+    """模型的每一次调用都经过它：调用前放行（不放行就抛错），调用后记下用了多少 token。"""
+
+    def charge(self) -> None: ...
+
+    def spend(self, tokens: int) -> None: ...
 
 
 class CourseAiError(Exception):
@@ -39,8 +48,8 @@ class OpenAiCompatibleChatModel:
         self.model = model
         self.api_key = api_key
         self.effort = effort
-        # 每次补全用掉的 token 数，交给费用上限记账。
-        self.on_usage: Callable[[int], None] | None = None
+        # 预算：每一次真正发出的请求都先过它、再记账；没接时（离线评测）不限。
+        self.meter: Meter | None = None
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         content = self._message({
@@ -77,18 +86,37 @@ class OpenAiCompatibleChatModel:
         body = json.dumps({"model": self.model, **request}, ensure_ascii=False).encode("utf-8")
         return Request(self.url, body, headers, method="POST")
 
-    def _spent(self, usage: object) -> None:
-        if self.on_usage is not None and isinstance(usage, dict) and is_int(usage.get("total_tokens")):
-            self.on_usage(usage["total_tokens"])
+    def _charge(self) -> None:
+        if self.meter is not None:
+            self.meter.charge()
+
+    def _spent(self, usage: object, request: dict[str, object], answer: str) -> None:
+        """有 usage 按它记；provider 不报用量时按字符估（约 3 个字符一个 token），不能因此不计费。"""
+        if self.meter is None:
+            return
+        if isinstance(usage, dict) and is_int(usage.get("total_tokens")):
+            self.meter.spend(usage["total_tokens"])
+        else:
+            self.meter.spend((len(json.dumps(request, ensure_ascii=False)) + len(answer)) // 3)
 
     def _message(self, request: dict[str, object], *, timeout: float) -> dict[str, object]:
+        self._charge()
         try:
             with urlopen(self._request(request), timeout=timeout) as response:
-                reply = json.loads(response.read().decode("utf-8"))
+                raw = response.read().decode("utf-8")
+        except Exception as error:
+            raise CourseAiError("model request failed") from error
+        # 先记账再解析：答得不合格的回复也已经花了钱。
+        try:
+            reply = json.loads(raw)
+        except ValueError as error:
+            self._spent(None, request, raw)
+            raise CourseAiError("model returned invalid JSON") from error
+        self._spent(reply.get("usage") if isinstance(reply, dict) else None, request, raw)
+        try:
             message = reply["choices"][0]["message"]
         except Exception as error:
             raise CourseAiError("model request failed") from error
-        self._spent(reply.get("usage"))
         if not isinstance(message, dict):
             raise CourseAiError("model returned no message")
         if isinstance(reply.get("usage"), dict):
@@ -100,6 +128,7 @@ class OpenAiCompatibleChatModel:
         reasoning: list[str] = []
         calls: dict[int, dict[str, object]] = {}
         usage: dict[str, object] | None = None
+        self._charge()
         try:
             with urlopen(self._request({**request, "stream": True, "stream_options": {"include_usage": True}}), timeout=timeout) as response:
                 for raw in response:
@@ -109,10 +138,12 @@ class OpenAiCompatibleChatModel:
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
+                    # 有的 provider 用空的 data 行保活：跳过，不当作坏数据。
+                    if not data:
+                        continue
                     chunk = json.loads(data)
                     if isinstance(chunk.get("usage"), dict):
                         usage = chunk["usage"]
-                    self._spent(chunk.get("usage"))
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
                         text = delta.get("content")
@@ -128,9 +159,12 @@ class OpenAiCompatibleChatModel:
                         for call in delta.get("tool_calls") or []:
                             _merge_call(calls, call)
         except _Interrupted:
+            self._spent(usage, request, "".join(content))
             raise
         except Exception as error:
+            self._spent(usage, request, "".join(content))
             raise CourseAiError("model request failed") from error
+        self._spent(usage, request, "".join(content))
         message: dict[str, object] = {"role": "assistant", "content": "".join(content)}
         if calls:
             message["tool_calls"] = [calls[index] for index in sorted(calls)]

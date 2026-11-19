@@ -11,6 +11,7 @@ from picopg.server.ai.diagnose import diagnose_request
 from picopg.server.ai.follow import follow_request
 from picopg.server.ai.hint import hint_request
 from picopg.server.ai.debrief import debrief_request
+from picopg.server.ai.budget import AiLimited, current_principal
 from picopg.server.ai.model import CourseAiError
 from picopg.server.learner import due, for_course
 from picopg.server.replication import ResponseSent, logger
@@ -57,6 +58,8 @@ def _guarded(handler: PicoRequestHandler, label: str, body: Callable[[], None]) 
         handler.error(400, "ai.request.invalid", str(error))
     except CourseAiError as error:
         handler.error(502, "ai.reply.invalid", str(error))
+    except AiLimited as error:
+        handler.error(429, "ai.limited", str(error))
     except ResponseSent:
         pass
     except Exception:
@@ -108,6 +111,9 @@ def _stream(handler: PicoRequestHandler, run: Callable[[Callable[[str], None] | 
     except CourseAiError as error:
         line({"error": {"code": "ai.reply.invalid", "message": str(error)}})
         raise ResponseSent() from None
+    except AiLimited as error:
+        line({"error": {"code": "ai.limited", "message": str(error)}})
+        raise ResponseSent() from None
     except Exception:
         logger.exception("course agent stream failed")
         line({"error": {"code": "server.failure", "message": "server failure"}})
@@ -125,9 +131,8 @@ def _permitted(handler: PicoRequestHandler) -> str | None:
     if not handler.server.ai_access.allows(replica.principal_id):
         handler.error(403, "ai.not_permitted", "AI is not enabled for this principal")
         return None
-    if not handler.server.ai_budget.admit(replica.principal_id):
-        handler.error(429, "ai.limited", "AI request limit reached; try again later")
-        return None
+    # 放行与记账在每一次模型调用时做（一次请求可能调用几次模型）：这里只记下是谁在用。
+    current_principal.set(replica.principal_id)
     return replica.principal_id
 
 

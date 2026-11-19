@@ -147,6 +147,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.course_debrief = course_debrief
         # 学生代码会发给模型：默认谁都不发，由运营者按账号打开。
         self.ai_access = ai_access or AiAccess()
+        # 预算挂在每个模型上（config 装配时），这里留着给运维查看用量。
         self.ai_budget = ai_budget or AiBudget()
         self.client_log_limiter = ClientLogLimiter()
         self.login_limiter = LoginLimiter()

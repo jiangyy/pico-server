@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
+from picopg.server.ai.budget import AiLimited, current_principal
 from picopg.server.ai.model import CourseAiError
 from picopg.server.classroom.roster import ClassRosterError
 from picopg.server.learner import for_course
@@ -66,9 +67,7 @@ def dispatch_teacher(handler: PicoRequestHandler, path: str) -> bool:
             if handler.server.course_agent is None or not handler.server.ai_access.allows(identity.principal_id):
                 handler.error(403, "ai.not_permitted", "AI is not enabled for this teacher")
                 return True
-            if not handler.server.ai_budget.admit(identity.principal_id):
-                handler.error(429, "ai.limited", "AI request limit reached; try again later")
-                return True
+            current_principal.set(identity.principal_id)
             source = detail_value(handler.server.store, handler.server.comments, submission)["source"]
             release = next((item for item in handler.server.playgrounds.catalog() if item.playground_id == submission.playground_id), None)
             learner = for_course(
@@ -101,6 +100,8 @@ def dispatch_teacher(handler: PicoRequestHandler, path: str) -> bool:
         handler.error(404, "submission.not_found", str(error))
     except CourseAiError as error:
         handler.error(502, "ai.reply.invalid", str(error))
+    except AiLimited as error:
+        handler.error(429, "ai.limited", str(error))
     except (ClassRosterError, CommentError, SubmissionError, InvalidReplicaData) as error:
         handler.error(400, "submission.invalid", str(error))
     except ResponseSent:

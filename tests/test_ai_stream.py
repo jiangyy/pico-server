@@ -47,7 +47,8 @@ class StreamingModelTest(unittest.TestCase):
 
     def test_text_arrives_in_pieces_and_tool_calls_are_assembled(self) -> None:
         pieces, spent = [], []
-        self.model.on_usage = spent.append
+        charged = []
+        self.model.meter = type("Meter", (), {"charge": lambda _self: charged.append(1), "spend": lambda _self, tokens: spent.append(tokens)})()
         message = self.model.step([{"role": "user", "content": "hi"}], [], pieces.append)
         assert Upstream.bodies[-1]["stream"] is True
         assert pieces == ["先看", "**第 2 行**"]
@@ -56,7 +57,7 @@ class StreamingModelTest(unittest.TestCase):
             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "act", "arguments": "{\"action\":\"code.run\"}"}}],
             "usage": {"total_tokens": 42},
         }
-        assert spent == [42]
+        assert spent == [42] and charged == [1], "one call is admitted once and charged what the provider reported"
 
     def test_a_client_that_goes_away_is_not_a_model_failure(self) -> None:
         def gone(_: str) -> None:

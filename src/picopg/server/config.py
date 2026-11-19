@@ -222,9 +222,8 @@ def _service(models: list[OpenAiCompatibleChatModel] | None, budget: AiBudget | 
     """一组 provider 包成一项课程服务：用量记进预算，按顺序回退，带上课程的规则。没配置模型时为 None。"""
     if models is None:
         return None
-    if budget is not None:
-        for model in models:
-            model.on_usage = budget.spend
+    for model in models:
+        model.meter = budget
     return service(_fallback(models), _course_skills(package_root))
 
 
