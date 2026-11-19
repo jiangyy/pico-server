@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.prompts_loader import load_prompt
 from picopg.server.ai.model import CourseAiError, ToolModel
 
 VERSION = os.environ.get("PICOPG_DEBRIEF_PROMPT", "debrief-v4")
-PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 TEXTS = ("idea", "right", "cleaner", "cleaner_why", "math", "better", "complexity", "edges")
 
 
@@ -25,6 +25,7 @@ class CourseDebrief(Protocol):
 
 class CourseDebriefService:
     def __init__(self, model: ToolModel, skills: CourseSkillRepository | OneSkill) -> None:
+        self.prompt = load_prompt(VERSION, "PICOPG_DEBRIEF_PROMPT")
         self.model = model
         self.skills = skills
 
@@ -38,7 +39,7 @@ class CourseDebriefService:
             f"## 课程的参考解\n```python\n{request['reference']}\n```" if isinstance(request.get("reference"), str) else None,
         ]
         chat: list[dict[str, object]] = [
-            {"role": "system", "content": PROMPT},
+            {"role": "system", "content": self.prompt},
             {"role": "user", "content": "\n\n".join(part for part in parts if part)},
         ]
         rejected = request.get("rejected")

@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.prompts_loader import load_prompt
 from picopg.server.ai.model import CourseAiError, ToolModel
 from picopg.server.common.validation import is_int
 
 VERSION = "diagnose-v2"
-PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 
 
 class CourseDiagnose(Protocol):
@@ -26,6 +26,7 @@ class CourseDiagnose(Protocol):
 
 class CourseDiagnoseService:
     def __init__(self, model: ToolModel, skills: CourseSkillRepository) -> None:
+        self.prompt = load_prompt(VERSION, "diagnose prompt")
         self.model = model
         self.skills = skills
 
@@ -33,7 +34,7 @@ class CourseDiagnoseService:
         skill = self._skill(playground_id, version_id)
         concepts = [item for item in skill.get("concepts", []) if isinstance(item, str)] if isinstance(skill.get("concepts"), list) else []
         chat: list[dict[str, object]] = [
-            {"role": "system", "content": "\n\n".join(part for part in (PROMPT, _course(skill, concepts, request.get("reference"))) if part)},
+            {"role": "system", "content": "\n\n".join(part for part in (self.prompt, _course(skill, concepts, request.get("reference"))) if part)},
             {"role": "user", "content": _student(request)},
         ]
         problems: list[str] = []

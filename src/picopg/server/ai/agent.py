@@ -53,11 +53,23 @@ class TeachingSkill:
 
 
 def load_teaching(root: Path = TEACHING) -> list[TeachingSkill]:
-    """按文件名的序号排列：不随本轮变化的在前；未匹配的 skill 不占 token。"""
+    """按文件名的序号排列：不随本轮变化的在前；未匹配的 skill 不占 token。启动时读一次，写坏的文件报出文件名与原因。"""
     skills = []
     for path in sorted(root.glob("*.md")):
-        head, body = path.read_text(encoding="utf-8").removeprefix("---\n").split("\n---\n", 1)
-        when = dict(line.split(": ", 1) for line in head.splitlines())["when"]
+        text = path.read_text(encoding="utf-8")
+        if not text.startswith("---\n") or "\n---\n" not in text:
+            raise ValueError(f"teaching/{path.name}: needs a --- header with a when: line")
+        head, body = text.removeprefix("---\n").split("\n---\n", 1)
+        fields = dict(line.split(": ", 1) for line in head.splitlines() if ": " in line)
+        when = fields.get("when", "")
+        kind, _, value = when.partition(" ")
+        if kind not in ("always", "tool", "ask") or (kind != "always" and not value):
+            raise ValueError(f"teaching/{path.name}: when must be 'always', 'tool <name>' or 'ask <pattern>', got {when!r}")
+        if kind == "ask":
+            try:
+                re.compile(value)
+            except re.error as error:
+                raise ValueError(f"teaching/{path.name}: ask pattern is invalid: {error}") from None
         skills.append(TeachingSkill(path.stem.split("-", 1)[-1], when, body.strip()))
     return skills
 
@@ -90,7 +102,6 @@ class CourseAgentService:
     def __init__(self, model: ToolModel, skills: CourseSkillRepository, teaching: list[TeachingSkill] | None = None) -> None:
         self.model = model
         self.skills = skills
-        self._teaching = teaching
         self.teaching = load_teaching() if teaching is None else teaching
 
     def step(
@@ -110,8 +121,7 @@ class CourseAgentService:
         """稳定的部分在前（core、本课要点），随本轮变化的 skill 在后，模型服务的前缀缓存才命中。"""
         names = {str(tool["name"]) for tool in tools}
         said = _said(messages)
-        teaching = load_teaching() if self._teaching is None else self.teaching
-        matched = [skill for skill in teaching if skill.applies(names, said)]
+        matched = [skill for skill in self.teaching if skill.applies(names, said)]
         parts = [skill.body for skill in matched if skill.when == "always"]
         course = self._skill(playground_id, version_id)
         if course is not None:

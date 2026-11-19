@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.prompts_loader import load_prompt
 from picopg.server.ai.model import CourseAiError, ToolModel
 from picopg.server.common.validation import is_int
 
 VERSION = os.environ.get("PICOPG_FOLLOW_PROMPT", "follow-v5")
-PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
 GAPS = ("plan", "expression", "execution")
 ACTIONS = ("edit", "run", "debug", "stop")
 
@@ -29,13 +29,14 @@ class CourseFollow(Protocol):
 
 class CourseFollowService:
     def __init__(self, model: ToolModel, skills: CourseSkillRepository | OneSkill) -> None:
+        self.prompt = load_prompt(VERSION, "PICOPG_FOLLOW_PROMPT")
         self.model = model
         self.skills = skills
 
     def follow(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]:
         skill = self._skill(playground_id, version_id)
         chat: list[dict[str, object]] = [
-            {"role": "system", "content": "\n\n".join(part for part in (PROMPT, _course(skill, request.get("reference"))) if part)},
+            {"role": "system", "content": "\n\n".join(part for part in (self.prompt, _course(skill, request.get("reference"))) if part)},
             *({"role": turn["role"], "content": turn["content"]} for turn in request["thread"]),  # type: ignore[union-attr, index]
         ]
         problems: list[str] = []

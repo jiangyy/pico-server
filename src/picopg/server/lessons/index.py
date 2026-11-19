@@ -71,12 +71,21 @@ class LessonIndex:
                 return self.outlines[key]
         try:
             _, payload = self.playgrounds.package(release.playground_id, release.version_id)
+        except (PackageNotFound, PackageError, OSError, RuntimeError):
+            # 读包失败是暂时的：不缓存，下次再试，不让一次失败让整门课在进程里消失。
+            return None
+        try:
             with zipfile.ZipFile(BytesIO(payload)) as archive:
                 value = json.loads(archive.read(f"course/{release.playground_id}.outline.json").decode("utf-8"))
             outline = value if isinstance(value, dict) and value.get("version") == 1 else None
-        except (KeyError, PackageNotFound, PackageError, OSError, RuntimeError, zipfile.BadZipFile, ValueError):
+        except (KeyError, zipfile.BadZipFile, ValueError):
+            # 包本身没有（或带着坏的）大纲：版本不变，结论就不变，可以缓存。
             outline = None
         with self.lock:
+            current = {(item.playground_id, item.version_id) for item in self.playgrounds.catalog()}
+            # 只留目录里还在的版本：发过多少版，缓存都不跟着涨。
+            for stale in [cached for cached in self.outlines if cached not in current and cached != key]:
+                del self.outlines[stale]
             self.outlines[key] = outline
         return outline
 
