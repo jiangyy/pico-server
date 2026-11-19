@@ -20,3 +20,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "B"]
+
+[tool.pytest.ini_options]
+# 只收集本仓库的测试：upstream-repos/ 是参考用的第三方仓库，不是这里的测试。
+testpaths = ["tests"]
+pythonpath = ["src", "."]

@@ -40,5 +40,22 @@ class BackupTest(unittest.TestCase):
                 raise AssertionError("unsafe archive was restored")
 
 
+class UnrestorableBackupTest(unittest.TestCase):
+    def test_a_link_in_the_data_directory_fails_the_backup_instead_of_the_restore(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+        from deploy.backup import create
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            data.mkdir()
+            (data / "file.txt").write_text("x", encoding="utf-8")
+            os.symlink(data / "file.txt", data / "link")
+            with self.assertRaisesRegex(ValueError, "link"):
+                create(data, root / "backup.tar.gz")
+            assert not (root / "backup.tar.gz").exists()
+
+
 if __name__ == "__main__":
     unittest.main()

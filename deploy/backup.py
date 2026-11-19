@@ -24,7 +24,7 @@ def create(data: Path, output: Path) -> None:
     temporary = Path(temporary_name)
     try:
         with tarfile.open(temporary, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            archive.add(data, arcname="data", recursive=True)
+            archive.add(data, arcname="data", recursive=True, filter=_restorable)
         with temporary.open("rb") as source:
             os.fsync(source.fileno())
         os.replace(temporary, output)
@@ -35,6 +35,13 @@ def create(data: Path, output: Path) -> None:
             os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _restorable(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    """备份时就拒绝还原时会拒绝的东西（链接、管道、设备）：能备份就一定能还原，不在出事那天才发现。"""
+    if not (member.isfile() or member.isdir()):
+        raise ValueError(f"cannot back up {member.name}: only regular files and directories can be restored")
+    return member
 
 
 def restore(archive_path: Path, target: Path) -> None:
@@ -56,14 +63,12 @@ def restore(archive_path: Path, target: Path) -> None:
                     or path.parts[0] != "data"
                     or path.is_absolute()
                     or ".." in path.parts
-                    or member.issym()
-                    or member.islnk()
-                    or member.isdev()
+                    or not (member.isfile() or member.isdir())
                 ):
                     raise ValueError(f"unsafe backup member: {member.name}")
-            # Members were validated above; omit Python 3.12's filter= argument so
-            # the deployment helper also runs on Ubuntu's older system Python.
-            archive.extractall(staging, members=members)
+            # 上面已逐条校验；有 data 过滤器的 Python（3.12，及打过补丁的旧版本）再让 tarfile 自己把关一遍。
+            safe = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            archive.extractall(staging, members=members, **safe)
         restored = staging / "data"
         if not restored.is_dir():
             raise ValueError("backup does not contain a data directory")
