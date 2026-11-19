@@ -53,13 +53,13 @@ def measure(count: int, payload_bytes: int, samples: int) -> tuple[int, float, f
             durations.append((perf_counter() - started) * 1_000)
             parent = item.position
 
-        path = root / "replica-log.json"
+        path = root / "logs"
         started = perf_counter()
         reopened = FileReplicaLogStore(root)
         load_ms = (perf_counter() - started) * 1_000
         assert reopened.head(log_id) == parent
         return (
-            path.stat().st_size,
+            sum(item.stat().st_size for item in path.glob("*.jsonl")),
             percentile(durations, 0.50),
             percentile(durations, 0.95),
             load_ms,

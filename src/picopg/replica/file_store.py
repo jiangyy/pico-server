@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
@@ -23,8 +25,21 @@ class ReplicaLogFileError(Exception):
     pass
 
 
+LEGACY_DOCUMENT = "replica-log.json"
+LOG_DIRECTORY = "logs"
+
+
 class FileReplicaLogStore(ReplicaLogStore):
-    """One-process durable Log store.
+    """One-process durable Log store: one append-only JSON Lines file per Log.
+
+    Each file starts with a header line naming its Log, then one Record per line. An append
+    writes and fsyncs only that Log's new lines, so its cost does not grow with the store.
+    Records stay in memory with an index from Record ID to position; they are immutable, so
+    reads hand them out without copying.
+
+    A crash can leave an unterminated last line: that append was never acknowledged, so
+    opening the store cuts it off. A store written by the earlier single-document format is
+    migrated once on open and the old document is kept beside it.
 
     shortcut: one process owns the directory; add a file lock before allowing
     multiple server processes to open the same store.
@@ -32,9 +47,13 @@ class FileReplicaLogStore(ReplicaLogStore):
 
     def __init__(self, root: Path) -> None:
         self._root = root
-        self._path = root / "replica-log.json"
+        self._directory = root / LOG_DIRECTORY
         self._lock = RLock()
-        self._logs = self._load()
+        # 只在锁里读写；记录不可变，读的时候切一段交出去。
+        self._logs: dict[str, list[ReplicatedRecord]] = {}
+        self._index: dict[str, dict[str, int]] = {}
+        self._migrate_legacy()
+        self._load()
 
     def log_ids(self) -> tuple[str, ...]:
         with self._lock:
@@ -43,16 +62,13 @@ class FileReplicaLogStore(ReplicaLogStore):
     def head(self, log_id: str) -> Position | None:
         _log_id(log_id)
         with self._lock:
-            return _head(log_id, self._logs.get(log_id, ()))
+            return _head(log_id, self._logs.get(log_id, []))
 
     def has(self, position: Position) -> bool:
         if not isinstance(position, Position):
             raise InvalidReplicaData("position must be a Position")
         with self._lock:
-            return any(
-                record.id == position.record_id
-                for record in self._logs.get(position.log_id, ())
-            )
+            return position.record_id in self._index.get(position.log_id, {})
 
     def read(
         self, log_id: str, after: Position | None, limit: int
@@ -65,23 +81,18 @@ class FileReplicaLogStore(ReplicaLogStore):
         ):
             raise InvalidReplicaData("after belongs to another Log")
         with self._lock:
-            records = self._logs.get(log_id, ())
+            records = self._logs.get(log_id, [])
             start = 0
             if after is not None:
-                for index, record in enumerate(records):
-                    if record.id == after.record_id:
-                        start = index + 1
-                        break
-                else:
+                index = self._index.get(log_id, {}).get(after.record_id)
+                if index is None:
                     raise UnknownPosition(
                         f"unknown cursor {log_id}:{after.record_id}"
                     )
-            page = records[start : start + limit]
+                start = index + 1
+            page = tuple(records[start : start + limit])
             return LogPage(
-                records=tuple(
-                    ReplicatedRecord.from_value(record.to_value())
-                    for record in page
-                ),
+                records=page,
                 head=_head(log_id, records),
                 has_more=start + len(page) < len(records),
             )
@@ -109,31 +120,32 @@ class FileReplicaLogStore(ReplicaLogStore):
         _validate_chain(log_id, expected_head, batch)
 
         with self._lock:
-            accepted = self._logs.get(log_id, ())
+            accepted = self._logs.get(log_id, [])
+            index = self._index.get(log_id, {})
             current = _head(log_id, accepted)
             self._validate_dependencies(batch)
             if current != expected_head:
                 replayed = bool(batch) and all(
-                    record in accepted for record in batch
+                    record.id in index and accepted[index[record.id]] == record
+                    for record in batch
                 )
                 return AppendResult(
                     "current" if replayed else "changed", current
                 )
             if not batch:
                 return AppendResult("current", current)
-
-            known = {record.id for record in accepted}
             for record in batch:
-                if record.id in known:
+                if record.id in index:
                     raise InvalidReplicaData(
                         f"record id reused: {record.id}"
                     )
-                known.add(record.id)
 
-            next_logs = dict(self._logs)
-            next_logs[log_id] = (*accepted, *batch)
-            self._write(next_logs)
-            self._logs = next_logs
+            self._write(log_id, batch, created=not accepted)
+            records = self._logs.setdefault(log_id, [])
+            positions = self._index.setdefault(log_id, {})
+            for record in batch:
+                positions[record.id] = len(records)
+                records.append(record)
             return AppendResult("accepted", batch[-1].position)
 
     def _validate_dependencies(
@@ -141,79 +153,124 @@ class FileReplicaLogStore(ReplicaLogStore):
     ) -> None:
         for record in records:
             for required in record.requires:
-                if not any(
-                    candidate.id == required.record_id
-                    for candidate in self._logs.get(required.log_id, ())
-                ):
+                if required.record_id not in self._index.get(required.log_id, {}):
                     raise MissingDependency(
                         f"missing dependency "
                         f"{required.log_id}:{required.record_id}"
                     )
 
-    def _load(self) -> dict[str, tuple[ReplicatedRecord, ...]]:
-        try:
-            value = strict_json_loads(self._path.read_text(encoding="utf-8"))
-            logs = _decode_document(value)
-        except FileNotFoundError:
-            return {}
-        except (OSError, ValueError, TypeError, InvalidReplicaData) as error:
-            raise ReplicaLogFileError(
-                f"cannot open {self._path}"
-            ) from error
-        _validate_document_dependencies(logs)
-        return logs
-
     def _write(
-        self, logs: dict[str, tuple[ReplicatedRecord, ...]]
+        self, log_id: str, batch: tuple[ReplicatedRecord, ...], *, created: bool
     ) -> None:
-        self._root.mkdir(parents=True, exist_ok=True)
-        temporary = self._root / f".replica-log-{uuid4().hex}.tmp"
-        document = {
-            "schema": 1,
-            "logs": [
-                {
-                    "logId": log_id,
-                    "records": [record.to_value() for record in records],
-                }
-                for log_id, records in logs.items()
-            ],
-        }
-        payload = (
-            json.dumps(
-                document,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            + b"\n"
-        )
+        path = self._directory / _file_name(log_id)
+        lines = [_line(record.to_value()) for record in batch]
+        if created:
+            lines.insert(0, _line({"logId": log_id}))
+        payload = b"".join(lines)
         try:
-            descriptor = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self._path)
+            self._directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
-                directory = os.open(self._root, os.O_RDONLY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-            except OSError:
-                pass
+                written = 0
+                while written < len(payload):
+                    written += os.write(descriptor, payload[written:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if created:
+                _fsync_directory(self._directory)
         except OSError as error:
+            raise ReplicaLogFileError(f"cannot persist {path}") from error
+
+    def _load(self) -> None:
+        if not self._directory.exists():
+            return
+        for path in sorted(self._directory.glob("*.jsonl")):
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise ReplicaLogFileError(
-                f"cannot persist {self._path}"
-            ) from error
+                log_id, records = _read_log(path)
+            except (OSError, ValueError, TypeError, InvalidReplicaData) as error:
+                raise ReplicaLogFileError(f"cannot open {path}") from error
+            if path.name != _file_name(log_id):
+                raise ReplicaLogFileError(f"{path} holds another Log ({log_id})")
+            self._logs[log_id] = list(records)
+            self._index[log_id] = {record.id: index for index, record in enumerate(records)}
+        _validate_document_dependencies(self._logs)
+
+    def _migrate_legacy(self) -> None:
+        """旧格式（整个库一份 JSON）只在第一次打开时搬成每个 Log 一个文件；旧文件改名留着，确认无误后再删。"""
+        legacy = self._root / LEGACY_DOCUMENT
+        if not legacy.exists() or self._directory.exists():
+            return
+        try:
+            logs = _decode_document(strict_json_loads(legacy.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError, InvalidReplicaData) as error:
+            raise ReplicaLogFileError(f"cannot open {legacy}") from error
+        _validate_document_dependencies(logs)
+        staging = self._root / f".{LOG_DIRECTORY}-{uuid4().hex}.tmp"
+        try:
+            staging.mkdir(parents=True)
+            for log_id, records in logs.items():
+                payload = b"".join([_line({"logId": log_id}), *(_line(record.to_value()) for record in records)])
+                descriptor = os.open(staging / _file_name(log_id), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    written = 0
+                    while written < len(payload):
+                        written += os.write(descriptor, payload[written:])
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            _fsync_directory(staging)
+            os.replace(staging, self._directory)
+            os.replace(legacy, self._root / f"{LEGACY_DOCUMENT}.migrated")
+            _fsync_directory(self._root)
+        except OSError as error:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise ReplicaLogFileError(f"cannot migrate {legacy}") from error
+
+
+def _file_name(log_id: str) -> str:
+    # Log ID 里有 `/` 和编码过的字符：文件名取它的摘要，Log ID 本身写在文件第一行。
+    return hashlib.sha256(log_id.encode("utf-8")).hexdigest() + ".jsonl"
+
+
+def _line(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _read_log(path: Path) -> tuple[str, tuple[ReplicatedRecord, ...]]:
+    data = path.read_bytes()
+    complete = data.rfind(b"\n") + 1
+    if complete < len(data):
+        # 崩溃时没写完的最后一行：那次追加没有被确认过，截掉。
+        with open(path, "r+b") as output:
+            output.truncate(complete)
+            output.flush()
+            os.fsync(output.fileno())
+        data = data[:complete]
+    lines = data.decode("utf-8").splitlines()
+    if not lines:
+        raise InvalidReplicaData("Log file has no header")
+    header = strict_json_loads(lines[0])
+    if not isinstance(header, dict) or set(header) != {"logId"}:
+        raise InvalidReplicaData("Log file header is invalid")
+    log_id = _log_id(header["logId"])
+    records = tuple(
+        ReplicatedRecord.from_value(strict_json_loads(line), log_id=log_id)
+        for line in lines[1:]
+    )
+    _validate_chain(log_id, None, records)
+    return log_id, records
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        pass
 
 
 def _log_id(value: object) -> str:
@@ -223,7 +280,7 @@ def _log_id(value: object) -> str:
 
 
 def _head(
-    log_id: str, records: tuple[ReplicatedRecord, ...]
+    log_id: str, records: "tuple[ReplicatedRecord, ...] | list[ReplicatedRecord]"
 ) -> Position | None:
     return None if not records else Position(log_id, records[-1].id)
 
@@ -277,7 +334,7 @@ def _decode_document(
 
 
 def _validate_document_dependencies(
-    logs: dict[str, tuple[ReplicatedRecord, ...]]
+    logs: "dict[str, tuple[ReplicatedRecord, ...]] | dict[str, list[ReplicatedRecord]]"
 ) -> None:
     positions = {
         record.position
