@@ -23,8 +23,8 @@ class ReplicaLogError(Exception):
     pass
 
 
-class InvalidReplicaData(ReplicaLogError):
-    pass
+class InvalidReplicaData(ReplicaLogError, ValueError):
+    """数据不合法：也是 ValueError，所以任何把 ValueError 当作坏输入的地方都按坏输入处理，而不是落进 500。"""
 
 
 class UnknownPosition(ReplicaLogError):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 import queue
@@ -10,6 +9,7 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from picopg.server.common.validation import same_secret
 from picopg.replica.strict_json import strict_json_loads
 from picopg.replica import (
     AppendResult,
@@ -156,6 +156,11 @@ class ReplicaHttpServer(ThreadingHTTPServer):
 class ReplicaRequestHandler(BaseHTTPRequestHandler):
     server: ReplicaHttpServer
 
+    def handle_one_request(self) -> None:
+        # 同一条连接上的下一个请求从头开始：没有写过响应。
+        self.responded = False
+        super().handle_one_request()
+
     def do_GET(self) -> None:
         self._dispatch()
 
@@ -167,6 +172,10 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         self._dispatch()
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self.responded = True
+        super().send_response(code, message)
 
     def _dispatch(self) -> None:
         try:
@@ -399,7 +408,7 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
     def operator_authorized(self) -> bool:
         expected = f"Bearer {self.server.replica_token}"
         actual = self.headers.get("Authorization", "")
-        if hmac.compare_digest(actual, expected):
+        if same_secret(actual, expected):
             return True
         token = self.cookie(OPERATOR_SESSION_COOKIE)
         return (
@@ -481,6 +490,11 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def error(self, status: int, code: str, message: str) -> None:
+        # 响应已经开始（流式接口发到一半）时不能再写第二个状态行：只关连接，客户端按断流处理。
+        if getattr(self, "responded", False):
+            logger.warning("%s after the response started; closing the connection", code)
+            self.close_connection = True
+            return
         self.send_json(
             status, {"error": {"code": code, "message": message}}
         )

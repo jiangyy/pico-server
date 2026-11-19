@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import hmac
 from typing import TYPE_CHECKING
 
+from picopg.server.common.validation import same_secret
 from picopg.server.auth.limiter import client_address
 from picopg.server.replication import ResponseSent, logger
 from picopg.replica import InvalidReplicaData
@@ -65,7 +65,7 @@ def _student_session(handler: PicoRequestHandler) -> None:
         account = next((
             candidate
             for candidate in handler.server.principal_accounts
-            if hmac.compare_digest(access_code, candidate.access_code)
+            if same_secret(access_code, candidate.access_code)
         ), None)
         if account is None:
             handler.server.login_limiter.failed(address)
@@ -143,7 +143,7 @@ def _operator_session(handler: PicoRequestHandler) -> None:
         if handler.server.login_limiter.blocked(address):
             handler.error(429, "auth.limited", "too many failed sign-ins; try again later")
             return
-        if not isinstance(token, str) or not hmac.compare_digest(token, handler.server.replica_token):
+        if not same_secret(token, handler.server.replica_token):
             handler.server.login_limiter.failed(address)
             handler.error(401, "auth.required", "valid operator token required")
             return

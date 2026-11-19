@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hmac
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
 from picopg.server.common.ids import encode_component
-from picopg.server.common.validation import require_text
+from picopg.server.common.validation import require_text, same_secret
 
 
 PRINCIPAL_CAPABILITIES = frozenset(("playgrounds", "drafts", "submissions", "analysis"))
@@ -118,7 +117,7 @@ class StaticAuthenticator:
     def authenticate(self, token: str) -> AuthenticatedReplica | None:
         matched = None
         for known, identity in self._entries:
-            if hmac.compare_digest(token, known):
+            if same_secret(token, known):
                 matched = identity
         return matched
 

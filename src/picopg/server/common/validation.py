@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
@@ -93,3 +95,8 @@ def optional_time(value: object, name: str, *, error_type: type[ValueError] = Va
 def utc_now() -> str:
     """写进事实的服务端时间：UTC、毫秒、以 Z 结尾，与客户端 toISOString() 同一格式。"""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def same_secret(given: object, expected: str) -> bool:
+    """常数时间比较密钥。按 UTF-8 字节比：hmac 对含非 ASCII 字符的 str 会抛 TypeError，而这些输入都来自客户端。"""
+    return isinstance(given, str) and hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
