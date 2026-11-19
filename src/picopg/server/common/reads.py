@@ -11,8 +11,14 @@ class PaginationStalled(ValueError):
 
 
 def read_all(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...]:
+    return read_after(store, log_id, None)
+
+
+def read_after(
+    store: ReplicaLogStore, log_id: str, after: Position | None
+) -> tuple[ReplicatedRecord, ...]:
+    """after 之后新追加的记录（after 为 None 时是整个日志）。"""
     records: list[ReplicatedRecord] = []
-    after: Position | None = None
     while True:
         page = store.read(log_id, after, _PAGE_SIZE)
         records.extend(page.records)
@@ -28,13 +34,4 @@ def read_all(store: ReplicaLogStore, log_id: str) -> tuple[ReplicatedRecord, ...
 def find_record(
     store: ReplicaLogStore, position: Position
 ) -> ReplicatedRecord | None:
-    if not store.has(position):
-        return None
-    return next(
-        (
-            record
-            for record in read_all(store, position.log_id)
-            if record.id == position.record_id
-        ),
-        None,
-    )
+    return store.record(position)

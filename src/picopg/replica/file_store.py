@@ -70,6 +70,13 @@ class FileReplicaLogStore(ReplicaLogStore):
         with self._lock:
             return position.record_id in self._index.get(position.log_id, {})
 
+    def record(self, position: Position) -> ReplicatedRecord | None:
+        if not isinstance(position, Position):
+            raise InvalidReplicaData("position must be a Position")
+        with self._lock:
+            index = self._index.get(position.log_id, {}).get(position.record_id)
+            return None if index is None else self._logs[position.log_id][index]
+
     def read(
         self, log_id: str, after: Position | None, limit: int
     ) -> LogPage:

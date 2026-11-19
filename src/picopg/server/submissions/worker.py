@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from threading import Lock
 from typing import Protocol
 
-from picopg.server.common.reads import read_all
+from picopg.server.common.reads import read_after, read_all
 from picopg.server.submissions.logs import is_request_log, result_log
 from picopg.server.submissions.protocol import decode_request, read_source
 from picopg.server.common.validation import require_non_blank_text
@@ -40,6 +40,9 @@ class SubmissionRequestConsumer:
         self._lock = Lock()
         self._tags = tags
         self._on_result = on_result or (lambda _log_id, _head: None)
+        # 每个请求日志：处理到哪一条请求、结果日志的头（只有这里写它）。第一次看到时从结果日志里重建。
+        self._cursors: dict[str, Position | None] = {}
+        self._heads: dict[str, Position | None] = {}
 
     def run_once(self) -> int:
         """一个学生的日志出错不挡住其他学生：都处理完再把第一个错误交给 worker 记录并稍后重试。"""
@@ -64,29 +67,38 @@ class SubmissionRequestConsumer:
 
     def _run_log(self, request_log: str) -> int:
         output_log = result_log(request_log)
-        results = read_all(self._store, output_log)
-        completed = {
-            (position.log_id, position.record_id)
-            for record in results
-            for position in record.requires[:1]
-            if position.log_id == request_log
-        }
-        head = None if not results else results[-1].position
+        if request_log not in self._cursors:
+            self._cursors[request_log], self._heads[request_log] = self._resume(request_log, output_log)
         handled = 0
-        for request in read_all(self._store, request_log):
-            if (request_log, request.id) in completed:
-                continue
+        for request in read_after(self._store, request_log, self._cursors[request_log]):
+            head = self._heads[request_log]
             data, requires = self._result(request)
             dependencies = _unique((request.position, *requires), output_log)
             record = _record(output_log, head, dependencies, data)
             appended = self._store.append(output_log, head, (record,))
             if appended.kind != "accepted":
                 raise RuntimeError(f"{output_log} lost its single writer")
-            head = record.position
-            self._on_result(output_log, head)
-            completed.add((request_log, request.id))
+            self._heads[request_log] = record.position
+            self._cursors[request_log] = request.position
+            self._on_result(output_log, record.position)
             handled += 1
         return handled
+
+    def _resume(self, request_log: str, output_log: str) -> tuple[Position | None, Position | None]:
+        """已经有结果的请求之后接着做：结果按请求的顺序写，所以最后一个结果对应的请求就是游标。"""
+        results = read_all(self._store, output_log)
+        completed = {
+            position
+            for record in results
+            for position in record.requires[:1]
+            if position.log_id == request_log
+        }
+        cursor = None
+        for request in read_all(self._store, request_log):
+            if request.position not in completed:
+                break
+            cursor = request.position
+        return cursor, None if not results else results[-1].position
 
     def _result(self, request: ReplicatedRecord) -> tuple[Mapping[str, object], tuple[Position, ...]]:
         try:

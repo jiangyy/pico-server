@@ -5,11 +5,13 @@ from threading import Lock
 
 from picopg.server.drafts.authority import DraftAuthority
 from picopg.server.drafts.protocol import DraftResult
-from picopg.server.common.reads import read_all
+from picopg.server.common.reads import read_after
 from picopg.replica import Position, ReplicaLogStore
 
 
 class DraftRequestConsumer:
+    """每个请求日志记着读到哪里，醒来只读新追加的请求；依赖还没到的请求留着，下次醒来再试。"""
+
     def __init__(
         self,
         store: ReplicaLogStore,
@@ -23,24 +25,30 @@ class DraftRequestConsumer:
         self._lock = Lock()
         self._authority = DraftAuthority(store)
         self._on_decision = on_decision or (lambda _log_id, _head: None)
-        self._processed: set[tuple[str, str]] = set()
+        self._cursors: dict[str, Position] = {}
+        self._waiting: dict[Position, None] = {}
 
     def run_once(self) -> tuple[tuple[Position, DraftResult], ...]:
         outcomes: list[tuple[Position, DraftResult]] = []
         with self._lock:
             request_logs = tuple(sorted(self._request_logs))
+        waiting = tuple(self._waiting)
+        self._waiting.clear()
+        for position in waiting:
+            outcomes.append(self._handle(position))
         for log_id in request_logs:
-            for record in read_all(self._store, log_id):
-                key = (log_id, record.id)
-                if key in self._processed:
-                    continue
-                result = self._authority.handle(record.position)
-                if result.kind != "missingDependency":
-                    self._processed.add(key)
-                outcomes.append((record.position, result))
-                if result.decision is not None:
-                    self._on_decision(result.decision.log_id, result.decision)
+            for record in read_after(self._store, log_id, self._cursors.get(log_id)):
+                outcomes.append(self._handle(record.position))
+                self._cursors[log_id] = record.position
         return tuple(outcomes)
+
+    def _handle(self, position: Position) -> tuple[Position, DraftResult]:
+        result = self._authority.handle(position)
+        if result.kind == "missingDependency":
+            self._waiting[position] = None
+        if result.decision is not None:
+            self._on_decision(result.decision.log_id, result.decision)
+        return position, result
 
     def add_request_log(self, log_id: str) -> None:
         if not is_draft_request_log(log_id):
