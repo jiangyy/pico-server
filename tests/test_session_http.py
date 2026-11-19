@@ -64,6 +64,25 @@ def _stop(server, thread: threading.Thread) -> None:
 
 
 class SessionHttpTest(unittest.TestCase):
+    def test_repeated_wrong_access_codes_are_slowed_down(self) -> None:
+        from picopg.server.auth.limiter import LoginLimiter
+        with tempfile.TemporaryDirectory() as temporary:
+            server, thread = _start(Path(temporary))
+            now = [0.0]
+            server.login_limiter = LoginLimiter(failures=3, window=60, clock=lambda: now[0])
+            try:
+                for _ in range(3):
+                    assert _request(server, "POST", "/api/v1/session", value={"accessCode": "guess"})[0] == 401
+                # 拦下之后连对的访问码也不收，否则猜的人一直猜到对为止。
+                assert _request(server, "POST", "/api/v1/session", value={"accessCode": "student-code"})[0] == 429
+                assert _request(server, "POST", "/api/v1/operator/session", value={"token": "guess"})[0] == 429
+                # 隔壁机器（nginx 转来的另一个地址）不受影响。
+                assert _request(server, "POST", "/api/v1/session", value={"accessCode": "student-code"}, headers={"X-Real-IP": "10.0.0.7"})[0] == 201
+                now[0] = 61
+                assert _request(server, "POST", "/api/v1/session", value={"accessCode": "student-code"})[0] == 201
+            finally:
+                _stop(server, thread)
+
     def test_session_http(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

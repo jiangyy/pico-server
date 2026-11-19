@@ -12,6 +12,7 @@ from picopg.server.ai.budget import AiBudget
 from picopg.server.ai.http import dispatch_ai
 from picopg.server.analysis import LearningAnalysisLogRule
 from picopg.server.auth.http import dispatch_session
+from picopg.server.auth.limiter import LoginLimiter
 from picopg.server.auth.model import (
     CompositeAuthenticator,
     CompositeReplicaDirectory,
@@ -146,6 +147,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.ai_access = ai_access or AiAccess()
         self.ai_budget = ai_budget or AiBudget()
         self.client_log_limiter = ClientLogLimiter()
+        self.login_limiter = LoginLimiter()
         self.playgrounds = PlaygroundPublisher(
             self, FilePackageStore(package_root), package_adapter
         )

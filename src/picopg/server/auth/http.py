@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 from typing import TYPE_CHECKING
 
+from picopg.server.auth.limiter import client_address
 from picopg.server.replication import ResponseSent, logger
 from picopg.replica import InvalidReplicaData
 
@@ -55,12 +56,17 @@ def _student_session(handler: PicoRequestHandler) -> None:
         if not isinstance(access_code, str) or not access_code:
             handler.error(400, "session.invalid", "accessCode must be non-empty")
             return
+        address = client_address(handler)
+        if handler.server.login_limiter.blocked(address):
+            handler.error(429, "auth.limited", "too many failed sign-ins; try again later")
+            return
         account = next((
             candidate
             for candidate in handler.server.principal_accounts
             if hmac.compare_digest(access_code, candidate.access_code)
         ), None)
         if account is None:
+            handler.server.login_limiter.failed(address)
             handler.error(401, "auth.required", "valid access code required")
             return
         device = body.get("deviceToken") if native else handler.cookie("picopg_device")
@@ -109,7 +115,12 @@ def _operator_session(handler: PicoRequestHandler) -> None:
             handler.error(400, "session.invalid", "body must contain token")
             return
         token = body["token"]
+        address = client_address(handler)
+        if handler.server.login_limiter.blocked(address):
+            handler.error(429, "auth.limited", "too many failed sign-ins; try again later")
+            return
         if not isinstance(token, str) or not hmac.compare_digest(token, handler.server.replica_token):
+            handler.server.login_limiter.failed(address)
             handler.error(401, "auth.required", "valid operator token required")
             return
         session = registry.create_operator()
