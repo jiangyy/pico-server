@@ -64,6 +64,28 @@ def _stop(server, thread: threading.Thread) -> None:
 
 
 class SessionHttpTest(unittest.TestCase):
+    def test_a_device_that_lost_its_storage_becomes_a_new_device(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            server, thread = _start(Path(temporary))
+            try:
+                status, headers, first = _request(server, "POST", "/api/v1/session", value={"accessCode": "student-code"})
+                assert status == 201
+                cookies = _cookies(headers)
+                cookie = "; ".join(f"{name}={value}" for name, value in cookies.items())
+                status, headers, renewed = _request(server, "POST", "/api/v1/session/device", headers={"Cookie": cookie})
+                assert status == 201
+                assert renewed["principalId"] == first["principalId"] and renewed["replicaId"] != first["replicaId"]
+                fresh = _cookies(headers)
+                assert fresh["picopg_device"] != cookies["picopg_device"]
+                # 旧会话作废，新会话认新设备。
+                assert _request(server, "GET", "/api/v1/session", headers={"Cookie": f"picopg_session={cookies['picopg_session']}"})[0] == 401
+                status, _, current = _request(server, "GET", "/api/v1/session", headers={"Cookie": f"picopg_session={fresh['picopg_session']}"})
+                assert (status, current["replicaId"]) == (200, renewed["replicaId"])
+                assert _request(server, "POST", "/api/v1/session/device")[0] == 401
+                assert _request(server, "GET", "/api/v1/session/device", headers={"Cookie": f"picopg_session={fresh['picopg_session']}"})[0] == 405
+            finally:
+                _stop(server, thread)
+
     def test_repeated_wrong_access_codes_are_slowed_down(self) -> None:
         from picopg.server.auth.limiter import LoginLimiter
         with tempfile.TemporaryDirectory() as temporary:

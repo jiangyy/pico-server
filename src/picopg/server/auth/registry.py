@@ -92,6 +92,15 @@ class FileSessionRegistry:
             self._write()
             return BrowserSession(identity, session_token, raw_device, expires_at)
 
+    def renew_device(self, session_token: str) -> BrowserSession | None:
+        """本机存储丢了的设备：同一个学生换一台新设备（新的设备凭据与 Replica），旧会话作废。会话无效时为 None。"""
+        with self._lock:
+            identity = self.authenticate(session_token)
+            if identity is None:
+                return None
+            self._sessions.pop(_digest(session_token), None)
+            return self.bootstrap(identity.principal_id, None)
+
     def create_operator(self) -> OperatorSession:
         with self._lock:
             self._prune()
