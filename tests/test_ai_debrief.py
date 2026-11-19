@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import http.client
 import json
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 
+from picopg.replica.file_store import FileReplicaLogStore
+from picopg.server.ai.access import AiAccess
+from picopg.server.app import PicoPGHttpServer
+from picopg.server.auth.model import PrincipalSession
 from picopg.server.ai.course import OneSkill
 from picopg.server.ai.model import CourseAiError
 from picopg.server.ai.debrief import VERSION, CourseDebriefService, debrief_request
@@ -98,6 +106,58 @@ class CourseDebriefServiceTest(unittest.TestCase):
             debrief_request({**body, "extra": 1})
         with self.assertRaises(ValueError):
             debrief_request({**body, "rejected": {"debrief": REVIEW}})
+
+
+class FakeDebrief:
+    def __init__(self) -> None:
+        self.fail = False
+
+    def debrief(self, playground_id, version_id, request):
+        if self.fail:
+            raise CourseAiError("the model wrote code that does not run")
+        return {"course": playground_id, "version": version_id, "source": request["source"]}
+
+
+class DebriefRouteTest(unittest.TestCase):
+    def test_debrief_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = FakeDebrief()
+            sessions = [
+                PrincipalSession.create("student", "device", "student-token", {}, ["playgrounds"]),
+                PrincipalSession.create("other", "device", "other-token", {}, ["playgrounds"]),
+            ]
+            server = PicoPGHttpServer(
+                ("127.0.0.1", 0), FileReplicaLogStore(root / "replica"), "operator-token", root / "packages",
+                principal_sessions=sessions, ai_access=AiAccess(["student"]), course_debrief=fake,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def call(token, value, method="POST"):
+                connection = http.client.HTTPConnection(*server.server_address)
+                try:
+                    connection.request(method, "/api/v1/ai/debrief", json.dumps(value).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            try:
+                body = {"playgroundId": "hanoi", "versionId": "v1", "source": "print(1)", "facts": "n=3"}
+                self.assertEqual(call("student-token", body), (200, {"course": "hanoi", "version": "v1", "source": "print(1)"}))
+                self.assertEqual(call("student-token", body, "GET")[0], 405)
+                self.assertEqual(call("wrong-token", body)[0], 401)
+                self.assertEqual(call("other-token", body)[0], 403)
+                self.assertEqual(call("student-token", {**body, "source": ""})[0], 400)
+                fake.fail = True
+                self.assertEqual(call("student-token", body)[1]["error"]["code"], "ai.reply.invalid")
+                server.course_debrief = None
+                self.assertEqual(call("student-token", body)[0], 503)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 if __name__ == "__main__":

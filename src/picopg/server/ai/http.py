@@ -21,65 +21,33 @@ if TYPE_CHECKING:
 
 def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
     if path in ("/api/v1/ai/agent", "/api/v1/ai/tutor"):
-        return _dispatch_agent(handler, path)
-    if path == "/api/v1/ai/hint":
-        return _dispatch_hint(handler)
-    if path == "/api/v1/ai/diagnose":
-        return _dispatch_diagnose(handler)
-    if path == "/api/v1/ai/follow":
-        return _dispatch_follow(handler)
-    if path == "/api/v1/ai/debrief":
-        return _dispatch_debrief(handler)
-    if path != "/api/v1/ai/course":
+        _guarded(handler, "course agent", lambda: _agent(handler, path))
+        return True
+    route = _ROUTES.get(path)
+    if route is None:
         return False
-    try:
-        if handler.command != "POST":
-            handler.error(405, "method.not_allowed", "method not allowed")
-            return True
+    label, attribute, parse, call = route
+
+    def answer() -> None:
         if _permitted(handler) is None:
-            return True
-        if handler.server.course_ai is None:
-            handler.error(503, "ai.unavailable", "course AI is not configured")
-            return True
-        playground_id, version_id, request = _request_value(handler.read_json())
-        reply = handler.server.course_ai.reply(playground_id, version_id, request)
-        handler.send_json(200, reply, (("Cache-Control", "no-store"),))
-    except ValueError as error:
-        handler.error(400, "ai.request.invalid", str(error))
-    except CourseAiError as error:
-        handler.error(502, "ai.reply.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("course AI request failed")
-        handler.error(500, "server.failure", "server failure")
+            return
+        service = getattr(handler.server, attribute)
+        if service is None:
+            handler.error(503, "ai.unavailable", f"{label} is not configured")
+            return
+        handler.send_json(200, call(service, parse(handler.read_json())), (("Cache-Control", "no-store"),))
+
+    _guarded(handler, label, answer)
     return True
 
 
-def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
+def _guarded(handler: PicoRequestHandler, label: str, body: Callable[[], None]) -> None:
+    """AI 接口共同的外壳：只收 POST；请求不对是 400，模型答得不合格是 502，其余意外是 500。"""
     try:
         if handler.command != "POST":
             handler.error(405, "method.not_allowed", "method not allowed")
-            return True
-        principal = _permitted(handler)
-        if principal is None:
-            return True
-        if handler.server.course_agent is None:
-            handler.error(503, "ai.unavailable", "course agent is not configured")
-            return True
-        agent = handler.server.course_agent
-        if path == "/api/v1/ai/tutor":
-            messages, tools = tutor_request(handler.read_json())
-            learner = _learner(handler, principal, None)
-            run = lambda on_text: agent.tutor(messages, tools, on_text, learner=learner)  # noqa: E731
-        else:
-            playground_id, version_id, messages, tools = agent_request(handler.read_json())
-            learner = _learner(handler, principal, playground_id)
-            run = lambda on_text: agent.step(playground_id, version_id, messages, tools, on_text, learner=learner)  # noqa: E731
-        if "application/x-ndjson" in (handler.headers.get("Accept") or ""):
-            _stream(handler, run)
-        else:
-            handler.send_json(200, run(None), (("Cache-Control", "no-store"),))
+            return
+        body()
     except ValueError as error:
         handler.error(400, "ai.request.invalid", str(error))
     except CourseAiError as error:
@@ -87,110 +55,30 @@ def _dispatch_agent(handler: PicoRequestHandler, path: str) -> bool:
     except ResponseSent:
         pass
     except Exception:
-        logger.exception("course agent request failed")
+        logger.exception("%s request failed", label)
         handler.error(500, "server.failure", "server failure")
-    return True
 
 
-def _dispatch_hint(handler: PicoRequestHandler) -> bool:
-    """助教在该开口的时刻请模型写提示：客户端给证据，这里补课程的规则与函数含义。"""
-    try:
-        if handler.command != "POST":
-            handler.error(405, "method.not_allowed", "method not allowed")
-            return True
-        if _permitted(handler) is None:
-            return True
-        if handler.server.course_hint is None:
-            handler.error(503, "ai.unavailable", "course hint is not configured")
-            return True
-        playground_id, version_id, evidence, focus = hint_request(handler.read_json())
-        hint = handler.server.course_hint.hint(playground_id, version_id, evidence, focus)
-        handler.send_json(200, hint, (("Cache-Control", "no-store"),))
-    except ValueError as error:
-        handler.error(400, "ai.request.invalid", str(error))
-    except CourseAiError as error:
-        handler.error(502, "ai.reply.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("course hint request failed")
-        handler.error(500, "server.failure", "server failure")
-    return True
-
-
-def _dispatch_diagnose(handler: PicoRequestHandler) -> bool:
-    """助教在后台诊断：客户端给证据、参考解和没验证过的几次补丁，这里补课程的规则与概念清单。"""
-    try:
-        if handler.command != "POST":
-            handler.error(405, "method.not_allowed", "method not allowed")
-            return True
-        if _permitted(handler) is None:
-            return True
-        if handler.server.course_diagnose is None:
-            handler.error(503, "ai.unavailable", "course diagnose is not configured")
-            return True
-        playground_id, version_id, request = diagnose_request(handler.read_json())
-        handler.send_json(200, handler.server.course_diagnose.diagnose(playground_id, version_id, request), (("Cache-Control", "no-store"),))
-    except ValueError as error:
-        handler.error(400, "ai.request.invalid", str(error))
-    except CourseAiError as error:
-        handler.error(502, "ai.reply.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("course diagnose request failed")
-        handler.error(500, "server.failure", "server failure")
-    return True
-
-
-def _dispatch_follow(handler: PicoRequestHandler) -> bool:
-    """助教的“跟”：客户端带上整条线程，这里补课程前缀，拿回下一份思路笔记。"""
-    try:
-        if handler.command != "POST":
-            handler.error(405, "method.not_allowed", "method not allowed")
-            return True
-        if _permitted(handler) is None:
-            return True
-        if handler.server.course_follow is None:
-            handler.error(503, "ai.unavailable", "course follow is not configured")
-            return True
-        playground_id, version_id, request = follow_request(handler.read_json())
-        handler.send_json(200, handler.server.course_follow.follow(playground_id, version_id, request), (("Cache-Control", "no-store"),))
-    except ValueError as error:
-        handler.error(400, "ai.request.invalid", str(error))
-    except CourseAiError as error:
-        handler.error(502, "ai.reply.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("course follow request failed")
-        handler.error(500, "server.failure", "server failure")
-    return True
-
-
-def _dispatch_debrief(handler: PicoRequestHandler) -> bool:
-    """做对之后的复盘：客户端发来做对的代码和代码跑出来的事实，拿回复盘与讲解；里面的代码由客户端运行验证。"""
-    try:
-        if handler.command != "POST":
-            handler.error(405, "method.not_allowed", "method not allowed")
-            return True
-        if _permitted(handler) is None:
-            return True
-        if handler.server.course_debrief is None:
-            handler.error(503, "ai.unavailable", "course debrief is not configured")
-            return True
-        playground_id, version_id, request = debrief_request(handler.read_json())
-        handler.send_json(200, handler.server.course_debrief.debrief(playground_id, version_id, request), (("Cache-Control", "no-store"),))
-    except ValueError as error:
-        handler.error(400, "ai.request.invalid", str(error))
-    except CourseAiError as error:
-        handler.error(502, "ai.reply.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("course debrief request failed")
-        handler.error(500, "server.failure", "server failure")
-    return True
+def _agent(handler: PicoRequestHandler, path: str) -> None:
+    principal = _permitted(handler)
+    if principal is None:
+        return
+    if handler.server.course_agent is None:
+        handler.error(503, "ai.unavailable", "course agent is not configured")
+        return
+    agent = handler.server.course_agent
+    if path == "/api/v1/ai/tutor":
+        messages, tools = tutor_request(handler.read_json())
+        learner = _learner(handler, principal, None)
+        run = lambda on_text: agent.tutor(messages, tools, on_text, learner=learner)  # noqa: E731
+    else:
+        playground_id, version_id, messages, tools = agent_request(handler.read_json())
+        learner = _learner(handler, principal, playground_id)
+        run = lambda on_text: agent.step(playground_id, version_id, messages, tools, on_text, learner=learner)  # noqa: E731
+    if "application/x-ndjson" in (handler.headers.get("Accept") or ""):
+        _stream(handler, run)
+    else:
+        handler.send_json(200, run(None), (("Cache-Control", "no-store"),))
 
 
 def _stream(handler: PicoRequestHandler, run: Callable[[Callable[[str], None] | None], dict[str, object]]) -> None:
@@ -312,3 +200,14 @@ def _moment(value: object) -> None:
         raise ValueError("request moment position is invalid")
     if not isinstance(value["frames"], list) or not isinstance(value["globals"], dict) or not isinstance(value["stdout"], str):
         raise ValueError("request moment state is invalid")
+
+
+#: 一问一答的几项服务：(名字, Server 上的属性, 请求校验, 调用)。
+#: 课程 AI 一问一答；提示写在该开口的时刻；诊断在后台找 bug；跟随写下一份思路笔记；复盘在做对之后。
+_ROUTES: dict[str, tuple[str, str, Callable[[object], tuple], Callable[[object, tuple], dict[str, object]]]] = {
+    "/api/v1/ai/course": ("course AI", "course_ai", _request_value, lambda service, args: service.reply(*args)),
+    "/api/v1/ai/hint": ("course hint", "course_hint", hint_request, lambda service, args: service.hint(*args)),
+    "/api/v1/ai/diagnose": ("course diagnose", "course_diagnose", diagnose_request, lambda service, args: service.diagnose(*args)),
+    "/api/v1/ai/follow": ("course follow", "course_follow", follow_request, lambda service, args: service.follow(*args)),
+    "/api/v1/ai/debrief": ("course debrief", "course_debrief", debrief_request, lambda service, args: service.debrief(*args)),
+}
