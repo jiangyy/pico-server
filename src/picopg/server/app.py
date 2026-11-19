@@ -40,6 +40,7 @@ from picopg.server.playgrounds.releases import (
     PlaygroundPublisher,
 )
 from picopg.server.replication import (
+    logger,
     LogBinding,
     ReplicaHttpServer,
     ReplicaRequestHandler,
@@ -211,6 +212,14 @@ class PicoRequestHandler(ReplicaRequestHandler):
     server: PicoPGHttpServer
 
     def _dispatch(self) -> None:
+        try:
+            self._dispatch_feature()
+        except Exception:
+            # 各功能自己处理预期的错误；漏出来的也要回一个 500，而不是一言不发地断开连接。
+            logger.exception("request failed")
+            self.error(500, "server.failure", "server failure")
+
+    def _dispatch_feature(self) -> None:
         path = urlsplit(self.path).path
         if dispatch_session(self, path):
             return
