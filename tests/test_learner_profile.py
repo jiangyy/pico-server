@@ -51,6 +51,34 @@ def rows(profile):
 
 
 class ProfileRulesTest(unittest.TestCase):
+    def test_times_from_devices_are_normalized_and_bad_ones_do_not_break_the_profile(self) -> None:
+        profile = profile_of([
+            graded("pass", ["for"], "2026-11-01T18:00:00+08:00"),
+            answer("pass", ["for"], "2026-11-01T11:00:00Z"),
+            graded("pass", ["break"], "not a time"),
+            graded("pass", ["break"], "2026-11-01T12:00:00"),
+        ], KNOWLEDGE)
+        found = rows(profile)
+        # +08:00 的 18 点是 UTC 10 点：排在 11 点那次之前，复习从 11 点那次算起。
+        self.assertEqual(found["for"]["reviewDue"], "2026-11-02T11:00:00.000Z")
+        self.assertEqual(profile["lastActive"], "2026-11-01T11:00:00.000Z")
+        self.assertNotIn("reviewDue", found["break"], "no usable time, no review date, and no crash")
+        self.assertEqual(due(profile, datetime(2026, 11, 3, tzinfo=timezone.utc)), ["for"])
+
+    def test_relearning_after_forgetting_starts_the_review_ladder_again(self) -> None:
+        history = [graded("pass", ["for"], f"2026-10-0{day}T10:00:00Z") for day in range(1, 6)]
+        history += [graded("fail", ["for"], "2026-10-06T10:00:00Z")]
+        history += [graded("pass", ["for"], "2026-10-07T10:00:00Z"), answer("pass", ["for"], "2026-10-08T10:00:00Z")]
+        found = rows(profile_of(history, KNOWLEDGE))
+        self.assertEqual(found["for"]["status"], "solid")
+        self.assertEqual(found["for"]["reviewDue"], "2026-10-09T10:00:00.000Z", "two passes in a row again: back to one day")
+
+    def test_a_course_sees_only_its_own_due_reviews(self) -> None:
+        profile = profile_of([graded("pass", ["recursion"], "2026-11-01T10:00:00Z"), answer("pass", ["recursion"], "2026-11-01T11:00:00Z")], KNOWLEDGE)
+        later = datetime(2026, 11, 5, tzinfo=timezone.utc)
+        self.assertEqual(for_course(profile, "hanoi", KNOWLEDGE, later)["due"], ["recursion"])
+        self.assertEqual(for_course(profile, "sudoku", KNOWLEDGE, later)["due"], [])
+
     def test_status_follows_the_strong_evidence(self) -> None:
         profile = profile_of([
             evidence({"kind": "script.step", "script": "x", "step": 0, "concepts": ["variable"]}),
@@ -64,7 +92,7 @@ class ProfileRulesTest(unittest.TestCase):
         self.assertEqual(found["for"]["status"], "solid", "the last two judgments both passed")
         self.assertEqual(found["break"]["status"], "shaky", "the latest judgment failed")
         self.assertEqual([row["concept"] for row in profile["concepts"]], ["break", "variable", "for"], "weakest first")
-        self.assertEqual(found["for"]["reviewDue"], "2026-11-02T11:00:00+00:00", "first review a day after the last pass")
+        self.assertEqual(found["for"]["reviewDue"], "2026-11-02T11:00:00.000Z", "first review a day after the last pass")
         self.assertEqual(due(profile, datetime(2026, 11, 3, tzinfo=timezone.utc)), ["for"])
         self.assertEqual(due(profile, datetime(2026, 11, 2, tzinfo=timezone.utc)), [])
 
@@ -85,7 +113,7 @@ class ProfileRulesTest(unittest.TestCase):
         ], KNOWLEDGE)
         self.assertEqual(rows(profile)["break"]["status"], "shaky", "passing again does not hide a misconception seen twice")
         self.assertEqual(profile["misconceptions"], [
-            {"id": "break-inner-only", "concepts": ["break"], "count": 2, "course": "sudoku", "last": "2026-11-01T12:00:00Z"},
+            {"id": "break-inner-only", "concepts": ["break"], "count": 2, "course": "sudoku", "last": "2026-11-01T12:00:00.000Z"},
         ])
 
     def test_old_concept_ids_migrate_and_unknown_ones_drop(self) -> None:

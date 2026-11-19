@@ -11,6 +11,7 @@ from collections import Counter, OrderedDict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from picopg.server.common.validation import client_instant, is_int
 
 # 掌握后的复习间隔（天）：每多通过一次，间隔拉长一档。
 REVIEW_DAYS = (1, 3, 7, 14, 30)
@@ -28,13 +29,15 @@ class Concepts:
     """知识地图里的概念：换算旧 id，按别名把学生原话对应到概念。没有地图时原样使用证据里的 id。"""
 
     def __init__(self, knowledge: Mapping[str, object] | None) -> None:
-        self.version = int(knowledge.get("version", 0)) if knowledge else 0
+        self.version = knowledge.get("version", 0) if knowledge and is_int(knowledge.get("version")) else 0
         items = [item for item in (knowledge or {}).get("concepts", []) if isinstance(item, Mapping)]
         self.labels = {str(item["id"]): str(item.get("label", item["id"])) for item in items}
         self.requires = {str(item["id"]): [str(other) for other in item.get("requires", [])] for item in items}
         self.courses = {str(key): [str(item) for item in value] for key, value in (knowledge or {}).get("courses", {}).items()}
+        # 课程包写的地图：只认按版本号编排的改名表，写坏的条目忽略，不让一门课拖垮所有学生的画像。
         migrations = (knowledge or {}).get("migrations", {})
-        self.renames = [migrations[key] for key in sorted(migrations, key=int)]
+        migrations = migrations if isinstance(migrations, Mapping) else {}
+        self.renames = [migrations[key] for key in sorted((key for key in migrations if str(key).isdigit()), key=int) if isinstance(migrations[key], Mapping)]
         # 一个字的别名（如 =、%）太容易误中，不用来匹配。
         self.words = [
             (word.lower(), str(item["id"]))
@@ -70,8 +73,6 @@ class _Concept:
     answers: Counter[str] = field(default_factory=Counter)
     predicted: int = 0
     predicted_right: int = 0
-    passes: int = 0
-    last_pass: str | None = None
     # 最近几次强证据，按时间排列：(时间, 结论, 是否来自练习或回答)。只留最近 OUTCOMES_KEPT 条。
     outcomes: list[tuple[str, str, bool]] = field(default_factory=list)
     misconceptions: Counter[str] = field(default_factory=Counter)
@@ -80,10 +81,6 @@ class _Concept:
         # 多台设备的证据到达顺序不定：按时间插入，同一时间的保持到达顺序。
         insort(self.outcomes, (at or "", verdict, judged), key=lambda item: item[0])
         del self.outcomes[:-OUTCOMES_KEPT]
-        if verdict == "pass":
-            self.passes += 1
-            if at is not None and (self.last_pass is None or at >= self.last_pass):
-                self.last_pass = at
 
 
 class Learner:
@@ -117,7 +114,8 @@ class Learner:
         data = payload.get("data")
         if not isinstance(data, Mapping):
             return
-        at = record.get("recordedAt") if isinstance(record.get("recordedAt"), str) else None
+        # 设备写的时间：规范成固定宽度的 UTC，之后的比较、排序与复习时间都按它；格式不对就当没有时间。
+        at = client_instant(record.get("recordedAt"))
         self.last_active = max(self.last_active or "", at or "") or None
         subject = record.get("subject") if isinstance(record.get("subject"), Mapping) else {}
         course = str(subject.get("playgroundId", ""))
@@ -155,9 +153,9 @@ class Learner:
             if data.get("verdict") == "pass":
                 self.open_practice.pop(str(data.get("task", "")), None)
                 self.counts["passedPractice"] += 1
-                if isinstance(data.get("attempt"), int):
+                if is_int(data.get("attempt")):
                     self.attempts = [self.attempts[0] + data["attempt"], self.attempts[1] + 1]
-            if isinstance(data.get("asked"), int):
+            if is_int(data.get("asked")):
                 self.asked = [self.asked[0] + data["asked"], self.asked[1] + 1]
         elif kind == "run.finished" and data.get("status") == "error":
             error = data.get("error")
@@ -251,9 +249,17 @@ def _row(concept: str, item: _Concept, concepts: Concepts) -> dict[str, object]:
     times = [at for at, _, _ in item.outcomes if at]
     if times:
         row["lastPracticed"] = times[-1]
-    if status == "solid" and item.last_pass is not None:
-        days = REVIEW_DAYS[min(item.passes - 2, len(REVIEW_DAYS) - 1)]
-        row["reviewDue"] = (_parse(item.last_pass) + timedelta(days=days)).isoformat()
+    if status == "solid":
+        # 复习间隔看最近连着通过了几次：忘了以后重新学会，从头一档开始。
+        streak = 0
+        for _, verdict, _ in reversed(item.outcomes):
+            if verdict != "pass":
+                break
+            streak += 1
+        passed_at = next((at for at, verdict, _ in reversed(item.outcomes) if verdict == "pass" and at), None)
+        if passed_at is not None:
+            days = REVIEW_DAYS[min(streak - 2, len(REVIEW_DAYS) - 1)]
+            row["reviewDue"] = client_instant((_parse(passed_at) + timedelta(days=days)).isoformat())
     return row
 
 
@@ -281,7 +287,7 @@ def for_course(profile: Mapping[str, object], course: str, knowledge: Mapping[st
             if isinstance(entry, Mapping) and (entry.get("course") == course or own & set(entry.get("concepts", [])))
         ],
         "habits": profile.get("habits", {}),
-        "due": due(profile, now),
+        "due": [concept for concept in due(profile, now) if concept in own or concept in weak_requires],
         "open": [entry for entry in profile.get("open", []) if isinstance(entry, Mapping) and entry.get("course") == course],
     }
 
@@ -292,7 +298,7 @@ def _mean(total_and_count: list[int]) -> float | None:
 
 
 def _int(value: object) -> int:
-    return value if isinstance(value, int) else -1
+    return value if is_int(value) else -1
 
 
 def _parse(value: str) -> datetime:

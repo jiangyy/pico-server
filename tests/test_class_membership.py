@@ -358,7 +358,7 @@ class TeacherInsightTest(unittest.TestCase):
                     == [("python-1", ["s1"]), ("python-2", ["s2"])]
                 profile = value["classes"][0]["students"][0]["profile"]
                 assert profile["concepts"][0]["concept"] == "for" and profile["concepts"][0]["status"] == "shaky"
-                assert profile["lastActive"] == "2026-11-03T10:00:00Z"
+                assert profile["lastActive"] == "2026-11-03T10:00:00.000Z"
                 assert _request(base_url, "/api/v1/teacher/classes", "t2-token") == (200, {"classes": []})
 
                 status, value = _request(base_url, "/api/v1/teacher/students/s1/activity", "t1-token")
