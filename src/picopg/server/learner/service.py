@@ -23,6 +23,8 @@ class _Entry:
     learner: Learner
     read: dict[str, Position] = field(default_factory=dict)
     profile: dict[str, object] | None = None
+    # 只锁这个学生：读证据、喂累加器都在它里面，别的学生的画像不用排队。
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class LearnerProfiles:
@@ -36,27 +38,34 @@ class LearnerProfiles:
         self.lock = threading.Lock()
 
     def profile(self, principal_id: str) -> dict[str, object]:
-        with self.lock:
-            entry = self._catch_up(principal_id)
+        entry = self._entry(principal_id)
+        with entry.lock:
+            self._catch_up(principal_id, entry)
             if entry.profile is None:
                 entry.profile = entry.learner.profile()
             return entry.profile
 
     def activity(self, principal_id: str, limit: int = 100) -> list[dict[str, object]]:
-        with self.lock:
-            return self._catch_up(principal_id).learner.recent(limit)
+        entry = self._entry(principal_id)
+        with entry.lock:
+            return self._catch_up(principal_id, entry).learner.recent(limit)
 
-    def _catch_up(self, principal_id: str) -> _Entry:
+    def _entry(self, principal_id: str) -> _Entry:
+        """表上的锁只管取出或换掉这个学生的累加器，很快；计算在学生自己的锁里做。"""
         knowledge = self.knowledge()
         version = None if knowledge is None else knowledge.get("version")
-        entry = self.entries.get(principal_id)
-        # 地图换了版本：概念的换算变了，从头重算。
-        if entry is None or entry.knowledge != version:
-            entry = _Entry(version, Learner(knowledge))
-            self.entries[principal_id] = entry
-        self.entries.move_to_end(principal_id)
-        while len(self.entries) > self.students:
-            self.entries.popitem(last=False)
+        with self.lock:
+            entry = self.entries.get(principal_id)
+            # 地图换了版本：概念的换算变了，从头重算。
+            if entry is None or entry.knowledge != version:
+                entry = _Entry(version, Learner(knowledge))
+                self.entries[principal_id] = entry
+            self.entries.move_to_end(principal_id)
+            while len(self.entries) > self.students:
+                self.entries.popitem(last=False)
+            return entry
+
+    def _catch_up(self, principal_id: str, entry: _Entry) -> _Entry:
         for log in self._logs(principal_id):
             after = entry.read.get(log)
             while True:
