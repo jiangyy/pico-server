@@ -43,6 +43,10 @@ class DraftLogRule:
         known = {encode_component(value, "replicaId") for value in replicas}
         return "read" if parts[5] in known else None
 
+    def claims(self, log_id: str) -> bool:
+        parts = log_id.split("/")
+        return len(parts) >= 4 and parts[0] == "principal" and parts[2] == "draft"
+
     def owner(self, log_id: str) -> tuple[str, str] | None:
         parts = log_id.split("/")
         if (

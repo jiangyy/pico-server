@@ -47,6 +47,10 @@ class PrincipalLogRule(Protocol):
 
     def owner(self, log_id: str) -> tuple[str, str] | None: ...
 
+    def claims(self, log_id: str) -> bool:
+        """这个 Log 是否在规则的命名空间里；在里面却没有 owner 的，是只有 Server 写的 Log。"""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PrincipalAccount:
@@ -248,20 +252,17 @@ class PrincipalLogAuthorization:
         identity: AuthenticatedReplica,
         grants: Mapping[str, str],
     ) -> None:
+        """规则认领的命名空间里默认拒绝：append 只能给规则认定属于这个 Replica 的 Log。规则之外的 Log 照旧由 grant 决定。"""
         encoded_identity = _encoded_identity(identity)
         for log_id, access in grants.items():
             if access != "append":
                 continue
-            owner = next(
-                (
-                    owner
-                    for rule in self._rules
-                    if (owner := rule.owner(log_id)) is not None
-                ),
-                None,
-            )
-            if owner is not None and owner != encoded_identity:
-                raise ValueError(f"append grant {log_id!r} belongs to another Replica")
+            claimed = [rule for rule in self._rules if rule.claims(log_id)]
+            if not claimed:
+                continue
+            owners = {rule.owner(log_id) for rule in claimed}
+            if owners != {encoded_identity}:
+                raise ValueError(f"append grant {log_id!r} is not this Replica's own Log")
 
 
 def permits_log(access: str | None, action: str, method: str) -> bool:

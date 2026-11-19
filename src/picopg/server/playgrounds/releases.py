@@ -34,6 +34,9 @@ class PlaygroundLogRule:
     ) -> str | None:
         return "read" if log_id == PLAYGROUND_RELEASES_LOG_ID else None
 
+    def claims(self, log_id: str) -> bool:
+        return log_id == PLAYGROUND_RELEASES_LOG_ID
+
     def owner(self, log_id: str) -> tuple[str, str] | None:
         return None
 

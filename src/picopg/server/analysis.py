@@ -38,6 +38,10 @@ class LearningAnalysisLogRule:
             return "append"
         return None
 
+    def claims(self, log_id: str) -> bool:
+        parts = log_id.split("/")
+        return len(parts) >= 3 and parts[0] == "principal" and parts[2] == "analysis"
+
     def owner(self, log_id: str) -> tuple[str, str] | None:
         parts = log_id.split("/")
         if (
