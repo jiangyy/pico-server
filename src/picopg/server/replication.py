@@ -155,6 +155,8 @@ class ReplicaHttpServer(ThreadingHTTPServer):
 
 class ReplicaRequestHandler(BaseHTTPRequestHandler):
     server: ReplicaHttpServer
+    # 一次读写最多等这么久：慢慢发请求头、发到一半不动的连接不会一直占着线程。SSE 每 15 秒写一次心跳，不受影响。
+    timeout = 60
 
     def handle_one_request(self) -> None:
         # 同一条连接上的下一个请求从头开始：没有写过响应。

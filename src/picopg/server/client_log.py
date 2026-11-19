@@ -34,6 +34,9 @@ class ClientLogLimiter:
     def allow(self, replica: str) -> bool:
         now = self.clock()
         with self.lock:
+            # 过了窗口的条目丢掉：表的大小随这一分钟在写日志的设备，而不是随所有写过的设备。
+            for stale in [key for key, (start, _) in self.windows.items() if now - start >= 60]:
+                del self.windows[stale]
             start, count = self.windows.get(replica, (now, 0))
             if now - start >= 60:
                 start, count = now, 0
@@ -44,10 +47,16 @@ class ClientLogLimiter:
 
 
 def write_client_log_to(path: Path) -> None:
+    """客户端日志只写进自己的文件：不冒泡到服务端日志（journalctl），再调用一次也只换文件、不重复写。"""
     path.parent.mkdir(parents=True, exist_ok=True)
+    for existing in list(client_logger.handlers):
+        client_logger.removeHandler(existing)
+        existing.close()
     handler = RotatingFileHandler(path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     client_logger.addHandler(handler)
+    client_logger.setLevel(logging.INFO)
+    client_logger.propagate = False
 
 
 def dispatch_client_log(handler: PicoRequestHandler, path: str) -> bool:

@@ -70,3 +70,22 @@ class ClientLogLimiterTest(unittest.TestCase):
         assert limiter.allow("a") and not limiter.allow("a") and limiter.allow("b")
         now[0] = 61
         assert limiter.allow("a")
+        assert set(limiter.windows) == {"a"}, "devices that stopped logging do not stay in the table"
+
+    def test_client_entries_go_to_their_own_file_once(self) -> None:
+        import logging
+        import tempfile
+        from pathlib import Path
+        from picopg.server.client_log import client_logger, write_client_log_to
+        with tempfile.TemporaryDirectory() as temporary:
+            write_client_log_to(Path(temporary) / "a.log")
+            write_client_log_to(Path(temporary) / "client.log")
+            assert len(client_logger.handlers) == 1 and client_logger.propagate is False
+            client_logger.warning("one entry")
+            for handler in client_logger.handlers:
+                handler.flush()
+            assert (Path(temporary) / "client.log").read_text(encoding="utf-8").count("one entry") == 1
+            for handler in list(client_logger.handlers):
+                client_logger.removeHandler(handler)
+                handler.close()
+            assert isinstance(logging.getLogger("picopg.client"), logging.Logger)
