@@ -69,6 +69,28 @@ class FileStoreTest(unittest.TestCase):
             assert reopened.append("log", records[-1].position, after).kind == "accepted"
             assert FileReplicaLogStore(root).head("log") == after[0].position
 
+    def test_a_crash_after_the_header_or_inside_it_reopens_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = FileReplicaLogStore(root)
+            [first] = _chain("log", 1)
+            store.append("log", None, (first,))
+            [path] = (root / "logs").glob("*.jsonl")
+            header = path.read_bytes().split(b"\n")[0] + b"\n"
+            # 建 Log 时 header 写完、记录写了一半：截掉以后只剩 header，再追加不能再写一个 header。
+            path.write_bytes(header + b'{"id":"sha256:half')
+            reopened = FileReplicaLogStore(root)
+            assert reopened.head("log") is None
+            assert reopened.append("log", None, (first,)).kind == "accepted"
+            assert path.read_bytes().count(b'"logId"') == 2, "one header plus the Record's own logId"
+            assert FileReplicaLogStore(root).head("log") == first.position
+            # 连 header 都没写完：这个 Log 从没建成，打开时清掉，之后照常建。
+            path.write_bytes(header[:5])
+            again = FileReplicaLogStore(root)
+            assert again.log_ids() == () and not path.exists()
+            assert again.append("log", None, (first,)).kind == "accepted"
+            assert FileReplicaLogStore(root).head("log") == first.position
+
     def test_a_single_document_store_is_migrated_once_and_kept(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

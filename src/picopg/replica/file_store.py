@@ -52,6 +52,8 @@ class FileReplicaLogStore(ReplicaLogStore):
         # 只在锁里读写；记录不可变，读的时候切一段交出去。
         self._logs: dict[str, list[ReplicatedRecord]] = {}
         self._index: dict[str, dict[str, int]] = {}
+        # 磁盘上已经有文件（至少有完整 header）的 Log：只有它们追加时不写 header。
+        self._files: set[str] = set()
         self._migrate_legacy()
         self._load()
 
@@ -147,7 +149,8 @@ class FileReplicaLogStore(ReplicaLogStore):
                         f"record id reused: {record.id}"
                     )
 
-            self._write(log_id, batch, created=not accepted)
+            self._write(log_id, batch, created=log_id not in self._files)
+            self._files.add(log_id)
             records = self._logs.setdefault(log_id, [])
             positions = self._index.setdefault(log_id, {})
             for record in batch:
@@ -194,11 +197,17 @@ class FileReplicaLogStore(ReplicaLogStore):
             return
         for path in sorted(self._directory.glob("*.jsonl")):
             try:
-                log_id, records = _read_log(path)
+                loaded = _read_log(path)
             except (OSError, ValueError, TypeError, InvalidReplicaData) as error:
                 raise ReplicaLogFileError(f"cannot open {path}") from error
+            if loaded is None:
+                # 建 Log 的那次写入连 header 都没写完：从没被确认过，当作不存在。
+                path.unlink()
+                continue
+            log_id, records = loaded
             if path.name != _file_name(log_id):
                 raise ReplicaLogFileError(f"{path} holds another Log ({log_id})")
+            self._files.add(log_id)
             self._logs[log_id] = list(records)
             self._index[log_id] = {record.id: index for index, record in enumerate(records)}
         _validate_document_dependencies(self._logs)
@@ -244,7 +253,8 @@ def _line(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
-def _read_log(path: Path) -> tuple[str, tuple[ReplicatedRecord, ...]]:
+def _read_log(path: Path) -> tuple[str, tuple[ReplicatedRecord, ...]] | None:
+    """读一个 Log 文件；连完整的 header 都没有时为 None。"""
     data = path.read_bytes()
     complete = data.rfind(b"\n") + 1
     if complete < len(data):
@@ -256,7 +266,7 @@ def _read_log(path: Path) -> tuple[str, tuple[ReplicatedRecord, ...]]:
         data = data[:complete]
     lines = data.decode("utf-8").splitlines()
     if not lines:
-        raise InvalidReplicaData("Log file has no header")
+        return None
     header = strict_json_loads(lines[0])
     if not isinstance(header, dict) or set(header) != {"logId"}:
         raise InvalidReplicaData("Log file header is invalid")
