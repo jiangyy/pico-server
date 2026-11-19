@@ -60,11 +60,6 @@ def _guarded(handler: PicoRequestHandler, label: str, body: Callable[[], None]) 
         handler.error(502, "ai.reply.invalid", str(error))
     except AiLimited as error:
         handler.error(429, "ai.limited", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("%s request failed", label)
-        handler.error(500, "server.failure", "server failure")
 
 
 def _agent(handler: PicoRequestHandler, path: str) -> None:

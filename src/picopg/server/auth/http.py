@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 from picopg.server.common.validation import same_secret
 from picopg.server.auth.limiter import client_address
-from picopg.server.replication import ResponseSent, logger
 from picopg.replica import InvalidReplicaData
 
 if TYPE_CHECKING:
@@ -23,11 +22,6 @@ def dispatch_session(handler: PicoRequestHandler, path: str) -> bool:
             _operator_session(handler)
     except (InvalidReplicaData, ValueError) as error:
         handler.error(400, "session.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("Session request failed")
-        handler.error(500, "server.failure", "server failure")
     return True
 
 

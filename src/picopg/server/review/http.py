@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
-from picopg.server.replication import ResponseSent, logger
 from picopg.server.review.comments import CommentError
 from picopg.server.submissions.reader import SubmissionError, SubmissionNotFound
 from picopg.server.submissions.views import detail_value, summary_value
@@ -34,11 +33,6 @@ def dispatch_review(handler: PicoRequestHandler, path: str) -> bool:
             "submission.invalid" if submission is not None else "comment.invalid",
             str(error),
         )
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("review request failed")
-        handler.error(500, "server.failure", "server failure")
     return True
 
 def _submission(handler: PicoRequestHandler, action: str, request_record_id: str) -> None:

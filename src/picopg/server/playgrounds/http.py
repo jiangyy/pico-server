@@ -5,7 +5,7 @@ from urllib.parse import unquote
 
 from picopg.server.playgrounds.releases import PLAYGROUND_RELEASES_LOG_ID
 from picopg.server.playgrounds.packages import PackageError, PackageNotFound
-from picopg.server.replication import ResponseSent, logger
+from picopg.server.replication import ResponseSent
 
 if TYPE_CHECKING:
     from picopg.server.app import PicoRequestHandler
@@ -58,11 +58,6 @@ def dispatch_playground(handler: PicoRequestHandler, path: str) -> bool:
         handler.error(404, "package.not_found", str(error))
     except PackageError as error:
         handler.error(400, "package.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("playground request failed")
-        handler.error(500, "server.failure", "server failure")
     return True
 
 

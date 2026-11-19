@@ -8,7 +8,7 @@ from picopg.server.ai.budget import AiLimited, current_principal
 from picopg.server.ai.model import CourseAiError
 from picopg.server.classroom.roster import ClassRosterError
 from picopg.server.learner import for_course
-from picopg.server.replication import ResponseSent, logger
+from picopg.server.replication import logger
 from picopg.server.review.comments import CommentError
 from picopg.server.submissions.views import detail_value, summary_value
 from picopg.server.submissions.reader import SubmissionError, SubmissionNotFound
@@ -104,11 +104,6 @@ def dispatch_teacher(handler: PicoRequestHandler, path: str) -> bool:
         handler.error(429, "ai.limited", str(error))
     except (ClassRosterError, CommentError, SubmissionError, InvalidReplicaData) as error:
         handler.error(400, "submission.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("teacher request failed")
-        handler.error(500, "server.failure", "server failure")
     return True
 
 

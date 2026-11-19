@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from picopg.server.replication import ResponseSent, logger
 from picopg.server.review.comments import CommentError
 from picopg.server.submissions.reader import SubmissionError
 from picopg.server.submissions.history import history_value
@@ -33,9 +32,4 @@ def dispatch_submissions(handler: PicoRequestHandler, path: str) -> bool:
         )
     except (CommentError, SubmissionError) as error:
         handler.error(400, "submission.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("student request failed")
-        handler.error(500, "server.failure", "server failure")
     return True

@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
 from picopg.server.classroom.roster import ClassRosterError
-from picopg.server.replication import ResponseSent, logger
 from picopg.replica import InvalidReplicaData
 
 if TYPE_CHECKING:
@@ -33,11 +32,6 @@ def dispatch_classroom(handler: PicoRequestHandler, path: str) -> bool:
         handler.send_json(201, {"position": position.to_value()})
     except (ClassRosterError, InvalidReplicaData) as error:
         handler.error(400, "class.invalid", str(error))
-    except ResponseSent:
-        pass
-    except Exception:
-        logger.exception("class roster request failed")
-        handler.error(500, "server.failure", "server failure")
     return True
 
 

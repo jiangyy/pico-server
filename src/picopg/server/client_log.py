@@ -9,7 +9,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from picopg.server.replication import ResponseSent
 
 if TYPE_CHECKING:
     from picopg.server.app import PicoRequestHandler
@@ -80,8 +79,6 @@ def dispatch_client_log(handler: PicoRequestHandler, path: str) -> bool:
         handler.send_json(200, {"logged": True}, (("Cache-Control", "no-store"),))
     except ValueError as error:
         handler.error(400, "client_log.invalid", str(error))
-    except ResponseSent:
-        pass
     return True
 
 

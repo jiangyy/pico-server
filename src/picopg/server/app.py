@@ -42,6 +42,7 @@ from picopg.server.playgrounds.releases import (
 from picopg.server.replication import (
     logger,
     LogBinding,
+    ResponseSent,
     ReplicaHttpServer,
     ReplicaRequestHandler,
 )
@@ -217,10 +218,15 @@ class PicoRequestHandler(ReplicaRequestHandler):
     server: PicoPGHttpServer
 
     def _dispatch(self) -> None:
+        """HTTP 的错误契约在这里，各功能不再各写一份：响应已写出就结束；坏输入（ValueError，含 InvalidReplicaData）是 400；
+        其余意外记下来回 500。功能只映射自己领域的错误码（例如 submission.invalid），那是给客户端的契约。"""
         try:
             self._dispatch_feature()
+        except ResponseSent:
+            pass
+        except ValueError as error:
+            self.error(400, "request.invalid", str(error))
         except Exception:
-            # 各功能自己处理预期的错误；漏出来的也要回一个 500，而不是一言不发地断开连接。
             logger.exception("request failed")
             self.error(500, "server.failure", "server failure")
 
