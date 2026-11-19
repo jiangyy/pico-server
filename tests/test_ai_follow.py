@@ -43,8 +43,12 @@ class CourseFollowServiceTest(unittest.TestCase):
         self.assertEqual(note, {**NOTE, "version": VERSION})
         system, *rest = model.calls[0]
         self.assertIn("## 题目\n把搬盘子拆成更小的同类任务。", system["content"])
-        self.assertIn("def hanoi(n, src, dst)", system["content"])
-        self.assertEqual([turn["content"] for turn in rest], ["第 1 次", "{}", "第 2 次"])
+        # 参考解是客户端带来的：放在第一条学生消息前面，不进系统指令；对话仍然一问一答交替。
+        self.assertNotIn("def hanoi(n, src, dst)", system["content"])
+        self.assertEqual([turn["role"] for turn in rest], ["user", "assistant", "user"])
+        self.assertIn("def hanoi(n, src, dst)", rest[0]["content"])
+        self.assertTrue(rest[0]["content"].endswith("第 1 次"))
+        self.assertEqual([turn["content"] for turn in rest[1:]], ["{}", "第 2 次"])
 
     def test_a_malformed_note_is_sent_back_once(self) -> None:
         model = RecordingModel([json.dumps({**NOTE, "gap": "unknown"}), json.dumps(NOTE, ensure_ascii=False)])

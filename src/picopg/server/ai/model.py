@@ -191,8 +191,7 @@ def _merge_call(calls: dict[int, dict[str, object]], delta: dict[str, object]) -
 class FallbackModel:
     """按顺序尝试多个模型：一个报 CourseAiError（连不上、没返回内容）就换下一个。
 
-    # ponytail: 流式 step 中途失败时，on_text 已经发出的片段收不回，下一个模型会重讲一遍；
-    # 主流故障（503、连不上）都发生在第一个字节之前，这个上限先接受。
+    流式 step 已经给学生发出片段之后才失败的，不再换下一个模型：重讲一遍比失败更糟。
     """
 
     def __init__(self, models: list[OpenAiCompatibleChatModel]) -> None:
@@ -204,6 +203,7 @@ class FallbackModel:
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         last: CourseAiError | None = None
+        self.answered = None
         for model in self.models:
             try:
                 content = model.complete(messages)
@@ -221,10 +221,20 @@ class FallbackModel:
         on_text: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         last: CourseAiError | None = None
+        self.answered = None
+        spoke = [False]
+
+        def speaking(text: str) -> None:
+            spoke[0] = True
+            on_text(text)  # type: ignore[misc]
+
         for model in self.models:
             try:
-                message = model.step(messages, tools, on_text)
+                message = model.step(messages, tools, None if on_text is None else speaking)
             except CourseAiError as error:
+                # 学生已经看到这个模型说的一半：换下一个模型会从头重讲一遍，不如如实失败。
+                if spoke[0]:
+                    raise
                 last = error
                 continue
             self.answered = getattr(model, "model", None)

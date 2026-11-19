@@ -100,9 +100,10 @@ class CourseAgentServiceTest(unittest.TestCase):
         written = '回到第 6 行。functions.act({"action": "code.run", "args": {"at": {"line": 6}}})'
 
         class StreamingModel(RecordingModel):
+            # 和真实的流一样一段段地给增量；调用被拆在好几段里（"func" / "tions.ac" / ...）。
             def step(self, messages, tools, on_text=None):
-                for end in (8, 20, len(written)):
-                    on_text(written[:end])
+                for start, end in ((0, 9), (9, 13), (13, 20), (20, len(written))):
+                    on_text(written[start:end])
                 return super().step(messages, tools, on_text)
 
         streamed = []
@@ -111,7 +112,7 @@ class CourseAgentServiceTest(unittest.TestCase):
         self.assertEqual(turn["content"], "回到第 6 行。")
         self.assertEqual([(call["name"], json.loads(call["arguments"])) for call in turn["calls"]],
                          [("act", {"action": "code.run", "args": {"at": {"line": 6}}})])
-        self.assertTrue(all("functions" not in text for text in streamed), streamed)
+        self.assertEqual("".join(streamed), "回到第 6 行。", "the student sees the text and none of the call, even split across chunks")
         unknown = CourseAgentService(RecordingModel([{"content": 'functions.nope({"a": 1})'}]), self.skills).step("sudoku", "v1", MESSAGES, TOOLS)
         self.assertEqual((unknown["content"], unknown["calls"]), ('functions.nope({"a": 1})', []), "a name that is not a tool stays text")
 

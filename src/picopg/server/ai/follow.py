@@ -35,9 +35,14 @@ class CourseFollowService:
 
     def follow(self, playground_id: str, version_id: str, request: dict[str, object]) -> dict[str, object]:
         skill = self._skill(playground_id, version_id)
+        thread = [{"role": turn["role"], "content": turn["content"]} for turn in request["thread"]]  # type: ignore[union-attr, index]
+        # 参考解是客户端带来的：放在学生那一侧（第一条学生消息前面），不进系统指令。
+        reference = _reference(request.get("reference"))
+        if reference:
+            thread[0] = {**thread[0], "content": f"{reference}\n\n{thread[0]['content']}"}
         chat: list[dict[str, object]] = [
-            {"role": "system", "content": "\n\n".join(part for part in (self.prompt, _course(skill, request.get("reference"))) if part)},
-            *({"role": turn["role"], "content": turn["content"]} for turn in request["thread"]),  # type: ignore[union-attr, index]
+            {"role": "system", "content": "\n\n".join(part for part in (self.prompt, _course(skill)) if part)},
+            *thread,
         ]
         problems: list[str] = []
         for _ in range(2):
@@ -60,7 +65,11 @@ class CourseFollowService:
             return {}
 
 
-def _course(skill: dict[str, object], reference: object) -> str:
+def _reference(reference: object) -> str:
+    return f"## 参考解（课程认为对的一种写法；学生可以有自己的写法，按他的走）\n```python\n{reference}\n```" if isinstance(reference, str) and reference else ""
+
+
+def _course(skill: dict[str, object]) -> str:
     meanings = skill.get("meanings") if isinstance(skill.get("meanings"), dict) else {}
     concepts = [item for item in skill.get("concepts", []) if isinstance(item, str)] if isinstance(skill.get("concepts"), list) else []
     parts = [
@@ -68,7 +77,6 @@ def _course(skill: dict[str, object], reference: object) -> str:
         f"## 课程规则\n{skill['rules']}" if isinstance(skill.get("rules"), str) else None,
         "## 课程的概念清单\n" + "、".join(concepts) if concepts else None,
         "## 课程给出的函数含义\n" + "\n".join(f"{name}：{meaning}" for name, meaning in meanings.items()) if meanings else None,
-        f"## 参考解（课程认为对的一种写法；学生可以有自己的写法，按他的走）\n```python\n{reference}\n```" if isinstance(reference, str) and reference else None,
     ]
     return "\n\n".join(part for part in parts if part)
 

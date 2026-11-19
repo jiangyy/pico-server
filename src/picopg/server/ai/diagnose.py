@@ -34,8 +34,9 @@ class CourseDiagnoseService:
         skill = self._skill(playground_id, version_id)
         concepts = [item for item in skill.get("concepts", []) if isinstance(item, str)] if isinstance(skill.get("concepts"), list) else []
         chat: list[dict[str, object]] = [
-            {"role": "system", "content": "\n\n".join(part for part in (self.prompt, _course(skill, concepts, request.get("reference"))) if part)},
-            {"role": "user", "content": _student(request)},
+            {"role": "system", "content": "\n\n".join(part for part in (self.prompt, _course(skill, concepts)) if part)},
+            # 参考解是客户端带来的：和学生的代码一起放在 user 消息里，不进系统指令。
+            {"role": "user", "content": "\n\n".join(part for part in (_reference(request.get("reference")), _student(request)) if part)},
         ]
         problems: list[str] = []
         for _ in range(2):
@@ -58,13 +59,16 @@ class CourseDiagnoseService:
             return {}
 
 
-def _course(skill: dict[str, object], concepts: list[str], reference: object) -> str:
+def _reference(reference: object) -> str:
+    return f"## 参考解（课程认为对的一种写法；学生可以有别的写法）\n```python\n{reference}\n```" if isinstance(reference, str) and reference else ""
+
+
+def _course(skill: dict[str, object], concepts: list[str]) -> str:
     meanings = skill.get("meanings") if isinstance(skill.get("meanings"), dict) else {}
     parts = [
         f"## 课程规则\n{skill['rules']}" if isinstance(skill.get("rules"), str) else None,
         "## 课程的概念清单\n" + "、".join(concepts) if concepts else None,
         "## 课程给出的函数含义\n" + "\n".join(f"{name}：{meaning}" for name, meaning in meanings.items()) if meanings else None,
-        f"## 参考解（课程认为对的一种写法；学生可以有别的写法）\n```python\n{reference}\n```" if isinstance(reference, str) and reference else None,
     ]
     return "\n\n".join(part for part in parts if part)
 

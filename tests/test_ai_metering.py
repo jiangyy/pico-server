@@ -87,6 +87,31 @@ class MeteringTest(unittest.TestCase):
         message = self.model(AiBudget()).step([{"role": "user", "content": "q"}], [], pieces.append)
         assert pieces == ["好"] and message["content"] == "好"
 
+    def test_a_model_that_already_spoke_is_not_replaced_mid_answer(self) -> None:
+        from picopg.server.ai.model import CourseAiError
+
+        class Speaks:
+            model = "first"
+
+            def step(self, messages, tools, on_text=None):
+                on_text("先说一半")
+                raise CourseAiError("connection dropped")
+
+        class Silent:
+            model = "second"
+            calls = 0
+
+            def step(self, messages, tools, on_text=None):
+                Silent.calls += 1
+                return {"role": "assistant", "content": "从头再说"}
+
+        pieces: list[str] = []
+        with self.assertRaises(CourseAiError):
+            FallbackModel([Speaks(), Silent()]).step([], [], pieces.append)
+        assert pieces == ["先说一半"] and Silent.calls == 0, "the student never hears the answer twice"
+        silent_first = FallbackModel([Silent(), Silent()])
+        assert silent_first.step([], [], pieces.append)["content"] == "从头再说"
+
     def test_people_who_stopped_using_ai_do_not_stay_in_the_table(self) -> None:
         now = [0.0]
         budget = AiBudget(per_hour=5, clock=lambda: now[0])

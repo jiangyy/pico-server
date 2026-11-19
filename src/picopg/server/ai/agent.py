@@ -262,10 +262,31 @@ _WRITTEN_CALL_START = re.compile(r"functions\.\w*(\s*\(.*)?$", re.S)
 
 
 def _hiding_calls(on_text: Callable[[str], None] | None) -> Callable[[str], None] | None:
-    """边生成边给学生看的文字，不带写成正文的调用（包括还没写完的那一截）。"""
+    """边生成边给学生看的文字，不带写成正文的调用。调用可能被拆在好几段里到达：在累积的全文上去掉调用，
+    只发出新增的可见部分；结尾可能是一个调用的开头（连 "func" 这样的半截都算）时先压着，等后文到了再定。"""
     if on_text is None:
         return None
-    return lambda text: on_text(_WRITTEN_CALL_START.sub("", _WRITTEN_CALL.sub("", text)).rstrip())
+    buffer: list[str] = []
+    shown = [""]
+
+    def receive(text: str) -> None:
+        buffer.append(text)
+        visible = _WRITTEN_CALL_START.sub("", _WRITTEN_CALL.sub("", "".join(buffer)))
+        visible = visible[: len(visible) - _call_prefix(visible)].rstrip()
+        if visible.startswith(shown[0]) and len(visible) > len(shown[0]):
+            on_text(visible[len(shown[0]):])
+            shown[0] = visible
+
+    return receive
+
+
+def _call_prefix(text: str) -> int:
+    """结尾有几个字符可能是 "functions." 的开头。"""
+    marker = "functions."
+    for size in range(min(len(marker), len(text)), 0, -1):
+        if text.endswith(marker[:size]):
+            return size
+    return 0
 
 
 def _recover_calls(content: str, names: set[str]) -> tuple[str, list[dict[str, object]]]:

@@ -47,7 +47,9 @@ class CourseDiagnoseServiceTest(unittest.TestCase):
         self.assertEqual(diagnosis, {**GOOD, "version": VERSION})
         system, user = model.calls[0]
         self.assertIn("recursion、while", system["content"])
-        self.assertIn("def hanoi(n, src, dst)", system["content"])
+        # 参考解是客户端带来的：在学生那一侧，不进系统指令。
+        self.assertNotIn("def hanoi(n, src, dst)", system["content"])
+        self.assertIn("def hanoi(n, src, dst)", user["content"])
         self.assertNotIn("if src != dst", system["content"])
         self.assertIn("`while src != dst:`", user["content"])
 
