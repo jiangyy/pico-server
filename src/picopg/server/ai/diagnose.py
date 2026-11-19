@@ -14,6 +14,7 @@ from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
+from picopg.server.common.validation import is_int
 
 VERSION = "diagnose-v2"
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
@@ -94,7 +95,7 @@ def _proposal(content: str, concepts: list[str]) -> tuple[dict[str, object], lis
         problems.append("patch 要是非空的数组")
     else:
         for item in patch:
-            if not isinstance(item, dict) or not isinstance(item.get("line"), int) or not isinstance(item.get("old"), str) or not isinstance(item.get("text"), str):
+            if not isinstance(item, dict) or not is_int(item.get("line")) or not isinstance(item.get("old"), str) or not isinstance(item.get("text"), str):
                 problems.append("patch 里每一处都要是 { line: 整数, old: 字符串, text: 字符串 }")
                 break
             edits.append({"line": item["line"], "old": item["old"], "text": item["text"]})

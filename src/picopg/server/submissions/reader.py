@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from picopg.server.common.reads import PaginationStalled, read_all
 from picopg.server.submissions.logs import is_request_log, request_scope, result_log
 from picopg.server.submissions.protocol import SubmissionError, SubmissionRequest, decode_request
-from picopg.server.common.validation import require_non_blank_position, require_non_blank_text
+from picopg.server.common.validation import client_instant, require_non_blank_position, require_non_blank_text
 from picopg.replica import Position, ReplicaLogStore, ReplicatedRecord
 
 
@@ -79,7 +79,7 @@ class SubmissionReader:
                     logger.warning("skipping malformed Submission request %s:%s: %s", log_id, request.id, error)
                     continue
                 submissions.append(self._submission(decoded, results.get(request.position)))
-        return tuple(sorted(submissions, key=lambda item: item.submitted_at or ""))
+        return tuple(sorted(submissions, key=lambda item: client_instant(item.submitted_at) or ""))
 
     def get(self, request_record_id: str) -> Submission:
         return self._get(request_record_id, self.list())

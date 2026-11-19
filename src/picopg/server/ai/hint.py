@@ -12,6 +12,7 @@ from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
+from picopg.server.common.validation import is_int
 
 SYSTEM = """你是坐在学生旁边的编程助教，学生在自学。规则已经判断出现在该你开口，下面给出依据和事实。
 
@@ -106,7 +107,7 @@ def _written(content: str) -> dict[str, object]:
         "fixes": [
             {"why": item["why"], **({"review": item["review"]} if isinstance(item.get("review"), str) else {}), "edits": [
                 {"line": edit["line"], "old": edit["old"], "new": edit["new"]}
-                for edit in item.get("edits", []) if isinstance(edit, dict) and isinstance(edit.get("line"), int)
+                for edit in item.get("edits", []) if isinstance(edit, dict) and is_int(edit.get("line"))
                 and isinstance(edit.get("old"), str) and isinstance(edit.get("new"), str)
             ]}
             for item in fixes if isinstance(item, dict) and isinstance(item.get("why"), str) and isinstance(item.get("edits"), list)
@@ -115,7 +116,7 @@ def _written(content: str) -> dict[str, object]:
         "example": value["example"].strip("\n") if isinstance(value.get("example"), str) and value["example"].strip() else None,
         "glosses": [
             {"line": item["line"], "text": item["text"]}
-            for item in glosses if isinstance(item, dict) and isinstance(item.get("line"), int) and isinstance(item.get("text"), str)
+            for item in glosses if isinstance(item, dict) and is_int(item.get("line")) and isinstance(item.get("text"), str)
         ] if isinstance(glosses, list) else [],
     }
 

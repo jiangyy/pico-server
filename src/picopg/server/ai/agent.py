@@ -10,6 +10,7 @@ from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository
 from picopg.server.ai.model import CourseAiError, ToolModel
+from picopg.server.common.validation import is_int
 
 
 class CourseAgent(Protocol):
@@ -300,7 +301,7 @@ def _turn(reply: dict[str, object], names: set[str] | None = None) -> dict[str, 
         parsed = {
             k: usage[k]
             for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-            if isinstance(usage.get(k), int)
+            if is_int(usage.get(k))
         }
         if parsed:
             turn["usage"] = parsed

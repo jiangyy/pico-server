@@ -41,7 +41,13 @@ def _non_empty(value: object, label: str) -> str:
     return value
 
 
+#: 记录 id 按 IEEE 754 double 编码数字（与 JS 的 Number 一致）；超出这个范围的整数编码后会相撞，不收。
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
 def _freeze_json(value: object, seen: set[int] | None = None) -> JsonValue:
+    if type(value) is int and not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+        raise InvalidReplicaData("integers must be within ±(2^53 - 1)")
     if value is None or type(value) in (bool, int, str):
         return value
     if type(value) is float:

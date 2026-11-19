@@ -146,7 +146,8 @@ class ClassMembershipTest(unittest.TestCase):
             _timed_submission(store, "s1", "laptop", "2026-11-19T09:00:00Z")
             broken_log = "principal/s2/submission/device/requests"
             store.append(broken_log, None, (_record(broken_log, None, (), {"type": "submission.requested", "submissionId": "x"}),))
-            _timed_submission(store, "s2", "other", "2026-11-19T08:30:00Z")
+            # 16:30+08:00 就是 UTC 08:30：按时间排在中间，按字符串会排到最后。
+            _timed_submission(store, "s2", "other", "2026-11-19T16:30:00+08:00")
             sessions = tuple(PrincipalSession.create(principal, "device", f"{principal}-token", {}, ()) for principal in ("t1", "s1", "s2"))
             server = PicoPGHttpServer(("127.0.0.1", 0), store, "operator-token", root / "packages", principal_sessions=sessions)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -159,7 +160,7 @@ class ClassMembershipTest(unittest.TestCase):
                 status, listed = _request(base_url, "/api/v1/teacher/submissions", "t1-token")
                 assert status == 200, listed
                 assert [(item["principalId"], item["submittedAt"]) for item in listed["submissions"]] == [
-                    ("s1", "2026-11-19T08:00:00Z"), ("s2", "2026-11-19T08:30:00Z"), ("s1", "2026-11-19T09:00:00Z"),
+                    ("s1", "2026-11-19T08:00:00Z"), ("s2", "2026-11-19T16:30:00+08:00"), ("s1", "2026-11-19T09:00:00Z"),
                 ]
             finally:
                 server.shutdown()

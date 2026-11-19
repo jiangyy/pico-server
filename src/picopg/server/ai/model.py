@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from typing import Protocol
 from urllib.request import Request, urlopen
+from picopg.server.common.validation import is_int
 
 
 class CourseAiError(Exception):
@@ -77,7 +78,7 @@ class OpenAiCompatibleChatModel:
         return Request(self.url, body, headers, method="POST")
 
     def _spent(self, usage: object) -> None:
-        if self.on_usage is not None and isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+        if self.on_usage is not None and isinstance(usage, dict) and is_int(usage.get("total_tokens")):
             self.on_usage(usage["total_tokens"])
 
     def _message(self, request: dict[str, object], *, timeout: float) -> dict[str, object]:

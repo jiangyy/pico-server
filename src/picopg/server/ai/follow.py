@@ -15,6 +15,7 @@ from typing import Protocol
 
 from picopg.server.ai.course import CourseSkillRepository, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
+from picopg.server.common.validation import is_int
 
 VERSION = os.environ.get("PICOPG_FOLLOW_PROMPT", "follow-v5")
 PROMPT = (Path(__file__).with_name("prompts") / f"{VERSION}.md").read_text(encoding="utf-8")
@@ -80,7 +81,7 @@ def _note(content: str) -> tuple[dict[str, object], list[str]]:
         return {}, ["不是一个 JSON 对象"]
     problems = []
     belief, nxt, want, basis = value.get("belief"), value.get("next"), value.get("want"), value.get("basis")
-    numbers = lambda items: isinstance(items, list) and all(isinstance(item, int) for item in items)  # noqa: E731
+    numbers = lambda items: isinstance(items, list) and all(is_int(item) for item in items)  # noqa: E731
     if not isinstance(value.get("doing"), str):
         problems.append("缺少 doing")
     if not isinstance(belief, dict) or not isinstance(belief.get("text"), str) or not numbers(belief.get("lines")) or not numbers(belief.get("steps")):
@@ -94,7 +95,7 @@ def _note(content: str) -> tuple[dict[str, object], list[str]]:
     if not isinstance(want, dict) or want.get("say") not in ("wait", "speak") or not isinstance(want.get("why"), str):
         problems.append("want 要是 { say: wait|speak, why }")
     if not isinstance(basis, list) or not all(
-        isinstance(item, dict) and isinstance(item.get("attempt"), int) and (item.get("line") is None or isinstance(item.get("line"), int)) for item in basis
+        isinstance(item, dict) and is_int(item.get("attempt")) and (item.get("line") is None or is_int(item.get("line"))) for item in basis
     ):
         problems.append("basis 要是 [{ attempt: 整数, line: 整数或 null }]")
     lacks = value.get("lacks", [])

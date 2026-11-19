@@ -25,6 +25,13 @@ def _chain(log_id: str, count: int, start: Position | None = None) -> tuple[Repl
 
 
 class FileStoreTest(unittest.TestCase):
+    def test_integers_beyond_double_precision_are_refused(self) -> None:
+        from picopg.replica import InvalidReplicaData
+        ok = _record("log", None, {"n": 2**53 - 1})
+        assert ok.data["n"] == 2**53 - 1
+        with self.assertRaises(InvalidReplicaData):
+            _record("log", None, {"n": 2**53})
+
     def test_appends_survive_reopening_and_reads_page_by_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

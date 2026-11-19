@@ -11,6 +11,7 @@ from typing import Protocol
 
 from picopg.server.playgrounds.packages import PackageError, PackageNotFound
 from picopg.server.playgrounds.releases import PlaygroundRelease
+from picopg.server.common.validation import is_int
 
 # 提问里常见、却不指向任何内容的双字词。
 STOP = frozenset({"我想", "想学", "怎么", "什么", "如何", "为什么", "一下", "可以", "这个", "那个", "学习", "知道", "请问", "是什", "么是"})
@@ -61,7 +62,7 @@ class LessonIndex:
             outline["knowledge"] for release in self.playgrounds.catalog()
             if (outline := self._outline(release)) is not None and isinstance(outline.get("knowledge"), dict)
         ]
-        return max(maps, key=lambda value: value.get("version", 0) if isinstance(value.get("version"), int) else 0, default=None)
+        return max(maps, key=lambda value: value.get("version", 0) if is_int(value.get("version")) else 0, default=None)
 
     def _outline(self, release: PlaygroundRelease) -> dict[str, object] | None:
         key = (release.playground_id, release.version_id)

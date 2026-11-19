@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from picopg.server.ai.model import ChatModel, CourseAiError
+from picopg.server.common.validation import is_int
 from picopg.server.playgrounds.packages import (
     FilePackageStore,
     PackageError,
@@ -208,22 +209,22 @@ def _action_value(value: object, allowed: frozenset[str], request: dict[str, obj
     source = context.get("source", "") if isinstance(context, dict) else ""
     moment = context.get("moment") if isinstance(context, dict) else None
     if action == "code.locate":
-        if args is None and isinstance(moment, dict) and isinstance(moment.get("line"), int):
+        if args is None and isinstance(moment, dict) and is_int(moment.get("line")):
             args = {"line": moment["line"]}
         if not isinstance(args, dict) or set(args) - {"line", "occurrence"}:
             raise CourseAiError("code.locate requires args with a source line")
         line = args.get("line")
-        if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= str(source).count("\n") + 1:
+        if not is_int(line) or not 1 <= line <= str(source).count("\n") + 1:
             raise CourseAiError("code.locate line is invalid")
         occurrence = args.get("occurrence")
-        if occurrence is not None and (isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 1):
+        if occurrence is not None and (not is_int(occurrence) or occurrence < 1):
             raise CourseAiError("code.locate occurrence is invalid")
     if action == "trace.seek":
         steps = moment.get("steps") if isinstance(moment, dict) else None
-        if args is None and isinstance(moment, dict) and isinstance(moment.get("step"), int):
+        if args is None and isinstance(moment, dict) and is_int(moment.get("step")):
             args = {"step": moment["step"]}
         step = args.get("step") if isinstance(args, dict) else None
-        if isinstance(step, bool) or not isinstance(step, int) or not isinstance(steps, int) or not 1 <= step <= steps:
+        if not is_int(step) or not is_int(steps) or not 1 <= step <= steps:
             raise CourseAiError("trace.seek requires args with an integer step inside the current Trace")
     if action == "annotation.show":
         if not isinstance(args, dict) or set(args) - {"kind", "at", "to", "text"}:
@@ -270,7 +271,7 @@ def _source_anchor(value: object, source: object) -> None:
         raise CourseAiError("annotation source anchor is invalid")
     line = value["line"]
     lines = str(source).splitlines() or [""]
-    if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= len(lines):
+    if not is_int(line) or not 1 <= line <= len(lines):
         raise CourseAiError("annotation source line is invalid")
     text = value.get("text")
     if text is not None and (not isinstance(text, str) or not text or text not in lines[line - 1]):

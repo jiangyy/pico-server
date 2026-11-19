@@ -100,3 +100,21 @@ def utc_now() -> str:
 def same_secret(given: object, expected: str) -> bool:
     """常数时间比较密钥。按 UTF-8 字节比：hmac 对含非 ASCII 字符的 str 会抛 TypeError，而这些输入都来自客户端。"""
     return isinstance(given, str) and hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
+
+
+def is_int(value: object) -> bool:
+    """JSON 里的整数：bool 在 Python 里也是 int，但 true 不是 1。"""
+    return type(value) is int
+
+
+def client_instant(value: object) -> str | None:
+    """客户端写的时间规范成固定宽度的 UTC（毫秒、以 Z 结尾）：字符串顺序就是时间顺序。不是带时区的 ISO 8601 时为 None。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or not 1 <= parsed.year <= 9999:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

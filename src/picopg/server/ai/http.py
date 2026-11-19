@@ -14,9 +14,14 @@ from picopg.server.ai.debrief import debrief_request
 from picopg.server.ai.model import CourseAiError
 from picopg.server.learner import due, for_course
 from picopg.server.replication import ResponseSent, logger
+from picopg.server.common.validation import is_int
 
 if TYPE_CHECKING:
     from picopg.server.app import PicoRequestHandler
+
+
+#: 一个运行时刻（调用栈、全局变量、输出）序列化后的上限，和源码的上限同一量级。
+MOMENT_LIMIT = 50_000
 
 
 def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
@@ -170,7 +175,7 @@ def _quote(value: object) -> None:
     lines = value["lines"]
     if lines is not None and (
         not isinstance(lines, list) or len(lines) != 2
-        or any(isinstance(line, bool) or not isinstance(line, int) or line < 1 for line in lines)
+        or any(not is_int(line) or line < 1 for line in lines)
         or lines[1] < lines[0]
     ):
         raise ValueError("request quote lines are invalid")
@@ -194,12 +199,15 @@ def _moment(value: object) -> None:
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("request moment is invalid")
     step, steps, line = value["step"], value["steps"], value["line"]
-    if (isinstance(step, bool) or not isinstance(step, int) or step < 0
-            or isinstance(steps, bool) or not isinstance(steps, int) or steps < step
-            or line is not None and (isinstance(line, bool) or not isinstance(line, int) or line < 1)):
+    if (not is_int(step) or step < 0
+            or not is_int(steps) or steps < step
+            or line is not None and (not is_int(line) or line < 1)):
         raise ValueError("request moment position is invalid")
     if not isinstance(value["frames"], list) or not isinstance(value["globals"], dict) or not isinstance(value["stdout"], str):
         raise ValueError("request moment state is invalid")
+    # 和相邻字段一样有上限：运行时的变量可以很大，原样整份送进模型既慢又贵。
+    if len(json.dumps([value["frames"], value["globals"], value["stdout"]], ensure_ascii=False)) > MOMENT_LIMIT:
+        raise ValueError("request moment is too large")
 
 
 #: 一问一答的几项服务：(名字, Server 上的属性, 请求校验, 调用)。

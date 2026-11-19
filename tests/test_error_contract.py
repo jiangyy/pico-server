@@ -71,5 +71,17 @@ class ErrorContractTest(unittest.TestCase):
         assert self.call("GET", "/api/v1/operator/submissions", headers={"Authorization": "Bearer 令牌"}) == 401
 
 
+
+class RequestLimitTest(unittest.TestCase):
+    def test_a_runtime_moment_has_a_size_limit_like_its_neighbours(self) -> None:
+        from picopg.server.ai.http import MOMENT_LIMIT, _request_value
+        moment = {"step": 0, "steps": 1, "line": 1, "occurrence": 1, "frames": [], "globals": {}, "stdout": ""}
+        body = {"playgroundId": "hanoi", "versionId": "v1", "request": {"kind": "question", "text": "?", "quote": None, "context": {"source": "x", "moment": moment}}}
+        _request_value(body)
+        moment["globals"] = {"big": "x" * MOMENT_LIMIT}
+        with self.assertRaises(ValueError):
+            _request_value(body)
+
+
 if __name__ == "__main__":
     unittest.main()
