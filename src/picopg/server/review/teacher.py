@@ -82,7 +82,7 @@ def dispatch_teacher(handler: PicoRequestHandler, path: str) -> bool:
             return True
         if action == "comment" and handler.command == "POST":
             body = handler.read_json()
-            if not isinstance(body, dict) or set(body) != {"text"}:
+            if not isinstance(body, dict) or "text" not in body:
                 raise CommentError("comment body must contain text")
             position = handler.server.comments.add_submission(
                 submission.principal_id,
@@ -92,6 +92,7 @@ def dispatch_teacher(handler: PicoRequestHandler, path: str) -> bool:
                 submission.submission_id,
                 submission.request,
                 submission.revision,
+                {key: value for key, value in body.items() if key != "text"},
             )
             handler.send_json(201, {"position": position.to_value()})
             return True

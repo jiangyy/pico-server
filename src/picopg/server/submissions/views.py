@@ -35,11 +35,7 @@ def detail_value(
     value["request"] = submission.request.to_value()
     value["source"] = source
     value["comments"] = [
-        {
-            "position": comment.position.to_value(),
-            "author": comment.author,
-            "text": comment.text,
-        }
+        {"position": comment.position.to_value(), **comment.review_value()}
         for comment in comments.comments(
             submission.principal_id, submission.playground_id
         )

@@ -210,7 +210,7 @@ def _ai_models(effort: str | None = None, names: list[str] | None = None) -> lis
         raise ValueError("PICOPG_AI_API_KEY must name the same number of providers")
     return [
         OpenAiCompatibleChatModel(base_url, model, keys[index] if keys else None, effort)
-        for index, (base_url, model) in enumerate(zip(base_urls, models))
+        for index, (base_url, model) in enumerate(zip(base_urls, models, strict=False))
     ]
 
 

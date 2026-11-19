@@ -129,6 +129,7 @@ class SubmissionsTest(unittest.TestCase):
                     "position": detail["comments"][0]["position"],  # type: ignore[index]
                     "author": "teacher",
                     "text": "Keep this exact result.",
+                    "createdAt": detail["comments"][0]["createdAt"],  # type: ignore[index]
                 }]
 
                 status, _ = _request(

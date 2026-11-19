@@ -94,6 +94,49 @@ def _timed_submission(store, principal_id: str, replica_id: str, submitted_at: s
 
 
 class ClassMembershipTest(unittest.TestCase):
+    def test_a_comment_on_code_keeps_its_kind_anchor_and_suggested_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = FileReplicaLogStore(root / "replica")
+            request = _submission(store, "s1", "device")
+            sessions = tuple(PrincipalSession.create(principal, "device", f"{principal}-token", {}, ["submissions"] if principal == "s1" else ()) for principal in ("t1", "s1"))
+            server = PicoPGHttpServer(("127.0.0.1", 0), store, "operator-token", root / "packages", principal_sessions=sessions)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            base_url = f"http://{host}:{port}"
+            path = f"/api/v1/teacher/submissions/{quote(request.id, safe='')}"
+            anchor = {"from": {"line": 1, "column": 7}, "to": {"line": 1, "column": 11}, "quote": "'s1'"}
+            suggest = {"text": "用变量名", "kind": "suggest", "anchor": anchor, "replacement": "name"}
+            try:
+                assert _request(base_url, "/api/v1/operator/classes/c", "operator-token", method="POST",
+                                value={"teachers": ["t1"], "students": ["s1"]})[0] == 201
+                assert _request(base_url, f"{path}/comments", "t1-token", method="POST", value=suggest)[0] == 201
+                assert _request(base_url, f"{path}/comments", "t1-token", method="POST", value={"text": "整体不错"})[0] == 201
+                for wrong in (
+                    {"text": "x", "kind": "scribble", "anchor": anchor},
+                    {"text": "x", "kind": "note"},
+                    {"text": "x", "kind": "note", "anchor": anchor, "replacement": "y"},
+                    {"text": "x", "kind": "note", "anchor": {**anchor, "to": {"line": 0, "column": 1}}},
+                    {"text": "x", "kind": "note", "anchor": {**anchor, "quote": ""}},
+                    {"text": "x", "color": "red"},
+                ):
+                    status, reply = _request(base_url, f"{path}/comments", "t1-token", method="POST", value=wrong)
+                    assert status == 400, (wrong, status, reply)
+
+                status, detail = _request(base_url, path, "t1-token")
+                assert status == 200
+                shown = [{key: value for key, value in item.items() if key not in ("position", "createdAt")} for item in detail["comments"]]
+                assert shown == [{"author": "t1", **suggest}, {"author": "t1", "text": "整体不错"}]
+                status, history = _request(base_url, "/api/v1/submissions", "s1-token")
+                assert status == 200
+                [mine] = history["submissions"]
+                assert [{key: value for key, value in item.items() if key != "createdAt"} for item in mine["comments"]] == shown
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_one_broken_request_does_not_hide_the_class_and_submissions_are_in_time_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
