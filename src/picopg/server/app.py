@@ -80,8 +80,9 @@ class PicoPGHttpServer(ReplicaHttpServer):
         course_diagnose: CourseDiagnose | None = None,
         course_follow: CourseFollow | None = None,
         course_debrief: CourseDebrief | None = None,
+        worker_state: Path | None = None,
     ) -> None:
-        self.workers = None
+        self.workers: tuple[ServerWorkerThread, ...] = ()
         sessions = tuple(principal_sessions)
         accounts = tuple(principal_accounts)
         if accounts and session_registry is None:
@@ -171,6 +172,7 @@ class PicoPGHttpServer(ReplicaHttpServer):
             self.store,
             request_logs,
             lambda log_id, head: self.broadcast(log_id, head),
+            None if worker_state is None else worker_state / "drafts.json",
         )
         consumers = [self.draft_consumer]
         self.submission_consumer = None
@@ -188,23 +190,25 @@ class PicoPGHttpServer(ReplicaHttpServer):
                 lambda log_id, head: self.broadcast(log_id, head),
             )
             consumers.append(self.submission_consumer)
-        self.workers = ServerWorkerThread(tuple(consumers)) if consumers else None
-        if self.workers is not None:
-            self.workers.start()
+        # 草稿与提交各一个线程：提交要跑 git，不能让正在编辑的学生排在它后面。
+        self.workers = tuple(ServerWorkerThread((consumer,)) for consumer in consumers)
+        for worker in self.workers:
+            worker.start()
 
     def append_and_broadcast(self, log_id, expected_head, records):
         result = super().append_and_broadcast(log_id, expected_head, records)
-        if result.kind == "accepted" and self.workers is not None:
+        if result.kind == "accepted" and self.workers:
             if is_draft_request_log(log_id):
                 self.draft_consumer.add_request_log(log_id)
             if self.submission_consumer is not None and is_request_log(log_id):
                 self.submission_consumer.add_request_log(log_id)
-            self.workers.notify_append(log_id)
+            for worker in self.workers:
+                worker.notify_append(log_id)
         return result
 
     def server_close(self) -> None:
-        if self.workers is not None:
-            self.workers.close()
+        for worker in self.workers or ():
+            worker.close()
         super().server_close()
 
 
@@ -282,4 +286,5 @@ def build_server(
         course_diagnose=course_diagnose,
         course_follow=course_follow,
         course_debrief=course_debrief,
+        worker_state=data_dir / "workers",
     )

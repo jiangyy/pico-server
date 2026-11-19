@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Protocol
 
 from picopg.server.common.reads import read_after, read_all
+from picopg.server.common.workers import Retry
 from picopg.server.submissions.logs import is_request_log, result_log
 from picopg.server.submissions.protocol import decode_request, read_source
 from picopg.server.common.validation import require_non_blank_text
@@ -43,21 +44,27 @@ class SubmissionRequestConsumer:
         # 每个请求日志：处理到哪一条请求、结果日志的头（只有这里写它）。第一次看到时从结果日志里重建。
         self._cursors: dict[str, Position | None] = {}
         self._heads: dict[str, Position | None] = {}
+        self._retry = Retry()
 
     def run_once(self) -> int:
-        """一个学生的日志出错不挡住其他学生：都处理完再把第一个错误交给 worker 记录并稍后重试。"""
+        """一个学生的日志出错不挡住其他学生。坏请求记成失败；基础设施错误（git、磁盘、超时）只让这个日志退避重试，
+        游标不前移，修好以后从卡住的那条接着做。"""
         with self._lock:
             request_logs = tuple(sorted(self._request_logs))
         handled = 0
-        failure: Exception | None = None
         for log_id in request_logs:
+            if not self._retry.ready(log_id):
+                continue
             try:
                 handled += self._run_log(log_id)
             except Exception as error:
-                failure = failure or error
-        if failure is not None:
-            raise failure
+                self._retry.failed(log_id, error)
+            else:
+                self._retry.succeeded(log_id)
         return handled
+
+    def next_wake_delay(self) -> float | None:
+        return self._retry.next_delay()
 
     def add_request_log(self, log_id: str) -> None:
         if not is_request_log(log_id):

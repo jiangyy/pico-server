@@ -31,9 +31,11 @@ class GitSubmissionTagWriterTest(unittest.TestCase):
 class FailingFirstTags:
     def __init__(self) -> None:
         self.created = []
+        self.failed = False
 
     def create(self, *, idempotency_key, submission_id, playground_id, revision, source):
-        if submission_id == "broken":
+        if submission_id == "broken" and not self.failed:
+            self.failed = True
             raise RuntimeError("git is unavailable for this one")
         self.created.append(submission_id)
         return f"tag/{submission_id}"
@@ -64,11 +66,20 @@ class SubmissionConsumerIsolationTest(unittest.TestCase):
                     "revision": revision.position.to_value(),
                 })
                 logs.append(log)
+            from picopg.server.common.workers import Retry
             tags = FailingFirstTags()
             consumer = SubmissionRequestConsumer(store, tuple(logs), tags)
-            with self.assertRaises(RuntimeError):
-                consumer.run_once()
+            now = [0.0]
+            consumer._retry = Retry(clock=lambda: now[0])
+            self.assertEqual(consumer.run_once(), 1)
             self.assertEqual(tags.created, ["fine"], "bbb's submission completed although aaa's sorts first and fails")
+            # 出错的日志只退避自己：时候没到不重试，到了从卡住的那条接着做。
+            self.assertEqual(consumer.next_wake_delay(), 1.0)
+            self.assertEqual(consumer.run_once(), 0)
+            now[0] = 1.0
+            self.assertEqual(consumer.run_once(), 1)
+            self.assertEqual(sorted(tags.created), ["broken", "fine"])
+            self.assertIsNone(consumer.next_wake_delay())
 
 
 if __name__ == "__main__":

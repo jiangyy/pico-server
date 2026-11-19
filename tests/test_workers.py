@@ -92,6 +92,38 @@ def draft_rejections_are_durable(root: Path) -> None:
     assert store.head(decision_log_id(principal_id, draft_id)) == head
 
 
+def a_restart_does_not_replay_old_requests(root: Path) -> None:
+    store = FileReplicaLogStore(root / "replica")
+    principal_id, draft_id = "user", "lesson"
+    initial = append(store, record(revision_log_id(principal_id, draft_id, "A"), None, (), {
+        "type": "draft.revised", "draftId": draft_id, "replicaId": "A", "source": "print(0)", "base": None,
+    }))
+    a_log, b_log = request_log_id(principal_id, draft_id, "A"), request_log_id(principal_id, draft_id, "B")
+    begin = append(store, record(a_log, None, (initial,), {
+        "type": "draft.beginEditing", "commandId": "begin-1", "draftId": draft_id, "replicaId": "A",
+        "expectedHead": initial.to_value(), "expectedEpoch": 0,
+    }))
+    # A 又点了一次开始编辑：结果是 current，不写任何决定。
+    append(store, record(a_log, begin, (initial,), {
+        "type": "draft.beginEditing", "commandId": "begin-2", "draftId": draft_id, "replicaId": "A",
+        "expectedHead": initial.to_value(), "expectedEpoch": 1,
+    }))
+    checkpoint = root / "workers" / "drafts.json"
+    assert [result.kind for _, result in DraftRequestConsumer(store, (a_log, b_log), checkpoint=checkpoint).run_once()] == ["accepted", "current"]
+    b_revision = append(store, record(revision_log_id(principal_id, draft_id, "B"), None, (initial,), {
+        "type": "draft.revised", "draftId": draft_id, "replicaId": "B", "source": "print('B')", "base": initial.to_value(),
+    }))
+    append(store, record(b_log, None, (initial, b_revision), {
+        "type": "draft.takeover", "commandId": "take", "draftId": draft_id, "replicaId": "B",
+        "expectedHead": initial.to_value(), "expectedEpoch": 1, "targetHead": b_revision.to_value(),
+    }))
+    assert [result.kind for _, result in DraftRequestConsumer(store, (a_log, b_log), checkpoint=checkpoint).run_once()] == ["accepted"]
+    head = store.head(decision_log_id(principal_id, draft_id))
+    # 重启：从 checkpoint 接着做，不在 B 接手之后的状态下重放 A 的 begin-2（那会追加一条多余的拒绝）。
+    assert DraftRequestConsumer(store, (a_log, b_log), checkpoint=checkpoint).run_once() == ()
+    assert store.head(decision_log_id(principal_id, draft_id)) == head
+
+
 def draft_transitions_and_faults_are_visible(root: Path) -> None:
     store = FileReplicaLogStore(root)
     authority = DraftAuthority(store)
@@ -236,6 +268,10 @@ class WorkersTest(unittest.TestCase):
     def test_draft_rejections_are_durable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             draft_rejections_are_durable(Path(raw))
+
+    def test_a_restart_does_not_replay_old_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            a_restart_does_not_replay_old_requests(Path(temporary))
 
     def test_draft_transitions_and_faults_are_visible(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

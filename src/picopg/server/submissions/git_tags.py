@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Mapping
 
 
+GIT_TIMEOUT_SECONDS = 30
+
+
 class GitSubmissionTagWriter:
     def __init__(self, repositories: Mapping[str, Path]) -> None:
         if any(not isinstance(key, str) or not key for key in repositories):
@@ -42,14 +45,10 @@ class GitSubmissionTagWriter:
                 raise ValueError("submission tag already exists with different source")
             return tag
 
-        # 刚 git init 的仓库没有 HEAD：第一份提交成为根提交。
-        head = self._run(repository, "rev-parse", "--verify", "--quiet", "HEAD", check=False)
-        parent = head.stdout.decode().strip() if head.returncode == 0 else None
+        # 每份提交是一个独立的快照（孤立 commit + tag）：不读也不动 HEAD，结果不取决于仓库当时的状态。
         blob = self._run(repository, "hash-object", "-w", "--stdin", input=source.encode("utf-8")).stdout.decode().strip()
         with tempfile.TemporaryDirectory(prefix="picopg-git-index-") as temporary:
             environment = {"GIT_INDEX_FILE": str(Path(temporary) / "index")}
-            if parent is not None:
-                self._run(repository, "read-tree", parent, environment=environment)
             self._run(
                 repository,
                 "update-index",
@@ -72,7 +71,6 @@ class GitSubmissionTagWriter:
             repository,
             "commit-tree",
             tree,
-            *(() if parent is None else ("-p", parent)),
             "-m",
             message,
             environment=identity,
@@ -101,6 +99,8 @@ class GitSubmissionTagWriter:
             stderr=subprocess.PIPE,
             env=env,
             check=False,
+            # 卡住的 git（锁、坏掉的仓库）不能拖住提交 worker：超时按基础设施故障退避重试。
+            timeout=GIT_TIMEOUT_SECONDS,
         )
         if check and result.returncode != 0:
             message = result.stderr.decode("utf-8", errors="replace").strip()
