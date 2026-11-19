@@ -16,6 +16,8 @@ def summary_value(submission: Submission) -> dict[str, object]:
         "revision": submission.revision.to_value(),
         "status": submission.status,
     }
+    if submission.submitted_at is not None:
+        value["submittedAt"] = submission.submitted_at
     if submission.tag is not None:
         value["tag"] = submission.tag
     if submission.message is not None:

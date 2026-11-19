@@ -136,9 +136,10 @@ class StudentSubmissionsTest(unittest.TestCase):
                 assert all("replicaId" not in item for item in submissions)
                 assert all(item["id"] for item in submissions)
                 assert _get(base_url, "wrong")[0] == 401
-                status, invalid = _get(base_url, "broken-token")
-                assert status == 400
-                assert invalid["error"]["code"] == "submission.invalid"  # type: ignore[index]
+                # 客户端写坏的请求是不可信输入：跳过它，学生其余的提交照常可见（日志不可删，报错就永远看不到了）。
+                status, listed = _get(base_url, "broken-token")
+                assert status == 200
+                assert listed["submissions"] == []  # type: ignore[index]
             finally:
                 server.shutdown()
                 server.server_close()

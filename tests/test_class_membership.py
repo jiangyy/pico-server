@@ -75,7 +75,54 @@ def _request(
             return error.code, json.loads(error.read())
 
 
+def _timed_submission(store, principal_id: str, replica_id: str, submitted_at: str) -> ReplicatedRecord:
+    revision_log = revision_log_id(principal_id, "lesson", replica_id)
+    parent = store.head(revision_log)
+    revision = _record(revision_log, parent, (), {
+        "type": "draft.revised", "draftId": "lesson", "replicaId": replica_id,
+        "source": f"print({submitted_at!r})\n", "base": parent.to_value() if parent else None,
+    })
+    assert store.append(revision_log, parent, (revision,)).kind == "accepted"
+    request_log = f"principal/{principal_id}/submission/{replica_id}/requests"
+    head = store.head(request_log)
+    request = _record(request_log, head, (revision.position,), {
+        "type": "submission.requested", "submissionId": f"{principal_id}-{submitted_at}", "playgroundId": "lesson",
+        "revision": revision.position.to_value(), "submittedAt": submitted_at,
+    })
+    assert store.append(request_log, head, (request,)).kind == "accepted"
+    return request
+
+
 class ClassMembershipTest(unittest.TestCase):
+    def test_one_broken_request_does_not_hide_the_class_and_submissions_are_in_time_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = FileReplicaLogStore(root / "replica")
+            # 同一个学生先用 phone 交、再用 laptop 交：日志 id 的顺序和提交时间相反。
+            _timed_submission(store, "s1", "phone", "2026-11-19T08:00:00Z")
+            _timed_submission(store, "s1", "laptop", "2026-11-19T09:00:00Z")
+            broken_log = "principal/s2/submission/device/requests"
+            store.append(broken_log, None, (_record(broken_log, None, (), {"type": "submission.requested", "submissionId": "x"}),))
+            _timed_submission(store, "s2", "other", "2026-11-19T08:30:00Z")
+            sessions = tuple(PrincipalSession.create(principal, "device", f"{principal}-token", {}, ()) for principal in ("t1", "s1", "s2"))
+            server = PicoPGHttpServer(("127.0.0.1", 0), store, "operator-token", root / "packages", principal_sessions=sessions)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            base_url = f"http://{host}:{port}"
+            try:
+                assert _request(base_url, "/api/v1/operator/classes/c", "operator-token", method="POST",
+                                value={"teachers": ["t1"], "students": ["s1", "s2"]})[0] == 201
+                status, listed = _request(base_url, "/api/v1/teacher/submissions", "t1-token")
+                assert status == 200, listed
+                assert [(item["principalId"], item["submittedAt"]) for item in listed["submissions"]] == [
+                    ("s1", "2026-11-19T08:00:00Z"), ("s2", "2026-11-19T08:30:00Z"), ("s1", "2026-11-19T09:00:00Z"),
+                ]
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_class_membership(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

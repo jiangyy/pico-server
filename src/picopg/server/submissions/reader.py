@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -10,6 +11,9 @@ from picopg.server.submissions.logs import is_request_log, request_scope, result
 from picopg.server.submissions.protocol import SubmissionError, SubmissionRequest, decode_request
 from picopg.server.common.validation import require_non_blank_position, require_non_blank_text
 from picopg.replica import Position, ReplicaLogStore, ReplicatedRecord
+
+
+logger = logging.getLogger("picopg.server")
 
 
 class SubmissionNotFound(SubmissionError):
@@ -56,6 +60,11 @@ class SubmissionReader:
         return self._list(request_logs)
 
     def _list(self, request_logs: tuple[str, ...]) -> tuple[Submission, ...]:
+        """按提交时间排；没有时间的旧请求排在前面，彼此保持日志顺序。
+
+        请求是客户端写的：解不开的一条（worker 已经给它记了失败）跳过，不让它挡住同一学生、同一个班的其他提交。
+        结果是 Server 自己写的：对不上就是完整性错误，照旧报错。
+        """
         submissions: list[Submission] = []
         record_ids: set[str] = set()
         for log_id in request_logs:
@@ -64,8 +73,13 @@ class SubmissionReader:
                 if request.id in record_ids:
                     raise SubmissionError("submission request Record ID is not unique")
                 record_ids.add(request.id)
-                submissions.append(self._submission(request, results.get(request.position)))
-        return tuple(submissions)
+                try:
+                    decoded = decode_request(request)
+                except SubmissionError as error:
+                    logger.warning("skipping malformed Submission request %s:%s: %s", log_id, request.id, error)
+                    continue
+                submissions.append(self._submission(decoded, results.get(request.position)))
+        return tuple(sorted(submissions, key=lambda item: item.submitted_at or ""))
 
     def get(self, request_record_id: str) -> Submission:
         return self._get(request_record_id, self.list())
@@ -105,15 +119,14 @@ class SubmissionReader:
             raise SubmissionError(str(error)) from error
 
     def _submission(
-        self, request: ReplicatedRecord, result: ReplicatedRecord | None
+        self, decoded: SubmissionRequest, result: ReplicatedRecord | None
     ) -> Submission:
-        decoded = decode_request(request)
         principal_id, replica_id = decoded.principal_id, decoded.replica_id
         submission_id, playground_id = decoded.submission_id, decoded.playground_id
         revision = decoded.revision
         if result is None:
             return Submission(
-                request.position, principal_id, replica_id, submission_id,
+                decoded.request, principal_id, replica_id, submission_id,
                 playground_id, revision, "requested", submitted_at=decoded.submitted_at,
             )
         result_data = result.data
@@ -122,7 +135,7 @@ class SubmissionReader:
         kind = result_data.get("type")
         if kind == "submission.failed":
             return Submission(
-                request.position, principal_id, replica_id, submission_id,
+                decoded.request, principal_id, replica_id, submission_id,
                 playground_id, revision, "failed", submitted_at=decoded.submitted_at,
                 message=require_non_blank_text(
                     result_data.get("message"),
@@ -143,7 +156,7 @@ class SubmissionReader:
         ) != revision:
             raise SubmissionError("Submission result names another Revision")
         return Submission(
-            request.position, principal_id, replica_id, submission_id,
+            decoded.request, principal_id, replica_id, submission_id,
             playground_id, revision, "completed", submitted_at=decoded.submitted_at,
             tag=require_non_blank_text(
                 result_data.get("tag"),
