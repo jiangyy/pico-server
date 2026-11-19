@@ -43,6 +43,24 @@ SESSION_COOKIE = "picopg_session"
 OPERATOR_SESSION_COOKIE = "picopg_operator_session"
 logger = logging.getLogger("picopg.server")
 
+SUBSCRIBER_QUEUE = 64
+
+
+class Subscriber:
+    """一条 SSE 连接的待发通知。排满了就标记溢出：连接随即关掉，客户端重连时从各日志的头重新对齐，不会静默漏掉通知。"""
+
+    def __init__(self, observes: Callable[[str], bool], size: int = SUBSCRIBER_QUEUE) -> None:
+        self.observes = observes
+        self.events: queue.Queue[str] = queue.Queue(maxsize=size)
+        self.overflowed = threading.Event()
+
+    def offer(self, event: str) -> None:
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            self.overflowed.set()
+
+
 LogAccess = str
 LogBinding = tuple[str, LogAccess]
 _READ_ACTIONS = {"head", "records", "has"}
@@ -104,7 +122,7 @@ class ReplicaHttpServer(ThreadingHTTPServer):
         )
         self.operator_authenticator = operator_authenticator
         self._subscriber_lock = threading.Lock()
-        self._subscribers: list[tuple[queue.Queue[str], Callable[[str], bool]]] = []
+        self._subscribers: list[Subscriber] = []
         super().__init__(address, handler_class or ReplicaRequestHandler)
 
     def broadcast(self, log_id: str, head: "Position | None") -> None:
@@ -118,14 +136,10 @@ class ReplicaHttpServer(ThreadingHTTPServer):
             separators=(",", ":"),
         )
         with self._subscriber_lock:
-            queues = list(self._subscribers)
-        for subscriber, observes in queues:
-            if not observes(log_id):
-                continue
-            try:
-                subscriber.put_nowait(event)
-            except queue.Full:
-                logger.warning("subscriber queue is full, dropping event for %s", log_id)
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            if subscriber.observes(log_id):
+                subscriber.offer(event)
 
     def append_and_broadcast(
         self,
@@ -336,9 +350,9 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         if not has_access:
             self.error(403, "log.not_exposed", "no readable Logs available")
             return
-        subscriber: queue.Queue[str] = queue.Queue(maxsize=64)
+        subscriber = Subscriber(observes)
         with self.server._subscriber_lock:
-            self.server._subscribers.append((subscriber, observes))
+            self.server._subscribers.append(subscriber)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -347,9 +361,9 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b": connected\n\n")
             self.wfile.flush()
-            while True:
+            while not subscriber.overflowed.is_set():
                 try:
-                    event = subscriber.get(timeout=15)
+                    event = subscriber.events.get(timeout=15)
                 except queue.Empty:
                     self.wfile.write(b": heartbeat\n\n")
                     self.wfile.flush()
@@ -361,10 +375,13 @@ class ReplicaRequestHandler(BaseHTTPRequestHandler):
         except (ConnectionError, BrokenPipeError, OSError):
             pass
         finally:
+            # 头里写了 keep-alive：不显式关掉，连接会留着等下一个请求，客户端就收不到流的结束。
+            self.close_connection = True
+            if subscriber.overflowed.is_set():
+                logger.warning("event stream fell behind; closing it so the client resynchronizes")
             with self.server._subscriber_lock:
-                entry = next((item for item in self.server._subscribers if item[0] is subscriber), None)
-                if entry is not None:
-                    self.server._subscribers.remove(entry)
+                if subscriber in self.server._subscribers:
+                    self.server._subscribers.remove(subscriber)
 
     def authenticated_replica(self) -> AuthenticatedReplica | None:
         if self.server.authenticator is None:
