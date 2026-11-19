@@ -210,7 +210,7 @@ def _ai_models(effort: str | None = None, names: list[str] | None = None) -> lis
         raise ValueError("PICOPG_AI_API_KEY must name the same number of providers")
     return [
         OpenAiCompatibleChatModel(base_url, model, keys[index] if keys else None, effort)
-        for index, (base_url, model) in enumerate(zip(base_urls, models, strict=False))
+        for index, (base_url, model) in enumerate(zip(base_urls, models, strict=True))
     ]
 
 
@@ -218,36 +218,28 @@ def _fallback(models: list[OpenAiCompatibleChatModel]) -> OpenAiCompatibleChatMo
     return models[0] if len(models) == 1 else FallbackModel(models)
 
 
-def load_course_ai(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAi | None:
-    models = _ai_models()
+def _service(models: list[OpenAiCompatibleChatModel] | None, budget: AiBudget | None, package_root: Path | None, service):
+    """一组 provider 包成一项课程服务：用量记进预算，按顺序回退，带上课程的规则。没配置模型时为 None。"""
     if models is None:
         return None
     if budget is not None:
         for model in models:
             model.on_usage = budget.spend
-    return CourseAiService(_fallback(models), _course_skills(package_root))
+    return service(_fallback(models), _course_skills(package_root))
+
+
+def load_course_ai(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAi | None:
+    return _service(_ai_models(), budget, package_root, CourseAiService)
 
 
 def load_course_agent(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAgent | None:
     """与课程 AI 同一个模型；PICOPG_AI_EFFORT 可选（如 low），推理模型据此少想一点、答得更快。"""
-    models = _ai_models(os.environ.get("PICOPG_AI_EFFORT") or None)
-    if models is None:
-        return None
-    if budget is not None:
-        for model in models:
-            model.on_usage = budget.spend
-    return CourseAgentService(_fallback(models), _course_skills(package_root))
+    return _service(_ai_models(os.environ.get("PICOPG_AI_EFFORT") or None), budget, package_root, CourseAgentService)
 
 
 def load_course_hint(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseHint | None:
     """同一组 provider；PICOPG_AI_HINT_MODEL 可选，按位置换成推理模型（如 deepseek-reasoner），提示要推理盘子在哪，不能说错。"""
-    models = _ai_models(names=_csv("PICOPG_AI_HINT_MODEL") or None)
-    if models is None:
-        return None
-    if budget is not None:
-        for model in models:
-            model.on_usage = budget.spend
-    return CourseHintService(_fallback(models), _course_skills(package_root))
+    return _service(_ai_models(names=_csv("PICOPG_AI_HINT_MODEL") or None), budget, package_root, CourseHintService)
 
 
 def _diagnose_models() -> list[OpenAiCompatibleChatModel] | None:
@@ -271,34 +263,16 @@ def follow_model() -> OpenAiCompatibleChatModel | FallbackModel | None:
 
 
 def load_course_follow(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseFollow | None:
-    models = _follow_models()
-    if models is None:
-        return None
-    if budget is not None:
-        for model in models:
-            model.on_usage = budget.spend
-    return CourseFollowService(_fallback(models), _course_skills(package_root))
+    return _service(_follow_models(), budget, package_root, CourseFollowService)
 
 
 def load_course_debrief(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseDebrief | None:
     """和提示同一组模型：复盘要推理思路为什么对、写能跑通的代码。"""
-    models = _ai_models(names=_csv("PICOPG_AI_HINT_MODEL") or None)
-    if models is None:
-        return None
-    if budget is not None:
-        for model in models:
-            model.on_usage = budget.spend
-    return CourseDebriefService(_fallback(models), _course_skills(package_root))
+    return _service(_ai_models(names=_csv("PICOPG_AI_HINT_MODEL") or None), budget, package_root, CourseDebriefService)
 
 
 def load_course_diagnose(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseDiagnose | None:
-    models = _diagnose_models()
-    if models is None:
-        return None
-    if budget is not None:
-        for model in models:
-            model.on_usage = budget.spend
-    return CourseDiagnoseService(_fallback(models), _course_skills(package_root))
+    return _service(_diagnose_models(), budget, package_root, CourseDiagnoseService)
 
 
 def _course_skills(package_root: Path | None) -> CourseSkillRepository:
