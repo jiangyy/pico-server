@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+import zipfile
+from io import BytesIO
+from pathlib import Path
+
+from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.config import SKILLS
+from picopg.server.playgrounds.packages import FilePackageStore, version_id
+
+
+class CourseSkillRepositoryTest(unittest.TestCase):
+    def test_packaged_skill_wins_and_missing_skill_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            packages = FilePackageStore(root / "packages")
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("course/hanoi.skill.json", json.dumps({
+                    "course": "hanoi", "actions": ["code.run"], "teaches": "包里的版本",
+                }))
+            payload = output.getvalue()
+            packaged_version = version_id(payload)
+            packages.put("hanoi", packaged_version, payload)
+            repository = CourseSkillRepository(SKILLS, packages)
+            self.assertEqual(repository.read("hanoi", packaged_version)["teaches"], "包里的版本")
+
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("course/other.json", "{}")
+            payload = output.getvalue()
+            legacy_version = version_id(payload)
+            packages.put("hanoi", legacy_version, payload)
+            self.assertNotEqual(repository.read("hanoi", legacy_version)["teaches"], "包里的版本")
+
+
+if __name__ == "__main__":
+    unittest.main()

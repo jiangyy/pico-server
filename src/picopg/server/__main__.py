@@ -12,7 +12,6 @@ from picopg.server.config import (
     load_ai_budget,
     load_bindings,
     load_course_agent,
-    load_course_ai,
     load_course_diagnose,
     load_course_follow,
     load_course_hint,
@@ -75,7 +74,6 @@ def main(argv: list[str] | None = None) -> int:
         principal_sessions, principal_accounts = load_principals(arguments.principal_config)
         submission_tag_writer = load_submission_tag_writer(arguments.submission_repositories)
         ai_budget = load_ai_budget()
-        course_ai = load_course_ai(ai_budget, arguments.data / "packages")
         course_agent = load_course_agent(ai_budget, arguments.data / "packages")
         course_hint = load_course_hint(ai_budget, arguments.data / "packages")
         course_diagnose = load_course_diagnose(ai_budget, arguments.data / "packages")
@@ -95,7 +93,6 @@ def main(argv: list[str] | None = None) -> int:
         principal_accounts=principal_accounts,
         secure_cookies=not arguments.insecure_cookies,
         submission_tag_writer=submission_tag_writer,
-        course_ai=course_ai,
         course_agent=course_agent,
         ai_access=ai_access,
         ai_budget=ai_budget,
@@ -109,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         "replica server listening on http://%s:%s with %d Log binding(s)",
         host, port, len(server.bindings),
     )
-    if course_ai is None:
+    if course_agent is None:
         logger.info("course AI disabled; clients will use their offline answers")
     elif not ai_access.everyone and not ai_access.principals:
         logger.info("course AI configured but PICOPG_AI_PRINCIPALS is empty; nobody's code is sent to the model")

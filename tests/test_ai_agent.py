@@ -15,6 +15,7 @@ from picopg.server.ai.access import AiAccess
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
 from picopg.server.config import SKILLS
+from tests.step_route import STEP, envelope
 
 
 class RecordingModel:
@@ -54,13 +55,14 @@ class FakeAgent:
         return {"content": f"tutor:{len(messages)}", "calls": []}
 
 
-def post(connection, token, body):
+def post(connection, token, body, prompt="course.agent"):
     connection.request(
-        "POST", "/api/v1/ai/agent", json.dumps(body).encode(),
+        "POST", STEP, json.dumps(envelope(prompt, body)).encode(),
         {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     response = connection.getresponse()
-    return response.status, json.loads(response.read())
+    status, reply = response.status, json.loads(response.read())
+    return (status, reply["turn"]) if status == 200 else (status, reply)
 
 
 class CourseAgentServiceTest(unittest.TestCase):
@@ -200,12 +202,7 @@ class AgentRouteTest(unittest.TestCase):
             try:
                 body = {"playgroundId": "hello", "versionId": "v1", "messages": MESSAGES, "tools": TOOLS}
                 self.assertEqual(post(connection, "student-token", body), (200, {"content": "hello:3", "calls": []}))
-                connection.request(
-                    "POST", "/api/v1/ai/tutor", json.dumps({"messages": MESSAGES[:1], "tools": []}).encode(),
-                    {"Authorization": "Bearer student-token", "Content-Type": "application/json"},
-                )
-                response = connection.getresponse()
-                self.assertEqual((response.status, json.loads(response.read())), (200, {"content": "tutor:1", "calls": []}))
+                self.assertEqual(post(connection, "student-token", {"messages": MESSAGES[:1], "tools": []}, "pico.tutor"), (200, {"content": "tutor:1", "calls": []}))
                 # 服务端按提问的学生算出画像：课程里只给本课相关的部分，导师拿到全部与到期复习。
                 course, tutor = agent.learners
                 self.assertEqual(set(course), {"concepts", "misconceptions", "habits", "due", "open"})
@@ -234,7 +231,7 @@ class AgentRouteTest(unittest.TestCase):
             def stream(playground_id):
                 connection = http.client.HTTPConnection(*server.server_address)
                 body = {"playgroundId": playground_id, "versionId": "v1", "messages": MESSAGES, "tools": TOOLS}
-                connection.request("POST", "/api/v1/ai/agent", json.dumps(body).encode(), {
+                connection.request("POST", STEP, json.dumps(envelope("course.agent", body)).encode(), {
                     "Authorization": "Bearer student-token", "Content-Type": "application/json", "Accept": "application/x-ndjson",
                 })
                 response = connection.getresponse()

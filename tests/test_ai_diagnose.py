@@ -15,6 +15,7 @@ from picopg.server.auth.model import PrincipalSession
 from picopg.server.ai.course import CourseSkillRepository
 from picopg.server.ai.diagnose import VERSION, CourseDiagnoseService, diagnose_request
 from picopg.server.ai.model import CourseAiError
+from tests.step_route import STEP, answered, envelope
 
 SKILL = {"course": "hanoi", "actions": [], "concepts": ["recursion", "while"], "rules": "盘子只能顺时针搬到下一根柱子。"}
 REQUEST = {"evidence": "## 现在的代码\n  8|         if src != dst:", "reference": "def hanoi(n, src, dst): ...", "deleted": ["while src != dst:"], "rejected": []}
@@ -100,9 +101,9 @@ class DiagnoseRouteTest(unittest.TestCase):
             def post(token, value):
                 connection = http.client.HTTPConnection(*server.server_address)
                 try:
-                    connection.request("POST", "/api/v1/ai/diagnose", json.dumps(value).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                    connection.request("POST", STEP, json.dumps(envelope("coach.diagnose", value)).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
                     response = connection.getresponse()
-                    return response.status, json.loads(response.read())
+                    return answered(response.status, json.loads(response.read()))
                 finally:
                     connection.close()
 

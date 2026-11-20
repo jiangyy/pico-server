@@ -17,6 +17,7 @@ from picopg.server.ai.model import CourseAiError, FallbackModel
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
 from picopg.server.config import load_course_hint
+from tests.step_route import STEP, answered, envelope
 
 SKILL = {
     "course": "hanoi",
@@ -154,9 +155,9 @@ class HintRouteTest(unittest.TestCase):
     def post(self, server, token, body):
         connection = http.client.HTTPConnection(*server.server_address)
         try:
-            connection.request("POST", "/api/v1/ai/hint", json.dumps(body).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            connection.request("POST", STEP, json.dumps(envelope("coach.hint", body)).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
             response = connection.getresponse()
-            return response.status, json.loads(response.read())
+            return answered(response.status, json.loads(response.read()))
         finally:
             connection.close()
 

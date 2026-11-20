@@ -10,8 +10,6 @@ from pathlib import Path
 from picopg.server.ai import (
     CourseAgent,
     CourseAgentService,
-    CourseAi,
-    CourseAiService,
     CourseDiagnose,
     CourseDiagnoseService,
     CourseFollow,
@@ -225,10 +223,6 @@ def _service(models: list[OpenAiCompatibleChatModel] | None, budget: AiBudget | 
     for model in models:
         model.meter = budget
     return service(_fallback(models), _course_skills(package_root))
-
-
-def load_course_ai(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAi | None:
-    return _service(_ai_models(), budget, package_root, CourseAiService)
 
 
 def load_course_agent(budget: AiBudget | None = None, package_root: Path | None = None) -> CourseAgent | None:

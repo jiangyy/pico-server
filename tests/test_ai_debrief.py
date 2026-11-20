@@ -14,6 +14,7 @@ from picopg.server.auth.model import PrincipalSession
 from picopg.server.ai.course import OneSkill
 from picopg.server.ai.model import CourseAiError
 from picopg.server.ai.debrief import VERSION, CourseDebriefService, debrief_request
+from tests.step_route import STEP, answered, envelope
 
 SKILL = {"course": "water-container", "rules": "同一个下标不能用两次。"}
 REVIEW = {
@@ -137,9 +138,9 @@ class DebriefRouteTest(unittest.TestCase):
             def call(token, value, method="POST"):
                 connection = http.client.HTTPConnection(*server.server_address)
                 try:
-                    connection.request(method, "/api/v1/ai/debrief", json.dumps(value).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                    connection.request(method, STEP, json.dumps(envelope("coach.debrief", value)).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
                     response = connection.getresponse()
-                    return response.status, json.loads(response.read())
+                    return answered(response.status, json.loads(response.read()))
                 finally:
                     connection.close()
 

@@ -14,6 +14,7 @@ from picopg.server.ai.follow import VERSION, CourseFollowService, follow_request
 from picopg.server.ai.model import CourseAiError
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
+from tests.step_route import STEP, answered, envelope
 
 SKILL = {"course": "hanoi", "teaches": "把搬盘子拆成更小的同类任务。", "concepts": ["recursion"], "rules": "只能顺时针搬。"}
 NOTE = {
@@ -91,9 +92,9 @@ class FollowRouteTest(unittest.TestCase):
             def post(token, value):
                 connection = http.client.HTTPConnection(*server.server_address)
                 try:
-                    connection.request("POST", "/api/v1/ai/follow", json.dumps(value).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                    connection.request("POST", STEP, json.dumps(envelope("coach.follow", value)).encode(), {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
                     response = connection.getresponse()
-                    return response.status, json.loads(response.read())
+                    return answered(response.status, json.loads(response.read()))
                 finally:
                     connection.close()
 

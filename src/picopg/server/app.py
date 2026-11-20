@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 from picopg.replica import ReplicaLogStore
 from picopg.replica.file_store import FileReplicaLogStore
-from picopg.server.ai import CourseAgent, CourseAi, CourseDiagnose, CourseFollow, CourseHint, CourseDebrief
+from picopg.server.ai import CourseAgent, CourseDiagnose, CourseFollow, CourseHint, CourseDebrief
 from picopg.server.ai.access import AiAccess
 from picopg.server.ai.budget import AiBudget
 from picopg.server.ai.http import dispatch_ai
@@ -73,7 +73,6 @@ class PicoPGHttpServer(ReplicaHttpServer):
         session_registry: FileSessionRegistry | None = None,
         secure_cookies: bool = True,
         submission_tag_writer: SubmissionTagWriter | None = None,
-        course_ai: CourseAi | None = None,
         course_agent: CourseAgent | None = None,
         ai_access: AiAccess | None = None,
         ai_budget: AiBudget | None = None,
@@ -140,7 +139,6 @@ class PicoPGHttpServer(ReplicaHttpServer):
         self.principal_accounts = accounts
         self.session_registry = session_registry
         self.secure_cookies = secure_cookies
-        self.course_ai = course_ai
         self.course_agent = course_agent
         self.course_hint = course_hint
         self.course_diagnose = course_diagnose
@@ -264,7 +262,6 @@ def build_server(
     principal_accounts: list[PrincipalAccount] | None = None,
     secure_cookies: bool = True,
     submission_tag_writer: SubmissionTagWriter | None = None,
-    course_ai: CourseAi | None = None,
     course_agent: CourseAgent | None = None,
     ai_access: AiAccess | None = None,
     ai_budget: AiBudget | None = None,
@@ -285,7 +282,6 @@ def build_server(
         session_registry=FileSessionRegistry(data_dir / "auth" / "sessions.json"),
         secure_cookies=secure_cookies,
         submission_tag_writer=submission_tag_writer,
-        course_ai=course_ai,
         course_agent=course_agent,
         ai_access=ai_access,
         ai_budget=ai_budget,
