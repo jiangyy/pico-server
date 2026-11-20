@@ -12,6 +12,7 @@ from picopg.server.ai.follow import follow_request
 from picopg.server.ai.hint import hint_request
 from picopg.server.ai.debrief import debrief_request
 from picopg.server.ai.budget import AiLimited, current_principal
+from picopg.server.ai.step import step_request
 from picopg.server.ai.model import CourseAiError
 from picopg.server.learner import due, for_course
 from picopg.server.replication import ResponseSent, logger
@@ -26,6 +27,9 @@ MOMENT_LIMIT = 50_000
 
 
 def dispatch_ai(handler: PicoRequestHandler, path: str) -> bool:
+    if path == "/api/v1/ai/step":
+        _guarded(handler, "ai step", lambda: _step(handler))
+        return True
     if path in ("/api/v1/ai/agent", "/api/v1/ai/tutor"):
         _guarded(handler, "course agent", lambda: _agent(handler, path))
         return True
@@ -60,6 +64,23 @@ def _guarded(handler: PicoRequestHandler, label: str, body: Callable[[], None]) 
         handler.error(502, "ai.reply.invalid", str(error))
     except AiLimited as error:
         handler.error(429, "ai.limited", str(error))
+
+
+def _step(handler: PicoRequestHandler) -> None:
+    principal = _permitted(handler)
+    if principal is None:
+        return
+    name, prompt, course, parsed = step_request(handler.read_json())
+    service = getattr(handler.server, prompt.service)
+    if service is None:
+        handler.error(503, "ai.unavailable", f"prompt {name} is not configured")
+        return
+    learner = _learner(handler, principal, None if course is None else course.playground_id) if prompt.tools else None
+    run = lambda on_text: prompt.run(service, course, parsed, on_text, learner)  # noqa: E731
+    if "application/x-ndjson" in (handler.headers.get("Accept") or ""):
+        _stream(handler, run)
+    else:
+        handler.send_json(200, {"turn": run(None)}, (("Cache-Control", "no-store"),))
 
 
 def _agent(handler: PicoRequestHandler, path: str) -> None:
