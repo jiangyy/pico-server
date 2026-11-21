@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.course import CourseSkills, OneSkill
 from picopg.server.ai.prompts_loader import load_prompt
 from picopg.server.ai.model import CourseAiError, ToolModel
 
@@ -24,7 +24,7 @@ class CourseDebrief(Protocol):
 
 
 class CourseDebriefService:
-    def __init__(self, model: ToolModel, skills: CourseSkillRepository | OneSkill) -> None:
+    def __init__(self, model: ToolModel, skills: CourseSkills) -> None:
         self.prompt = load_prompt(VERSION, "PICOPG_DEBRIEF_PROMPT")
         self.model = model
         self.skills = skills
@@ -174,7 +174,7 @@ def main() -> None:
     if loaded is None:
         raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    service = CourseDebriefService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined, arg-type]
+    service = CourseDebriefService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined]
     debrief = service.debrief(str(skill.get("course")), "offline", json.load(sys.stdin))
     model = loaded.model  # type: ignore[attr-defined]
     print(json.dumps({**debrief, "model": getattr(model, "answered", None) or getattr(model, "model", None)}, ensure_ascii=False))

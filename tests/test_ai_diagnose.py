@@ -12,7 +12,7 @@ from picopg.server.ai.access import AiAccess
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
 
-from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.course import SkillTable
 from picopg.server.ai.diagnose import VERSION, CourseDiagnoseService, diagnose_request
 from picopg.server.ai.model import CourseAiError
 from tests.step_route import STEP, answered, envelope
@@ -34,13 +34,7 @@ class RecordingModel:
 
 class CourseDiagnoseServiceTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.directory = tempfile.TemporaryDirectory()
-        root = Path(self.directory.name)
-        (root / "hanoi.json").write_text(json.dumps(SKILL, ensure_ascii=False), encoding="utf-8")
-        self.skills = CourseSkillRepository(root)
-
-    def tearDown(self) -> None:
-        self.directory.cleanup()
+        self.skills = SkillTable({"hanoi": SKILL})
 
     def test_course_comes_first_and_the_student_after(self) -> None:
         model = RecordingModel([json.dumps(GOOD, ensure_ascii=False)])

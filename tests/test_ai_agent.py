@@ -9,13 +9,20 @@ from pathlib import Path
 
 from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.ai.agent import CourseAgentService, agent_request
-from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.course import SkillTable
 from picopg.server.ai.model import CourseAiError
 from picopg.server.ai.access import AiAccess
 from picopg.server.app import PicoPGHttpServer
 from picopg.server.auth.model import PrincipalSession
-from picopg.server.config import SKILLS
 from tests.step_route import STEP, envelope
+
+
+SUDOKU = {
+    "course": "sudoku",
+    "concepts": ["search", "nested", "break"],
+    "teaches": "按格子枚举候选数字，遇到冲突就换下一个。",
+    "actions": ["code.run"],
+}
 
 
 class RecordingModel:
@@ -67,7 +74,7 @@ def post(connection, token, body, prompt="course.agent"):
 
 class CourseAgentServiceTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.skills = CourseSkillRepository(SKILLS)
+        self.skills = SkillTable({"sudoku": SUDOKU})
 
     def test_step_maps_messages_and_returns_tool_calls(self) -> None:
         # 客户端的对话映射成 OpenAI 形状，系统提示在前，有 skill 的课程附上要点；模型的工具调用原样带回。

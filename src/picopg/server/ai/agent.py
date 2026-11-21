@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.course import CourseSkills
 from picopg.server.ai.model import CourseAiError, ToolModel
 from picopg.server.common.validation import is_int
 
@@ -99,7 +99,7 @@ class CourseAgentService:
 最后一行是一句简短的鼓励。
 附有学生画像时，留意本次代码是否又出现画像里的误区或不牢的概念，有就点出来。"""
 
-    def __init__(self, model: ToolModel, skills: CourseSkillRepository, teaching: list[TeachingSkill] | None = None) -> None:
+    def __init__(self, model: ToolModel, skills: CourseSkills, teaching: list[TeachingSkill] | None = None) -> None:
         self.model = model
         self.skills = skills
         self.teaching = load_teaching() if teaching is None else teaching

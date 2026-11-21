@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import zipfile
 from io import BytesIO
-from pathlib import Path
+from typing import Protocol
 
 from picopg.server.ai.model import CourseAiError
 from picopg.server.playgrounds.packages import (
@@ -14,23 +14,21 @@ from picopg.server.playgrounds.packages import (
 )
 
 
+class CourseSkills(Protocol):
+    def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]: ...
+
+
 class CourseSkillRepository:
-    def __init__(self, root: Path, packages: FilePackageStore | None = None) -> None:
-        self.root = root
+    """课程 skill 只来自这门课这一版的课程包（course/<id>.skill.json）。"""
+
+    def __init__(self, packages: FilePackageStore | None = None) -> None:
         self.packages = packages
 
     def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]:
         packaged = self._packaged(playground_id, version_id)
-        if packaged is not None:
-            return _skill_value(packaged, playground_id)
-        path = self.root / f"{playground_id}.json"
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError as error:
-            raise CourseAiError(f"course AI is not configured for {playground_id!r}") from error
-        except (OSError, json.JSONDecodeError) as error:
-            raise CourseAiError(f"course AI skill is invalid for {playground_id!r}") from error
-        return _skill_value(value, playground_id)
+        if packaged is None:
+            raise CourseAiError(f"course AI is not configured for {playground_id!r}")
+        return _skill_value(packaged, playground_id)
 
     def _packaged(self, playground_id: str, version_id: str | None) -> object | None:
         if self.packages is None or version_id is None:
@@ -66,6 +64,18 @@ class OneSkill:
 
     def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]:
         return self.skill
+
+
+class SkillTable:
+    """测试与离线工具用：按课程 id 给出 skill，没有的课和没配置一样。"""
+
+    def __init__(self, skills: dict[str, dict[str, object]]) -> None:
+        self.skills = skills
+
+    def read(self, playground_id: str, version_id: str | None = None) -> dict[str, object]:
+        if playground_id not in self.skills:
+            raise CourseAiError(f"course AI is not configured for {playground_id!r}")
+        return _skill_value(self.skills[playground_id], playground_id)
 
 
 def _skill_value(value: object, playground_id: str) -> dict[str, object]:

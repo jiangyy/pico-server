@@ -30,9 +30,6 @@ from picopg.server.submissions.worker import SubmissionTagWriter
 
 
 logger = logging.getLogger("picopg.server")
-SKILLS = Path(__file__).resolve().parent / "ai" / "skills"
-
-
 def _parse_pair(value: str) -> tuple[str, str]:
     if "=" not in value:
         raise ValueError(f"--binding expects LOG_ID=ACCESS, got {value!r}")
@@ -270,4 +267,4 @@ def load_course_diagnose(budget: AiBudget | None = None, package_root: Path | No
 
 def _course_skills(package_root: Path | None) -> CourseSkillRepository:
     packages = None if package_root is None else FilePackageStore(package_root)
-    return CourseSkillRepository(SKILLS, packages)
+    return CourseSkillRepository(packages)

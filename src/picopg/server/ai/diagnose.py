@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.course import CourseSkills, OneSkill
 from picopg.server.ai.prompts_loader import load_prompt
 from picopg.server.ai.model import CourseAiError, ToolModel
 from picopg.server.common.validation import is_int
@@ -25,7 +25,7 @@ class CourseDiagnose(Protocol):
 
 
 class CourseDiagnoseService:
-    def __init__(self, model: ToolModel, skills: CourseSkillRepository) -> None:
+    def __init__(self, model: ToolModel, skills: CourseSkills) -> None:
         self.prompt = load_prompt(VERSION, "diagnose prompt")
         self.model = model
         self.skills = skills
@@ -146,7 +146,7 @@ def main() -> None:
     if model is None:
         raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    service = CourseDiagnoseService(model, OneSkill(skill))  # type: ignore[arg-type]
+    service = CourseDiagnoseService(model, OneSkill(skill))
     diagnosis = service.diagnose(str(skill.get("course")), "offline", json.load(sys.stdin))
     print(json.dumps({**diagnosis, "model": getattr(model, "answered", None) or getattr(model, "model", None)}, ensure_ascii=False))
 

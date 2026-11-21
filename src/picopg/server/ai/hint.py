@@ -10,7 +10,7 @@ import json
 import re
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.course import CourseSkills, OneSkill
 from picopg.server.ai.model import CourseAiError, ToolModel
 from picopg.server.common.validation import is_int
 
@@ -48,7 +48,7 @@ class CourseHint(Protocol):
 
 
 class CourseHintService:
-    def __init__(self, model: ToolModel, skills: CourseSkillRepository) -> None:
+    def __init__(self, model: ToolModel, skills: CourseSkills) -> None:
         self.model = model
         self.skills = skills
 
@@ -172,7 +172,7 @@ def main() -> None:
     if loaded is None:
         raise SystemExit("没有配置模型：PICOPG_AI_BASE_URL / PICOPG_AI_MODEL / PICOPG_AI_API_KEY")
     skill = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    service = CourseHintService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined, arg-type]
+    service = CourseHintService(loaded.model, OneSkill(skill))  # type: ignore[attr-defined]
     request = json.load(sys.stdin)
     hint = service.hint(str(skill.get("course")), "offline", request["evidence"], request.get("focus"))
     model = loaded.model  # type: ignore[attr-defined]

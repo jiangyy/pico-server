@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Protocol
 
-from picopg.server.ai.course import CourseSkillRepository, OneSkill
+from picopg.server.ai.course import CourseSkills, OneSkill
 from picopg.server.ai.prompts_loader import load_prompt
 from picopg.server.ai.model import CourseAiError, ToolModel
 from picopg.server.common.validation import is_int
@@ -28,7 +28,7 @@ class CourseFollow(Protocol):
 
 
 class CourseFollowService:
-    def __init__(self, model: ToolModel, skills: CourseSkillRepository | OneSkill) -> None:
+    def __init__(self, model: ToolModel, skills: CourseSkills) -> None:
         self.prompt = load_prompt(VERSION, "PICOPG_FOLLOW_PROMPT")
         self.model = model
         self.skills = skills

@@ -11,7 +11,7 @@ from unittest import mock
 
 from picopg.replica.file_store import FileReplicaLogStore
 from picopg.server.ai.access import AiAccess
-from picopg.server.ai.course import CourseSkillRepository
+from picopg.server.ai.course import SkillTable
 from picopg.server.ai.hint import CourseHintService, hint_request
 from picopg.server.ai.model import CourseAiError, FallbackModel
 from picopg.server.app import PicoPGHttpServer
@@ -47,13 +47,7 @@ class RecordingModel:
 
 class CourseHintServiceTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.directory = tempfile.TemporaryDirectory()
-        root = Path(self.directory.name)
-        (root / "hanoi.json").write_text(json.dumps(SKILL, ensure_ascii=False), encoding="utf-8")
-        self.skills = CourseSkillRepository(root)
-
-    def tearDown(self) -> None:
-        self.directory.cleanup()
+        self.skills = SkillTable({"hanoi": SKILL})
 
     def test_first_sentence_comes_from_the_course_and_the_model_writes_the_rest(self) -> None:
         model = RecordingModel([json.dumps(GOOD, ensure_ascii=False)])
