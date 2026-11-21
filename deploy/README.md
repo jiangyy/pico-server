@@ -20,7 +20,8 @@ Publish a dedicated Playground that is not used by students, map it to an initia
 - `PICOPG_SMOKE_BASE_URL`: the public HTTPS origin;
 - `PICOPG_SMOKE_ACCESS_CODE`: access code for the dedicated smoke principal;
 - `PICOPG_SMOKE_PLAYGROUND_ID`: the dedicated published Playground and repository mapping;
-- `PICOPG_REPLICA_TOKEN`: operator token.
+- `PICOPG_REPLICA_TOKEN`: operator token;
+- `PICOPG_SERVICE`: the user systemd unit to restart (default `picopg`).
 
 Then run:
 
@@ -60,8 +61,9 @@ Run through this before the first lesson and again after every release. Each ite
 
 ### Release order
 
+0. Back up first (see above) and copy the archive off the host. Release the site into a new directory, e.g. `site-YYYYMMDD/`, and point the nginx root at it through a symlink; rolling back the front end is switching the symlink back. If the host cannot reach the Git remote, ship the server as a bundle (`git bundle create release.bundle <deployed>..main`, then `git fetch` it on the host and `git merge --ff-only`); rolling back the server is `git reset --hard <deployed>` and a restart.
 1. Deploy the server first, then publish **every** course from the web repository (`node scripts/publish.mjs --all`, then `scripts/upload.mjs`). Packages carry the knowledge map in their outline; until one is published the learner profile has no concept labels and does not migrate old concept ids.
-2. Rebuild and copy `dist/` (it includes `/teacher/`), then run `deploy/restart-smoke.sh`.
+2. Rebuild and copy `dist/` (it includes `/teacher/`), then run `deploy/restart-smoke.sh`. Course packages name the runtime version they were built for and the client opens only matching ones, so when `client/runtime.json` changes every course must be republished in the same release.
 3. Before every release, run `npm run smoke:pilot` in the web repository. It starts this server from source and drives two devices of one student and a teacher through publish, update, offline edits and the divergence choice, learning evidence to profile, submission to Git tag, review, and a restart.
 
 The submission repositories in `config/submissions.json` only need `git init`; the first submission becomes the root commit.

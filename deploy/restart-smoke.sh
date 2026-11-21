@@ -5,13 +5,14 @@ set -eu
 : "${PICOPG_SMOKE_ACCESS_CODE:?set PICOPG_SMOKE_ACCESS_CODE}"
 : "${PICOPG_SMOKE_PLAYGROUND_ID:?set PICOPG_SMOKE_PLAYGROUND_ID}"
 : "${PICOPG_REPLICA_TOKEN:?set PICOPG_REPLICA_TOKEN}"
+service="${PICOPG_SERVICE:-picopg}"
 
 umask 077
 state=$(mktemp "${TMPDIR:-/tmp}/picopg-smoke.XXXXXX")
 trap 'rm -f "$state"' EXIT HUP INT TERM
 
 restart_and_wait() {
-    systemctl --user restart picopg
+    systemctl --user restart "$service"
     attempt=0
     until curl --fail --silent --show-error "${PICOPG_SMOKE_BASE_URL%/}/healthz" >/dev/null; do
         attempt=$((attempt + 1))
