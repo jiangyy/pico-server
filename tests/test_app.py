@@ -23,7 +23,7 @@ from picopg.server.playgrounds.packages import PackageInfo
 from picopg.replica.file_store import FileReplicaLogStore
 
 
-def _package(title: str, course: str = "course") -> bytes:
+def _package(title: str, course: str = "course", requires_submission: object = None) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
@@ -34,6 +34,7 @@ def _package(title: str, course: str = "course") -> bytes:
                     "runtime": "python",
                     "module": "course/demo.js",
                     "title": title,
+                    **({} if requires_submission is None else {"requiresSubmission": requires_submission}),
                 }
             ),
         )
@@ -148,6 +149,7 @@ class AppTest(unittest.TestCase):
                 _expect(catalog[0]["playground_id"] == "demo", "catalog id is wrong")
                 _expect(catalog[0]["current_version_id"] == first_version, "catalog version is wrong")
                 _expect(catalog[0]["title"] == "First", "catalog title is wrong")
+                _expect("requires_submission" not in catalog[0], "a course that declares nothing takes no hand-ins")
 
                 status, headers, body = _request(
                     base_url,

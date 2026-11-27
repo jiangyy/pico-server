@@ -37,6 +37,7 @@ class PackageNotFound(FileNotFoundError):
 class PackageInfo:
     media_type: str
     title: str | None
+    requires_submission: bool = False
 
 
 class PackageAdapter(Protocol):
@@ -102,7 +103,8 @@ class ZipPackageAdapter:
             raise PackageError("package is missing picopg.json")
         if "course/index.html" not in seen:
             raise PackageError("package is missing course/index.html")
-        return PackageInfo(ZIP_MEDIA_TYPE, _manifest_title(manifest_bytes, seen))
+        title, requires_submission = _manifest(manifest_bytes, seen)
+        return PackageInfo(ZIP_MEDIA_TYPE, title, requires_submission)
 
 
 class FilePackageStore:
@@ -187,7 +189,8 @@ def _package_path(raw: str) -> str:
     raise PackageError(f"unexpected package path: {name}")
 
 
-def _manifest_title(payload: bytes, paths: set[str]) -> str | None:
+def _manifest(payload: bytes, paths: set[str]) -> tuple[str | None, bool]:
+    """picopg.json 里的标题，与这门课要不要交作业（课程在自己的 skill.json 里声明，发布时写进来）。"""
     try:
         value = json.loads(payload.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -207,7 +210,10 @@ def _manifest_title(payload: bytes, paths: set[str]) -> str | None:
     title = value.get("title")
     if title is not None and (not isinstance(title, str) or not title.strip()):
         raise PackageError("picopg.json title must be a non-empty string")
-    return title
+    requires_submission = value.get("requiresSubmission", False)
+    if not isinstance(requires_submission, bool):
+        raise PackageError("picopg.json requiresSubmission must be a boolean")
+    return title, requires_submission
 
 
 def _fsync_directory(path: Path) -> None:

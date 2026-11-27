@@ -58,6 +58,7 @@ class PlaygroundRelease:
     version_id: str
     media_type: str
     title: str | None
+    requires_submission: bool = False
 
     def to_catalog_value(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -67,6 +68,8 @@ class PlaygroundRelease:
         }
         if self.title is not None:
             value["title"] = self.title
+        if self.requires_submission:
+            value["requires_submission"] = True
         return value
 
 
@@ -133,6 +136,8 @@ class PlaygroundPublisher:
             }
             if info.title is not None:
                 data["title"] = info.title
+            if info.requires_submission:
+                data["requiresSubmission"] = True
             record = ReplicatedRecord(
                 id=record_id_of(PLAYGROUND_RELEASES_LOG_ID, parent, (), data),
                 log_id=PLAYGROUND_RELEASES_LOG_ID,
@@ -178,13 +183,17 @@ def _release(data: object) -> PlaygroundRelease | None:
         return None
     media_type = data.get("mediaType")
     title = data.get("title")
+    requires_submission = data.get("requiresSubmission", False)
     if not isinstance(media_type, str) or not media_type:
         raise PackageError("release mediaType is invalid")
     if title is not None and not isinstance(title, str):
         raise PackageError("release title is invalid")
+    if not isinstance(requires_submission, bool):
+        raise PackageError("release requiresSubmission is invalid")
     return PlaygroundRelease(
         validate_playground_id(data.get("playgroundId")),
         validate_version_id(data.get("versionId")),
         media_type,
         title,
+        requires_submission,
     )

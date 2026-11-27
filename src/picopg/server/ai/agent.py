@@ -154,7 +154,8 @@ class CourseAgentService:
             skill = self.skills.read(playground_id, version_id)
         except CourseAiError:
             return None
-        return {key: value for key, value in skill.items() if key not in ("actions", "course")}
+        # 课程元数据（是否交作业）不是教学内容，不进提示词。
+        return {key: value for key, value in skill.items() if key not in ("actions", "course", "requiresSubmission")}
 
 
 def _learner(learner: dict[str, object] | None) -> str:
